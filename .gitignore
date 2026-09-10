@@ -1,0 +1,8 @@
+target/
+node_modules/
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+*.log
+/.tmp-c24.html
+/.tmp-gh.html
