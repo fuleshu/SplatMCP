@@ -1,0 +1,26 @@
+[package]
+name = "splatmcp-mcp"
+description = "SplatMCP MCP server (rmcp) for creating and editing 3D Gaussian Splats"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "splatmcp_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "splatmcp-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Official Rust MCP SDK: https://github.com/modelcontextprotocol/rust-sdk
+rmcp = { version = "3", features = [
+    "server",
+    "macros",
+    "transport-io",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

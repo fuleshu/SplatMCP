@@ -1,0 +1,18 @@
+[package]
+name = "splatmcp"
+description = "SplatMCP - 3D Gaussian Splat editor with an MCP server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+build = "build.rs"
+default-run = "splatmcp"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+splatmcp-mcp = { path = "../crates/splatmcp-mcp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }

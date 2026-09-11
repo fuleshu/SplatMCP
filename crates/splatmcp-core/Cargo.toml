@@ -1,0 +1,13 @@
+[package]
+name = "splatmcp-core"
+description = "SplatMCP Gaussian splat model with PLY import and export (fixed colour, no spherical harmonics)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "splatmcp_core"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
