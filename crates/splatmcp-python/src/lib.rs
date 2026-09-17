@@ -50,7 +50,7 @@ pub use script::{RecipeRecord, ScriptSnapshot, SourceOrigin};
 pub use service::{
     CancelView, CommitOutcome, CommitRequest, DisplayState, DocumentIdentity, DocumentTarget,
     ExportOutcome, GenerationRequest, GenerationService, JobError, JobReceipt, JobState,
-    JobSummary, JobView, ServiceConfig, TargetSpec, Timings,
+    JobSummary, JobView, PublishOptions, ServiceConfig, TargetSpec, Timings,
 };
 
 use thiserror::Error;

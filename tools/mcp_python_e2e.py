@@ -108,6 +108,27 @@ class Session:
             "get_python_job", {"job_id": job_id, "log_after": log_after}
         )["json"]
 
+    def settle_camera(self, timeout: float = 15.0) -> dict:
+        """Reads the camera until it stops moving.
+
+        The viewer's orbit controls damp their motion, so a camera read immediately after
+        `set_camera` is a mid-animation sample. Comparing that against a later read would
+        look like movement when nothing moved at all.
+        """
+        deadline = time.monotonic() + timeout
+        previous = self.call("get_camera", {})["json"]
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            current = self.call("get_camera", {})["json"]
+            if all(
+                abs(current[key][axis] - previous[key][axis]) < 1e-4
+                for key in ("position", "target")
+                for axis in range(3)
+            ):
+                return current
+            previous = current
+        raise RuntimeError(f"the camera never settled: last read {previous}")
+
     def wait_rendered(self, job_id: int, timeout: float = 60.0) -> dict:
         """Waits until the viewer has acknowledged a committed revision.
 
@@ -129,6 +150,10 @@ class Session:
             f"the viewer never acknowledged job {job_id}'s revision; last display state "
             f"{(view.get('display') or {}).get('state')!r}"
         )
+
+    def job_now(self, job_id: int) -> dict:
+        """One job read, without waiting for it to finish."""
+        return self.call("get_python_job", {"job_id": job_id, "log_after": 0})["json"]
 
     def wait(self, job_id: int) -> dict:
         """Polls a job until it reaches a terminal state, accumulating its log."""
@@ -362,7 +387,65 @@ def main() -> int:
             after.get("point_count"),
         )
 
-        print("\n7. request identity: deduplication, and a reused id with new content")
+        print("\n7. display:false and frame:false")
+        # display:false commits without publishing, so the displayed model is untouched.
+        quiet = session.submit(
+            request_id="e2e-quiet",
+            code=AXIS_RECIPE,
+            component_id="quiet",
+            expected_revision=edited.get("revision"),
+            display=False,
+        )
+        quiet_view = session.wait(quiet["job_id"])
+        check("a display:false job still commits", quiet_view.get("state") == "committed", quiet_view.get("error"))
+        check(
+            "and reports that nothing was requested",
+            (quiet_view.get("display") or {}).get("state") == "not_requested",
+            quiet_view.get("display"),
+        )
+        check(
+            "the committed revision is the next one",
+            quiet_view.get("revision") == edited.get("revision") + 1,
+            (quiet_view.get("revision"), edited.get("revision")),
+        )
+
+        # frame:false displays the revision but leaves the camera where it is.
+        session.call("set_camera", {"azimuth": 33, "elevation": 11, "distance": 2.7})
+        before = session.settle_camera()
+        keep_view = session.submit(
+            request_id="e2e-keep-view",
+            code=AXIS_RECIPE,
+            component_id="keep-view",
+            expected_revision=quiet_view.get("revision"),
+            frame=False,
+        )
+        keep_view_job = session.wait_rendered(keep_view["job_id"])
+        after = session.settle_camera()
+        check("the frame:false job committed", keep_view_job.get("state") == "committed", keep_view_job.get("error"))
+        check("it was displayed", (keep_view_job.get("display") or {}).get("state") == "rendered", keep_view_job.get("display"))
+        check(
+            "the camera did not move",
+            all(abs(before[key][axis] - after[key][axis]) < 0.01
+                for key in ("position", "target") for axis in range(3)),
+            f"{before} -> {after}",
+        )
+        # And a default job does re-frame, so the flag is what makes the difference.
+        framed = session.submit(
+            request_id="e2e-frame",
+            code=AXIS_RECIPE,
+            component_id="framed",
+            expected_revision=keep_view_job.get("revision"),
+        )
+        session.wait_rendered(framed["job_id"])
+        reframed = session.settle_camera()
+        check(
+            "a default job re-frames the new content",
+            any(abs(after[key][axis] - reframed[key][axis]) > 0.01
+                for key in ("position", "target") for axis in range(3)),
+            f"{after} -> {reframed}",
+        )
+
+        print("\n8. request identity: deduplication, and a reused id with new content")
         repeat = session.submit(
             request_id="e2e-axes",
             code=AXIS_RECIPE,
@@ -396,7 +479,77 @@ def main() -> int:
                 str(error),
             )
 
-        print("\n8. the tool surface stays compact")
+        print("\n9. script output and the source snapshot")
+        # A recipe that prints, and that edits through ctx.source() without reshaping it.
+        source_recipe = r"""
+import numpy as np
+import splatmcp
+
+
+def generate(ctx):
+    snapshot = ctx.source()
+    print("snapshot revision is %d" % snapshot["revision"])
+    print("positions shape is %s" % (snapshot["positions"].shape,))
+    print("rotations shape is %s" % (snapshot["rotations"].shape,))
+    print("opacity shape is %s" % (snapshot["opacity"].shape,))
+    count = snapshot["point_count"]
+    if snapshot["positions"].shape != (count, 3):
+        raise AssertionError("positions must be (N, 3), not flattened")
+    if snapshot["rotations"].shape != (count, 4):
+        raise AssertionError("rotations must be (N, 4), not flattened")
+    # Passed straight back to batch(), which is the point of the shapes.
+    positions = snapshot["positions"].copy()
+    positions[:, 1] += 0.4
+    print("editing %d gaussians" % count)
+    return splatmcp.batch(
+        positions=positions.astype(np.float32),
+        scales=snapshot["scales"].astype(np.float32),
+        rotations=snapshot["rotations"].astype(np.float32),
+        colors=snapshot["colors"].astype(np.float32),
+        opacity=snapshot["opacity"].astype(np.float32),
+        component_id="snapshot-edit",
+        recipe="e2e_snapshot",
+    )
+"""
+        latest = session.call("splat_info", {"points": 0})["json"]
+        revision = (latest.get("document") or {}).get("revision")
+        snapshot_job = session.submit(
+            request_id="e2e-snapshot",
+            code=source_recipe,
+            component_id="snapshot-edit",
+            expected_revision=revision,
+            display=False,
+        )
+        snapshot_view = session.wait(snapshot_job["job_id"])
+        lines = [line["text"] for line in snapshot_view["logs"]]
+        check("the snapshot edit committed", snapshot_view.get("state") == "committed", snapshot_view.get("error"))
+        check(
+            "print output reached the log",
+            any("snapshot revision is" in line for line in lines),
+            lines,
+        )
+        check(
+            "positions arrived as (N, 3)",
+            any("positions shape is (19, 3)" in line for line in lines),
+            [line for line in lines if "shape" in line],
+        )
+        check(
+            "rotations arrived as (N, 4)",
+            any("rotations shape is (19, 4)" in line for line in lines),
+            [line for line in lines if "shape" in line],
+        )
+        check(
+            "opacity arrived as (N,)",
+            any("opacity shape is (19,)" in line for line in lines),
+            [line for line in lines if "shape" in line],
+        )
+        check(
+            "the edit used the snapshot without reshaping",
+            any("editing 19 gaussians" in line for line in lines),
+            lines,
+        )
+
+        print("\n10. the tool surface stays compact")
         listing = session.session.request("tools/list").get("tools", [])
         encoded = json.dumps(listing)
         check("all twelve tools are exposed", len(listing) == 12, len(listing))

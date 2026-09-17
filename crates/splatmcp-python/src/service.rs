@@ -160,6 +160,33 @@ pub enum CommitOutcome {
     },
 }
 
+/// How a committed revision should be shown.
+///
+/// The frame flag lives here rather than in [`CommitRequest`] on purpose: committing and
+/// showing are separate steps, and a job with `display:false` must commit without ever
+/// reaching the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishOptions {
+    /// Re-frame the camera on the new revision.
+    ///
+    /// `false` is the iterative-editing case: an agent that nudges one component must not
+    /// throw the user's viewpoint away, so the camera is left exactly where it was.
+    pub frame: bool,
+}
+
+impl Default for PublishOptions {
+    fn default() -> Self {
+        Self { frame: true }
+    }
+}
+
+impl PublishOptions {
+    /// Options for a job that asked to be displayed and re-framed.
+    pub fn framed(frame: bool) -> Self {
+        Self { frame }
+    }
+}
+
 /// The document owner: the app, or a test double.
 ///
 /// Only these three operations are needed, which keeps the Python service free of any
@@ -169,10 +196,19 @@ pub trait DocumentTarget: Send + Sync + 'static {
     fn snapshot(&self, target: &TargetSpec) -> Result<SourceSnapshot>;
 
     /// Swaps in a candidate when the target revision still matches.
+    ///
+    /// This must **not** show the result: the service calls [`DocumentTarget::publish`]
+    /// afterwards, and only when the request asked for it. An implementation that published
+    /// here would ignore `display:false`.
     fn commit(&self, request: CommitRequest) -> Result<CommitOutcome>;
 
     /// Asks the viewer to show a committed revision.
-    fn publish(&self, target: &TargetSpec, identity: &DocumentIdentity) -> Result<()>;
+    fn publish(
+        &self,
+        target: &TargetSpec,
+        identity: &DocumentIdentity,
+        options: PublishOptions,
+    ) -> Result<()>;
 }
 
 /// Whether the viewer is showing a job's result.
@@ -298,7 +334,14 @@ pub struct GenerationRequest {
     /// Where the result goes.
     pub target: TargetSpec,
     /// Show the committed revision in the viewer when it is ready.
+    ///
+    /// `false` commits the revision without telling the viewer, so the displayed model is
+    /// untouched. The job reports `display: not_requested`.
     pub display: bool,
+    /// Re-frame the camera when the revision is displayed. Ignored when `display` is false.
+    ///
+    /// `false` keeps the viewpoint, which is what an iterative edit wants.
+    pub frame: bool,
     /// Optional `.ply` export of the candidate.
     pub export_path: Option<PathBuf>,
     /// Cooperative deadline; the configured default applies when absent.
@@ -426,6 +469,8 @@ struct JobRecord {
     content_hash: String,
     state: JobState,
     display_requested: bool,
+    /// Re-frame the camera when this job's revision is displayed.
+    frame: bool,
     display: DisplayState,
     displayed_revision: Option<u64>,
     progress: ProgressSink,
@@ -591,6 +636,7 @@ impl GenerationService {
                     content_hash: content_hash.clone(),
                     state: JobState::Queued,
                     display_requested: request.display,
+                    frame: request.frame,
                     display: if request.display {
                         DisplayState::Pending
                     } else {
@@ -889,12 +935,17 @@ impl JobObserver for Observer {
             Ok(_) => {}
             Err(_) => return,
         }
+        // How long the script ran is the same fact for every outcome, so it is recorded
+        // once here rather than in each branch. Leaving it to the failure paths is how a
+        // successful job ends up reporting no duration at all.
+        self.registry.update(outcome.job_id, |record| {
+            record.timings.finished_at_ms = Some(finished_at);
+            record.timings.execution_ms = Some(outcome.duration.as_millis() as u64);
+        });
+
         if outcome.cancelled {
             self.registry.update(outcome.job_id, |record| {
                 record.state = JobState::Cancelled;
-                record.timings.finished_at_ms = Some(finished_at);
-                record.timings.execution_ms = Some(outcome.duration.as_millis() as u64);
-                record.progress.report(record.progress.fraction(), None);
                 let reason = outcome
                     .cancel_reason
                     .map(CancelReason::name)
@@ -916,8 +967,6 @@ impl JobObserver for Observer {
                 let job_error = JobError::of(&error);
                 self.registry.update(outcome.job_id, |record| {
                     record.state = JobState::Failed;
-                    record.timings.finished_at_ms = Some(finished_at);
-                    record.timings.execution_ms = Some(outcome.duration.as_millis() as u64);
                     record.error = Some(job_error);
                     if record.display == DisplayState::Pending {
                         record.display = DisplayState::NotRequested;
@@ -942,6 +991,10 @@ impl Observer {
         registry.update(job_id, |record| {
             record.state = JobState::Validating;
             record.timings.finished_at_ms = Some(finished_at);
+            // The script has returned, so its own work is finished whatever happens to the
+            // candidate next. A script that reports no progress would otherwise still read
+            // as 0% after a successful commit.
+            record.progress.complete();
         });
 
         if let Err(error) = batch.validate(max_points) {
@@ -987,8 +1040,13 @@ impl Observer {
                     .export_path
                     .as_ref()
                     .map(|path| export_candidate(path, &batch, &provenance, max_points));
+                // Display is asked for *after* the commit, and only when the request wanted
+                // it: a job submitted with `display: false` commits its revision and leaves
+                // the viewer showing whatever it showed before. The frame flag travels with
+                // the call, so `frame: false` really does keep the current camera.
                 let display_ok = if record.display_requested {
-                    match registry.target.publish(&record.target, &identity) {
+                    let options = PublishOptions::framed(record.frame);
+                    match registry.target.publish(&record.target, &identity, options) {
                         Ok(()) => Ok(DisplayState::Pending),
                         Err(error) => Err(error.to_string()),
                     }
@@ -1186,7 +1244,8 @@ mod tests {
     struct StubTarget {
         revision: Mutex<u64>,
         commits: Mutex<Vec<String>>,
-        published: Mutex<Vec<u64>>,
+        /// Every publish call, with the options it was given.
+        published: Mutex<Vec<(u64, PublishOptions)>>,
         publish_fails: bool,
     }
 
@@ -1207,6 +1266,25 @@ mod tests {
                 published: Mutex::new(Vec::new()),
                 publish_fails: true,
             })
+        }
+
+        /// Revisions the viewer was told about.
+        fn published_revisions(&self) -> Vec<u64> {
+            self.published
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(revision, _)| *revision)
+                .collect()
+        }
+
+        /// The frame flag of the only publish call, or `None` when there was not exactly one.
+        fn published_frame(&self) -> Option<bool> {
+            let published = self.published.lock().unwrap();
+            match published.as_slice() {
+                [(_, options)] => Some(options.frame),
+                _ => None,
+            }
         }
     }
 
@@ -1260,11 +1338,19 @@ mod tests {
             Ok(CommitOutcome::Committed { identity })
         }
 
-        fn publish(&self, _target: &TargetSpec, identity: &DocumentIdentity) -> Result<()> {
+        fn publish(
+            &self,
+            _target: &TargetSpec,
+            identity: &DocumentIdentity,
+            options: PublishOptions,
+        ) -> Result<()> {
             if self.publish_fails {
                 return Err(PythonError::Display("the viewer rejected the revision".to_owned()));
             }
-            self.published.lock().unwrap().push(identity.revision);
+            self.published
+                .lock()
+                .unwrap()
+                .push((identity.revision, options));
             Ok(())
         }
     }
@@ -1292,6 +1378,16 @@ mod tests {
     }
 
     fn request(request_id: &str, target: TargetSpec, display: bool) -> GenerationRequest {
+        // Framing by default, which is what a first look at a new object wants.
+        request_with_frame(request_id, target, display, true)
+    }
+
+    fn request_with_frame(
+        request_id: &str,
+        target: TargetSpec,
+        display: bool,
+        frame: bool,
+    ) -> GenerationRequest {
         GenerationRequest {
             snapshot: ScriptSnapshot::inline(
                 request_id,
@@ -1303,6 +1399,7 @@ mod tests {
             .unwrap(),
             target,
             display,
+            frame,
             export_path: None,
             deadline: None,
         }
@@ -1344,7 +1441,97 @@ mod tests {
         assert_eq!(view.display, DisplayState::Rendered);
         assert_eq!(view.displayed_revision, Some(1));
         assert!(view.logs.is_empty(), "the log cursor returned no repeats");
-        assert_eq!(target.published.lock().unwrap().len(), 1);
+        assert_eq!(target.published_revisions().len(), 1);
+        service.shutdown();
+    }
+
+    #[test]
+    fn display_false_commits_without_touching_the_viewer() {
+        let target = StubTarget::new(0);
+        let service = service(StubRunner::producing(4), target.clone());
+        let receipt = service
+            .submit(request("req-no-display", TargetSpec::new_document(None), false))
+            .unwrap();
+        let view = wait_for(&service, receipt.job_id);
+
+        // The geometry is committed ...
+        assert_eq!(view.state, JobState::Committed);
+        assert_eq!(view.revision, Some(1));
+        assert_eq!(view.point_count, Some(4));
+        // ... and the viewer was never told about it, so the displayed model is untouched.
+        assert!(
+            target.published_revisions().is_empty(),
+            "display:false must not publish a revision"
+        );
+        assert_eq!(view.display, DisplayState::NotRequested);
+        assert!(view.displayed_revision.is_none());
+        service.shutdown();
+    }
+
+    #[test]
+    fn the_frame_flag_reaches_the_publication() {
+        // The locals are not called `service`, so the constructor stays visible for the
+        // second one.
+        let target = StubTarget::new(0);
+        let framed = StubTarget::new(0);
+        let keep_view = service(StubRunner::producing(2), target.clone());
+        let framing_service = service(StubRunner::producing(2), framed.clone());
+
+        // An iterative edit: the component changes and the camera must not move.
+        let receipt = keep_view
+            .submit(request_with_frame(
+                "req-keep-view",
+                TargetSpec::new_document(None),
+                true,
+                false,
+            ))
+            .unwrap();
+        let view = wait_for(&keep_view, receipt.job_id);
+        assert_eq!(view.state, JobState::Committed);
+        assert_eq!(target.published_revisions(), vec![1]);
+        assert_eq!(
+            target.published_frame(),
+            Some(false),
+            "the viewer must be told not to re-frame"
+        );
+
+        // A job that wants the new object framed says so.
+        let receipt = framing_service
+            .submit(request_with_frame(
+                "req-frame",
+                TargetSpec::new_document(None),
+                true,
+                true,
+            ))
+            .unwrap();
+        wait_for(&framing_service, receipt.job_id);
+        assert_eq!(framed.published_frame(), Some(true));
+
+        keep_view.shutdown();
+        framing_service.shutdown();
+    }
+
+    #[test]
+    fn a_committed_job_reports_its_duration_and_full_progress() {
+        let target = StubTarget::new(0);
+        let service = service(StubRunner::producing(3), target);
+        let receipt = service
+            .submit(request("req-reporting", TargetSpec::new_document(None), false))
+            .unwrap();
+        let view = wait_for(&service, receipt.job_id);
+        assert_eq!(view.state, JobState::Committed);
+
+        // The stub runner reports no progress at all, which used to leave a committed job
+        // sitting at 0%.
+        assert_eq!(view.progress, 1.0, "a finished job is at 100%");
+        let timings = view.timings;
+        assert!(timings.started_at_ms.is_some(), "the job reports when it started");
+        assert!(timings.finished_at_ms.is_some(), "and when it finished");
+        assert!(
+            timings.execution_ms.is_some(),
+            "a successful job reports how long its script ran: {timings:?}"
+        );
+        assert!(timings.waiting_ms.is_some(), "and how long it waited");
         service.shutdown();
     }
 

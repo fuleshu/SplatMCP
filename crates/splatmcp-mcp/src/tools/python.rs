@@ -52,8 +52,13 @@ pub struct RunPythonInput {
     pub expected_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+    /// Show the result. `false` commits the revision but leaves the displayed model
+    /// untouched, so a batch of edits can be generated without the viewpoint or the
+    /// geometry changing under the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<bool>,
+    /// Re-frame the camera on the displayed result. `false` keeps the current view, which
+    /// is what an iterative edit wants. Defaults to `true`; ignored when `display` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,8 +196,11 @@ pub struct JobLogReply {
 /// Timings of a job, in milliseconds.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TimingsReply {
+    /// Time the job spent waiting for the interpreter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_ms: Option<u64>,
+    /// How long the script itself ran. Reported for every terminal state, including a
+    /// successful commit, so a caller can measure a recipe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_ms: Option<u64>,
 }
@@ -227,7 +235,8 @@ pub struct JobReply {
     /// queued, running, cancel_requested, validating, committing, committed, cancelled,
     /// failed or conflict.
     pub state: String,
-    /// Progress reported by the script, in `0..=1`.
+    /// Progress in `0..=1`. Reported by the script, and forced to `1.0` once its work is
+    /// finished, so a committed job never reads as 0%.
     pub progress: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_message: Option<String>,

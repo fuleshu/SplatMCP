@@ -20,7 +20,7 @@ use splatmcp_python::executor::{ExecutorConfig, LogLevel, RunnerInfo, ScriptRunn
 use splatmcp_python::runtime::{Limits, PythonRuntime, RuntimeReport, RuntimeRoots};
 use splatmcp_python::service::{
     CommitOutcome, CommitRequest, DisplayState, DocumentIdentity, DocumentTarget, GenerationRequest,
-    GenerationService, JobState, JobView, ServiceConfig, TargetSpec,
+    GenerationService, JobState, JobView, PublishOptions, ServiceConfig, TargetSpec,
 };
 use splatmcp_python::script::ScriptSnapshot;
 use splatmcp_python::executor::SourceSnapshot;
@@ -68,6 +68,9 @@ struct MemoryDocument {
     revision: Mutex<u64>,
     splat: Mutex<Splat>,
     commits: Mutex<Vec<u64>>,
+    /// Every publish call: the revision the viewer was told about and whether it should
+    /// re-frame.
+    published: Mutex<Vec<(u64, bool)>>,
     publish_fails: AtomicBool,
 }
 
@@ -90,6 +93,7 @@ impl MemoryDocument {
             revision: Mutex::new(1),
             splat: Mutex::new(splat),
             commits: Mutex::new(Vec::new()),
+            published: Mutex::new(Vec::new()),
             publish_fails: AtomicBool::new(false),
         })
     }
@@ -151,12 +155,21 @@ impl DocumentTarget for MemoryDocument {
         })
     }
 
-    fn publish(&self, _target: &TargetSpec, _identity: &DocumentIdentity) -> splatmcp_python::Result<()> {
+    fn publish(
+        &self,
+        _target: &TargetSpec,
+        identity: &DocumentIdentity,
+        options: PublishOptions,
+    ) -> splatmcp_python::Result<()> {
         if self.publish_fails.load(Ordering::SeqCst) {
             return Err(splatmcp_python::PythonError::Display(
                 "the viewer rejected the revision".to_owned(),
             ));
         }
+        self.published
+            .lock()
+            .unwrap()
+            .push((identity.revision, options.frame));
         Ok(())
     }
 }
@@ -200,6 +213,7 @@ fn request(
             .expect("the test script is valid"),
         target,
         display,
+        frame: true,
         export_path: None,
         deadline: None,
     }
@@ -653,17 +667,31 @@ def generate(ctx):
     source = ctx.source()
     if source is None:
         raise RuntimeError("this recipe needs an existing document")
-    ctx.log("editing %d gaussians at revision %d" % (source["point_count"], source["revision"]))
-    positions = source["positions"].reshape(-1, 3).copy()
+    # The snapshot arrives in the shapes batch() takes: no reshaping, no guessing.
+    shapes = {name: tuple(np.asarray(source[name]).shape)
+              for name in ("positions", "scales", "rotations", "colors", "opacity")}
+    count = source["point_count"]
+    expected = {
+        "positions": (count, 3),
+        "scales": (count, 3),
+        "rotations": (count, 4),
+        "colors": (count, 3),
+        "opacity": (count,),
+    }
+    ctx.log("snapshot shapes %s" % shapes)
+    if shapes != expected:
+        raise AssertionError("unexpected snapshot shapes: %s != %s" % (shapes, expected))
+    ctx.log("editing %d gaussians at revision %d" % (count, source["revision"]))
+
+    # Passed straight back to batch(), which is the whole point of the shapes.
+    positions = source["positions"].copy()
     positions[:, 1] += 1.5
-    count = len(positions)
-    colors = source["colors"].reshape(-1, 3).copy()
     return splatmcp.batch(
         positions=positions.astype(np.float32),
-        scales=np.full((count, 3), 0.05, dtype=np.float32),
-        rotations=np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (count, 1)),
-        colors=colors.astype(np.float32),
-        opacity=np.ones(count, dtype=np.float32),
+        scales=source["scales"].astype(np.float32),
+        rotations=source["rotations"].astype(np.float32),
+        colors=source["colors"].astype(np.float32),
+        opacity=source["opacity"].astype(np.float32),
         component_id="tower",
         recipe="raise",
     )
@@ -705,6 +733,138 @@ def generate(ctx):
     assert!(error.message.contains("nothing was overwritten"));
     assert_eq!(document.revision(), revision + 1, "the newer revision stands");
     assert_eq!(document.commits.lock().unwrap().len(), 1);
+    service.shutdown();
+}
+
+/// A script's own output belongs in its log, not only the lines it chose to log.
+///
+/// `print()` and anything a library writes to stderr are how a person actually debugs a
+/// recipe, so both are captured for the duration of the job, in order, with the stream
+/// distinguishable by level.
+#[test]
+fn print_and_stderr_reach_the_job_log() {
+    let _guard = interpreter();
+    let _runtime = runtime_or_skip!();
+    let document = MemoryDocument::new(0);
+    let service = service(document, 10_000);
+    let source = r#"
+import sys
+import splatmcp
+
+def generate(ctx):
+    print("plain print")
+    print("two", "arguments")
+    print("no newline", end="")
+    print(" - same line")
+    sys.stdout.write("written directly\n")
+    sys.stderr.write("a warning on stderr\n")
+    print("after the warning")
+    ctx.log("explicit log line")
+    return splatmcp.axis_fixture()
+"#;
+    let receipt = service
+        .submit(request(
+            "stdout",
+            source,
+            TargetSpec::new_document(None),
+            false,
+            serde_json::json!({}),
+            0,
+        ))
+        .unwrap();
+    let view = wait_for(&service, receipt.job_id);
+    dump_log(&view);
+    assert_eq!(view.state, JobState::Committed, "{:?}", view.error);
+
+    let text: Vec<&str> = view.logs.iter().map(|line| line.text.as_str()).collect();
+    assert!(text.contains(&"plain print"), "stdout is captured: {text:?}");
+    assert!(text.contains(&"two arguments"), "print joins its arguments: {text:?}");
+    assert!(
+        text.contains(&"no newline - same line"),
+        "a partial line is completed by the next write: {text:?}"
+    );
+    assert!(text.contains(&"written directly"), "sys.stdout.write works: {text:?}");
+    assert!(text.contains(&"after the warning"), "output resumes after stderr: {text:?}");
+    assert!(text.contains(&"explicit log line"), "ctx.log still works: {text:?}");
+
+    // stderr is distinguishable from stdout, and is a warning rather than a failure.
+    let warning = view
+        .logs
+        .iter()
+        .find(|line| line.text.contains("a warning on stderr"))
+        .expect("stderr is captured");
+    assert_eq!(warning.level, LogLevel::Warning);
+    let printed = view
+        .logs
+        .iter()
+        .find(|line| line.text == "plain print")
+        .unwrap();
+    assert_eq!(printed.level, LogLevel::Info);
+
+    // The log is in order, so a reader can follow what the script did.
+    let order = |needle: &str| {
+        view.logs
+            .iter()
+            .position(|line| line.text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is missing"))
+    };
+    assert!(order("plain print") < order("a warning on stderr"));
+    assert!(order("a warning on stderr") < order("after the warning"));
+    service.shutdown();
+}
+
+/// The interpreter's own streams come back after a job, whatever the job did.
+#[test]
+fn a_job_restores_the_interpreters_streams() {
+    let _guard = interpreter();
+    let _runtime = runtime_or_skip!();
+    let document = MemoryDocument::new(0);
+    let service = service(document, 10_000);
+    // A job that replaces `sys.stdout` itself, and one that raises: neither may leave the
+    // next job's output pointed at a dead stream.
+    let source = r#"
+import sys
+
+def generate(ctx):
+    if ctx.params.get("hostile"):
+        sys.stdout = None
+    raise RuntimeError("deliberate")
+"#;
+    for (request_id, params) in [
+        ("restore-plain", serde_json::json!({})),
+        ("restore-hostile", serde_json::json!({"hostile": true})),
+    ] {
+        let receipt = service
+            .submit(request(
+                request_id,
+                source,
+                TargetSpec::new_document(None),
+                false,
+                params,
+                0,
+            ))
+            .unwrap();
+        let view = wait_for(&service, receipt.job_id);
+        assert_eq!(view.state, JobState::Failed, "{:?}", view.error);
+    }
+
+    // A later job still captures its output, so the streams were restored.
+    let receipt = service
+        .submit(request(
+            "restore-after",
+            "def generate(ctx):\n    print('still captured')\n    return None\n",
+            TargetSpec::new_document(None),
+            false,
+            serde_json::json!({}),
+            0,
+        ))
+        .unwrap();
+    let view = wait_for(&service, receipt.job_id);
+    assert!(
+        view.logs.iter().any(|line| line.text.contains("still captured")),
+        "the streams were not restored: {:?}",
+        view.logs
+    );
     service.shutdown();
 }
 
@@ -827,6 +987,83 @@ def generate(ctx):
 
     let bounds = view.bounds.expect("bounds are reported");
     assert!((bounds.radius - 1.03).abs() < 0.05, "radius {}", bounds.radius);
+    service.shutdown();
+}
+
+/// The two flags an agent needs for iterative modelling, through the real stack.
+///
+/// `display: false` must leave the viewer alone while still committing, and `frame: false`
+/// must tell it to keep the camera. Both used to be decided inside the document owner, so
+/// neither flag reached the viewer.
+#[test]
+fn display_and_frame_flags_reach_the_viewer() {
+    let _guard = interpreter();
+    let _runtime = runtime_or_skip!();
+    let document = MemoryDocument::new(0);
+    // A document that already exists, so every revision below is a commit on top of it.
+    let starting_revision = document.revision();
+    let service = service(document.clone(), 10_000);
+    let recipe = "import splatmcp\n\ndef generate(ctx):\n    return splatmcp.axis_fixture()\n";
+
+    // display: false - committed, not shown.
+    let receipt = service
+        .submit(GenerationRequest {
+            frame: true,
+            ..request("flags-none", recipe, TargetSpec::new_document(None), false, serde_json::json!({}), 0)
+        })
+        .unwrap();
+    let view = wait_for(&service, receipt.job_id);
+    assert_eq!(view.state, JobState::Committed, "{:?}", view.error);
+    assert_eq!(view.revision, Some(starting_revision + 1));
+    assert_eq!(view.display, DisplayState::NotRequested);
+    assert!(
+        document.published.lock().unwrap().is_empty(),
+        "display:false must not publish: the viewer was told about {:?}",
+        document.published.lock().unwrap()
+    );
+
+    // frame: false - shown, camera kept.
+    let revision = view.revision.unwrap();
+    assert_eq!(revision, starting_revision + 1);
+    let receipt = service
+        .submit(GenerationRequest {
+            frame: false,
+            ..request(
+                "flags-keep-view",
+                recipe,
+                TargetSpec::new_document(None),
+                true,
+                serde_json::json!({}),
+                0,
+            )
+        })
+        .unwrap();
+    let view = wait_for(&service, receipt.job_id);
+    assert_eq!(view.state, JobState::Committed, "{:?}", view.error);
+    assert_eq!(view.revision, Some(revision + 1));
+    assert_eq!(view.display, DisplayState::Pending, "the revision was published");
+    assert_eq!(
+        document.published.lock().unwrap().as_slice(),
+        [(revision + 1, false)],
+        "the viewer must be told to keep the camera"
+    );
+
+    // The default still frames the new content.
+    let receipt = service
+        .submit(request(
+            "flags-frame",
+            recipe,
+            TargetSpec::new_document(None),
+            true,
+            serde_json::json!({}),
+            0,
+        ))
+        .unwrap();
+    wait_for(&service, receipt.job_id);
+    assert_eq!(
+        document.published.lock().unwrap().last().copied(),
+        Some((revision + 2, true))
+    );
     service.shutdown();
 }
 

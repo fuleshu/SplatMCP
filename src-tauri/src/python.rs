@@ -22,8 +22,8 @@ use splatmcp_python::runtime::{Limits, PythonRuntime, RuntimeRoots};
 use splatmcp_python::script::ScriptSnapshot;
 use splatmcp_python::{
     CommitOutcome, CommitRequest, DocumentIdentity, DocumentTarget, GenerationRequest,
-    GenerationService, JobReceipt, JobSummary, JobView, PythonError, RuntimeReport,
-    ServiceConfig, TargetSpec,
+    GenerationService, JobReceipt, JobSummary, JobView, PublishOptions, PythonError,
+    RuntimeReport, ServiceConfig, TargetSpec,
 };
 use splatmcp_python::executor::{RunnerInfo, ScriptRunner};
 use tauri::{AppHandle, Emitter, Manager};
@@ -63,10 +63,7 @@ impl PythonHost {
         let config = ServiceConfig {
             executor: ExecutorConfig::default(),
         };
-        let target: Arc<dyn DocumentTarget> = Arc::new(AppDocumentTarget {
-            app: app.clone(),
-            frame_revisions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        });
+        let target: Arc<dyn DocumentTarget> = Arc::new(AppDocumentTarget { app: app.clone() });
 
         let bundled_root = bundled_runtime_dir(app);
         let roots = RuntimeRoots::from_env(bundled_root, Some(crate::paths::python_runtime_dir()));
@@ -163,12 +160,13 @@ impl PythonHost {
             (None, None) => TargetSpec::new_document(request.file_name.clone()),
         };
 
-        let frame = request.frame.unwrap_or(true);
-        self.remember_frame(&target, frame);
         let generation = GenerationRequest {
             snapshot,
             target,
             display: request.display.unwrap_or(true),
+            // Default to framing: a first look at a new object is what a caller almost
+            // always wants, and preserving the camera is the exception an agent asks for.
+            frame: request.frame.unwrap_or(true),
             export_path: request.export_path.as_deref().map(PathBuf::from),
             deadline: request
                 .deadline_seconds
@@ -204,19 +202,11 @@ impl PythonHost {
         self.service.note_display_failed(revision, message)
     }
 
-    /// Forgets a revision once the viewer is done with it.
-    pub fn forget_frame(&self, revision: u64) {
-        // Frames are keyed by revision in the target; the map is small and bounded by the
-        // jobs that ran, so it is only trimmed when a revision is explicitly released.
-        let _ = revision;
-    }
-
     /// Stops the executor, cancelling anything still queued.
     pub fn shutdown(&self) {
         self.service.shutdown();
     }
 
-    fn remember_frame(&self, _target: &TargetSpec, _frame: bool) {}
 }
 
 /// Strips a Windows verbatim prefix so a reported path reads like the one a user sees.
@@ -237,9 +227,6 @@ fn bundled_runtime_dir(app: &AppHandle) -> Option<PathBuf> {
 /// The document owner: it reads and commits the app's displayed splat.
 struct AppDocumentTarget {
     app: AppHandle,
-    /// Whether a revision should re-frame the camera, remembered between commit and
-    /// publication.
-    frame_revisions: std::sync::Mutex<std::collections::HashMap<u64, bool>>,
 }
 
 impl DocumentTarget for AppDocumentTarget {
@@ -257,27 +244,23 @@ impl DocumentTarget for AppDocumentTarget {
     }
 
     fn commit(&self, request: CommitRequest) -> splatmcp_python::Result<CommitOutcome> {
+        // Committing only. The service decides whether the result is shown, and publishing
+        // here would make `display: false` mean nothing: the viewer would be told about the
+        // revision and the user's model would change under them.
         let state = self.app.state::<AppState>();
-        let outcome = state
+        state
             .commit_candidate(request)
-            .map_err(PythonError::DocumentConflict)?;
-        if let CommitOutcome::Committed { identity } = &outcome {
-            let frame = self
-                .frame_revisions
-                .lock()
-                .ok()
-                .and_then(|mut frames| frames.remove(&identity.revision))
-                .unwrap_or(true);
-            self.publish_revision(identity, frame)
-                .map_err(PythonError::Display)?;
-        }
-        Ok(outcome)
+            .map_err(PythonError::DocumentConflict)
     }
 
-    fn publish(&self, _target: &TargetSpec, _identity: &DocumentIdentity) -> splatmcp_python::Result<()> {
-        // Publication happens in `commit`, where the frame flag is available; this keeps
-        // the trait's contract for callers that publish separately.
-        Ok(())
+    fn publish(
+        &self,
+        _target: &TargetSpec,
+        identity: &DocumentIdentity,
+        options: PublishOptions,
+    ) -> splatmcp_python::Result<()> {
+        self.publish_revision(identity, options.frame)
+            .map_err(PythonError::Display)
     }
 }
 
@@ -369,9 +352,7 @@ pub fn python_job_cancel(
 /// Tauri command: the viewer rendered a revision.
 #[tauri::command]
 pub fn python_note_rendered(revision: u64, host: tauri::State<'_, PythonHostState>) -> Option<u64> {
-    let job_id = host.0.note_rendered(revision);
-    host.0.forget_frame(revision);
-    job_id
+    host.0.note_rendered(revision)
 }
 
 /// Tauri command: the viewer failed to load a revision.

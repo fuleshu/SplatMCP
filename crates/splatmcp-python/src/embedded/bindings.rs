@@ -28,7 +28,10 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::ndarray::{Array1, Array2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
+};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Py;
@@ -37,7 +40,7 @@ use splatmcp_core::Rng;
 
 use crate::arrays::{BatchMetadata, GaussianBatch};
 use crate::conventions::{self, AuthoringSpace};
-use crate::executor::{LogLevel, RunContext};
+use crate::executor::{LogLevel, LogSink, RunContext};
 use crate::geometry::{CurveSpec, SurfaceSpec};
 
 pyo3::create_exception!(
@@ -124,6 +127,154 @@ impl PyBatch {
             self.inner.len(),
             self.inner.metadata.component_id
         )
+    }
+}
+
+/// A text stream that forwards what a script prints into its job log.
+///
+/// `sys.stdout` and `sys.stderr` are pointed at one of these for the duration of a job, so
+/// `print()` and anything a library writes to stderr land in the same bounded log as
+/// `ctx.log()`. Without it, a script's own output is invisible unless the script knew to
+/// call `ctx.log()`, which is exactly the output a person debugging a recipe needs.
+///
+/// Lines are assembled here rather than forwarded per `write` call, because Python flushes
+/// a `print()` in several pieces; and the log stays bounded because it is the job's own
+/// [`LogSink`], which drops its oldest lines when it is full.
+#[pyclass(name = "JobStream", module = "splatmcp")]
+pub struct PyJobStream {
+    sink: LogSink,
+    level: LogLevel,
+    /// Text written since the last newline.
+    pending: Mutex<String>,
+}
+
+#[pymethods]
+impl PyJobStream {
+    /// Accepts text, forwarding every complete line to the log.
+    ///
+    /// Returns the character count, which is what `io.TextIOBase.write` promises; code that
+    /// checks the result (`print` does not, but plenty of libraries do) keeps working.
+    fn write(&self, text: &str) -> usize {
+        let Ok(mut pending) = self.pending.lock() else {
+            return text.len();
+        };
+        pending.push_str(text);
+        while let Some(index) = pending.find('\n') {
+            let line: String = pending.drain(..=index).collect();
+            self.emit(line.trim_end_matches(['\n', '\r']));
+        }
+        // A single write with no newline is not a line yet; it is flushed on `flush` or at
+        // the end of the job, so a progress bar written with `end=""` still appears.
+        text.chars().count()
+    }
+
+    /// Writes an iterable of lines, as `io.TextIOBase` does.
+    fn writelines(&self, lines: &Bound<'_, PyAny>) -> PyResult<()> {
+        for line in lines.try_iter()? {
+            let line: String = line?.extract()?;
+            self.write(&line);
+        }
+        Ok(())
+    }
+
+    /// Flushes any partial line, then does nothing else: the log is already in memory.
+    fn flush(&self) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let partial = std::mem::take(&mut *pending);
+        let partial = partial.trim_end_matches(['\n', '\r']);
+        if !partial.is_empty() {
+            let line = partial.to_owned();
+            drop(pending);
+            self.emit(&line);
+        }
+    }
+
+    /// True when the object is writable, which is what `print` and most writers check.
+    fn writable(&self) -> bool {
+        true
+    }
+
+    /// Never readable: this stream only accepts output.
+    fn readable(&self) -> bool {
+        false
+    }
+
+    /// Not a terminal, so libraries keep their output plain and unbuffered by colour codes.
+    fn isatty(&self) -> bool {
+        false
+    }
+
+    #[getter]
+    fn encoding(&self) -> &str {
+        "utf-8"
+    }
+
+    #[getter]
+    fn errors(&self) -> &str {
+        "replace"
+    }
+
+    fn __repr__(&self) -> String {
+        format!("splatmcp.JobStream(level={:?})", self.level)
+    }
+}
+
+impl PyJobStream {
+    fn new(sink: LogSink, level: LogLevel) -> Self {
+        Self {
+            sink,
+            level,
+            pending: Mutex::new(String::new()),
+        }
+    }
+
+    fn emit(&self, line: &str) {
+        if !line.is_empty() {
+            self.sink.push(self.level, truncate(line.to_owned()));
+        }
+    }
+}
+
+/// Points the interpreter's standard streams at the job log for the duration of a job.
+///
+/// Held by the runner and restored on the way out, including when the script raised: a job
+/// must not leave the next job's output pointed at its own log.
+pub(crate) struct StreamGuard {
+    stdout: Py<PyAny>,
+    stderr: Py<PyAny>,
+    streams: Vec<Py<PyJobStream>>,
+}
+
+impl StreamGuard {
+    /// Installs the job's streams and remembers the interpreter's own.
+    pub(crate) fn install(py: Python<'_>, context: &RunContext) -> PyResult<Self> {
+        let sys = PyModule::import(py, "sys")?;
+        let stdout = sys.getattr("stdout")?.unbind();
+        let stderr = sys.getattr("stderr")?.unbind();
+        // `print` writes to stdout at info level; anything a library sends to stderr is a
+        // warning, not a job failure - the job's own structured error says that.
+        let out = Py::new(py, PyJobStream::new(context.logs.clone(), LogLevel::Info))?;
+        let err = Py::new(py, PyJobStream::new(context.logs.clone(), LogLevel::Warning))?;
+        sys.setattr("stdout", &out)?;
+        sys.setattr("stderr", &err)?;
+        Ok(Self {
+            stdout,
+            stderr,
+            streams: vec![out, err],
+        })
+    }
+
+    /// Puts the interpreter's own streams back and flushes any partial line.
+    pub(crate) fn restore(self, py: Python<'_>) {
+        if let Ok(sys) = PyModule::import(py, "sys") {
+            let _ = sys.setattr("stdout", self.stdout.bind(py));
+            let _ = sys.setattr("stderr", self.stderr.bind(py));
+        }
+        for stream in &self.streams {
+            stream.borrow(py).flush();
+        }
     }
 }
 
@@ -278,6 +429,12 @@ impl PyContext {
 
     /// The read-only source snapshot, or `None` for a job that creates a new document.
     ///
+    /// The arrays have exactly the shapes [`batch`] takes - `positions`, `scales` and
+    /// `colors` as `(N, 3)`, `rotations` as `(N, 4)`, `opacity` as `(N,)` - so a recipe can
+    /// pass them straight back without reshaping. Returning flattened buffers instead would
+    /// silently drop the structure the contract is written in terms of, and every script
+    /// would have to know the layout to put it back.
+    ///
     /// The arrays are copies: a script can read the current model without any risk of
     /// tearing it, and cannot mutate the document through them.
     fn source<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -288,13 +445,12 @@ impl PyContext {
         dict.set_item("document_id", &snapshot.document_id)?;
         dict.set_item("revision", snapshot.revision)?;
         dict.set_item("component_id", &snapshot.component_id)?;
-        let batch = &snapshot.batch;
-        dict.set_item("positions", flatten_points(py, &batch.positions)?)?;
-        dict.set_item("scales", flatten_points(py, &batch.scales)?)?;
-        dict.set_item("rotations", flatten_quaternions(py, &batch.rotations)?)?;
-        dict.set_item("colors", flatten_points(py, &batch.colors)?)?;
-        dict.set_item("opacity", batch.opacities.clone().into_pyarray(py))?;
-        dict.set_item("point_count", batch.len())?;
+        dict.set_item("point_count", snapshot.batch.len())?;
+        dict.set_item("positions", points_array(py, &snapshot.batch.positions)?)?;
+        dict.set_item("scales", points_array(py, &snapshot.batch.scales)?)?;
+        dict.set_item("colors", points_array(py, &snapshot.batch.colors)?)?;
+        dict.set_item("rotations", quaternions_array(py, &snapshot.batch.rotations)?)?;
+        dict.set_item("opacity", scalars_array(py, &snapshot.batch.opacities)?)?;
         Ok(Some(dict))
     }
 
@@ -373,6 +529,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyBatch>()?;
     module.add_class::<PyRng>()?;
     module.add_class::<PyContext>()?;
+    module.add_class::<PyJobStream>()?;
 
     module.add_function(wrap_pyfunction!(batch, module)?)?;
     module.add_function(wrap_pyfunction!(merge, module)?)?;
@@ -618,28 +775,46 @@ fn read_scalars(array: &PyReadonlyArray1<f32>, name: &str) -> PyResult<Vec<f32>>
     Ok(values)
 }
 
-/// Flattens `(N, 3)` points into one NumPy array.
-fn flatten_points<'py>(
+/// Copies `(N, 3)` points into a NumPy array of the same shape.
+fn points_array<'py>(
     py: Python<'py>,
     values: &[[f32; 3]],
-) -> PyResult<Bound<'py, PyArray1<f32>>> {
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let mut flat = Vec::with_capacity(values.len() * 3);
     for value in values {
         flat.extend_from_slice(value);
     }
-    Ok(flat.into_pyarray(py))
+    shaped(py, flat, 3, values.len())
 }
 
-/// Flattens `(N, 4)` quaternions into one NumPy array.
-fn flatten_quaternions<'py>(
+/// Copies `(N, 4)` quaternions into a NumPy array of the same shape.
+fn quaternions_array<'py>(
     py: Python<'py>,
     values: &[[f32; 4]],
-) -> PyResult<Bound<'py, PyArray1<f32>>> {
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let mut flat = Vec::with_capacity(values.len() * 4);
     for value in values {
         flat.extend_from_slice(value);
     }
-    Ok(flat.into_pyarray(py))
+    shaped(py, flat, 4, values.len())
+}
+
+/// Copies `(N,)` values into a NumPy array of the same shape.
+fn scalars_array<'py>(py: Python<'py>, values: &[f32]) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    Ok(Array1::from_vec(values.to_vec()).into_pyarray(py))
+}
+
+/// Builds a two-dimensional array, keeping the row-major layout `batch` reads.
+fn shaped<'py>(
+    py: Python<'py>,
+    flat: Vec<f32>,
+    width: usize,
+    rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let array = Array2::from_shape_vec((rows, width), flat).map_err(|error| {
+        invalid_batch(format!("could not shape the snapshot array: {error}"))
+    })?;
+    Ok(array.into_pyarray(py))
 }
 
 /// Converts plain Python data into JSON, for the geometry spec parameters.

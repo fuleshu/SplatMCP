@@ -176,6 +176,21 @@ def generate(ctx):                      # the entry point is configurable
     )
 ```
 
+### Iterative editing: `display` and `frame`
+
+Two request flags exist because an agent editing a model and a user looking at one want
+different things:
+
+| Flag | `true` (default) | `false` |
+| --- | --- | --- |
+| `display` | the committed revision is published to the viewer | the revision is committed and the viewer is left alone, so the displayed model does not change |
+| `frame` | the camera re-frames the new content | the camera keeps its position and orientation, so only the geometry that changed looks different |
+
+`frame` is ignored when `display` is `false`, and both are reported back: a job that was not
+displayed reports `display: not_requested`, so a caller can tell "committed quietly" apart
+from "committed and shown". Publishing happens after the commit and only when `display` is
+true, which is why the flag cannot be ignored in the middle of a commit.
+
 `ctx` provides:
 
 | Member | Purpose |
@@ -185,7 +200,7 @@ def generate(ctx):                      # the entry point is configurable
 | `ctx.rng()` | deterministic RNG: `unit`, `range`, `jitter`, `quaternion`, `array`, `normal_array` |
 | `ctx.check_cancelled()` | raises `splatmcp.Cancelled` at a checkpoint |
 | `ctx.progress(fraction, message)` | bounded progress |
-| `ctx.log(message, level)` | bounded log line |
+| `ctx.log(message, level)` | bounded log line; `print()` and stderr are captured too |
 | `ctx.source()` | read-only snapshot of the document being edited, or `None` |
 | `ctx.remaining_seconds` | seconds left before the deadline |
 
@@ -199,6 +214,18 @@ is what makes a sampled sheet read as a sheet.
 
 Each job runs in a **fresh module namespace**. Imported libraries stay loaded, and a recipe
 must not assume anything survives between jobs beyond that.
+
+### Logs
+
+A job's log holds its own output as well as its explicit lines. `sys.stdout` and `sys.stderr`
+point at the job's log for the duration of the job, so `print(...)`, `sys.stdout.write(...)`
+and anything a library writes to stderr all appear - stdout at `info`, stderr at `warning`,
+in the order they were written, with a partially written line completed by the next write.
+The streams are restored on every path out, including a script that raises or replaces
+`sys.stdout` itself, so one job cannot swallow the next one's output.
+
+Nothing is lost to a log bound either: the buffer drops its oldest lines and the reply sets
+`log_truncated`, rather than silently trimming the middle.
 
 The tests in `tests/embedded_generation.rs` serialise themselves on one interpreter: the
 app runs one job at a time, so a test suite that ran several jobs at once would be testing

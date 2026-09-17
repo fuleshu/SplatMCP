@@ -321,6 +321,14 @@ impl ProgressSink {
         }
     }
 
+    /// Marks the job's own work as finished, leaving the last message in place.
+    ///
+    /// A script that reports nothing - which plenty of correct scripts do - would otherwise
+    /// still read as 0% after a successful commit, which looks like a job that never ran.
+    pub fn complete(&self) {
+        self.fraction.store(1.0f32.to_bits(), Ordering::SeqCst);
+    }
+
     /// Last reported fraction.
     pub fn fraction(&self) -> f32 {
         f32::from_bits(self.fraction.load(Ordering::SeqCst))
@@ -913,5 +921,19 @@ mod tests {
         sink.report(1.5, Some("done".to_owned()));
         assert_eq!(sink.fraction(), 1.0);
         assert_eq!(sink.message().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn completing_a_job_reaches_full_progress_and_keeps_its_message() {
+        let sink = ProgressSink::default();
+        assert_eq!(sink.fraction(), 0.0);
+        sink.report(0.25, Some("sampled".to_owned()));
+        sink.complete();
+        assert_eq!(sink.fraction(), 1.0);
+        assert_eq!(
+            sink.message().as_deref(),
+            Some("sampled"),
+            "the script's last message is more useful than none"
+        );
     }
 }

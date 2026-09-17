@@ -368,8 +368,21 @@ impl ScriptRunner for PythonRunner {
     }
 }
 
-/// Executes one script in a fresh module and converts its result.
+/// Executes one script with its output captured into the job log.
+///
+/// The standard streams are redirected for the duration of the job, so `print()` and
+/// anything a library writes to stderr appear alongside `ctx.log()` lines. They are
+/// restored on every path out, including a script that raised or was cancelled.
 fn run_script(py: Python<'_>, context: &Arc<RunContext>) -> Result<GaussianBatch> {
+    let guard = bindings::StreamGuard::install(py, context)
+        .map_err(|error| script_error(py, &error))?;
+    let outcome = execute_script(py, context);
+    guard.restore(py);
+    outcome
+}
+
+/// Executes one script in a fresh module and converts its result.
+fn execute_script(py: Python<'_>, context: &Arc<RunContext>) -> Result<GaussianBatch> {
     let module = PyModule::new(py, "__splatmcp_job__")
         .map_err(|error| PythonError::Script(format!("could not create a script namespace: {error}")))?;
     let namespace = module.dict();

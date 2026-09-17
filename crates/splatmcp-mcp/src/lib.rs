@@ -240,8 +240,10 @@ impl SplatMcpServer {
     #[tool(
         description = "Run an embedded-Python recipe that builds Gaussians with NumPy and shows \
                        the result in the SplatMCP window. Pass code or script_path plus a \
-                       request_id, then poll the returned job id with get_python_job. Scripts are \
-                       local code execution, not a sandbox.",
+                       request_id, then poll the returned job id with get_python_job. Use \
+                       display:false to commit without changing what is displayed, and \
+                       frame:false to keep the current camera. Scripts are local code execution, \
+                       not a sandbox.",
         annotations(title = "Run Python splat", read_only_hint = false, open_world_hint = true)
     )]
     async fn run_python_splat(
