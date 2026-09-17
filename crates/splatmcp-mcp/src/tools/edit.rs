@@ -168,6 +168,19 @@ pub struct InfoReply {
     pub sample: Option<Vec<PointOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Identity of the displayed document, when the call read one.
+    ///
+    /// A Python edit has to state `expected_revision`, and the caller reads it here. It is
+    /// an addition to the reply, so a caller that only wanted the summary is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<DocumentIdentity>,
+}
+
+/// Identity and revision of the document a reply describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocumentIdentity {
+    pub document_id: String,
+    pub revision: u64,
 }
 
 fn parse_box(values: &[f32], name: &str) -> Result<Box3, String> {
@@ -285,18 +298,32 @@ fn looks_like_path(source: &str) -> bool {
     lower.ends_with(".ply") || lower.contains('/') || lower.contains('\\')
 }
 
+/// Where a splat came from, as `resolve_source` reports it.
+#[derive(Debug)]
+pub struct ResolvedSource {
+    pub splat: Splat,
+    /// Human readable description of the source.
+    pub source: String,
+    /// File it was read from, when it came from disk.
+    pub path: Option<String>,
+    /// Identity of the displayed document, when the source was the app.
+    pub document: Option<DocumentIdentity>,
+}
+
 /// Resolves where a splat comes from and loads it.
-///
-/// Returns the splat, a description of the source, and the file it was read from (if any).
-pub fn resolve_source(
-    link: &AppLink,
-    source: Option<&str>,
-) -> Result<(Splat, String, Option<String>), String> {
+pub fn resolve_source(link: &AppLink, source: Option<&str>) -> Result<ResolvedSource, String> {
     let source = source.unwrap_or(SOURCE_VIEWER).trim().to_owned();
     if source.eq_ignore_ascii_case(SOURCE_NEW) {
-        return Ok((Splat::new(), "new".to_owned(), None));
+        return Ok(ResolvedSource {
+            splat: Splat::new(),
+            source: "new".to_owned(),
+            path: None,
+            document: None,
+        });
     }
     if source.eq_ignore_ascii_case(SOURCE_VIEWER) {
+        // The viewer status says whether anything is displayed; the document reply carries
+        // the bytes *and* the identity a Python edit has to quote.
         let status: ViewerStatus = link.request_typed(Method::ViewerStatus, Value::Null)?;
         if !status.loaded {
             return Err(
@@ -305,14 +332,24 @@ pub fn resolve_source(
                     .to_owned(),
             );
         }
-        let bytes = document_ply_bytes(link)?;
-        let splat = read_ply(&bytes)
+        let document = document_ply(link)?;
+        let splat = read_ply(&document.1)
             .map_err(|error| format!("the displayed splat could not be read: {error}"))?;
-        return Ok((splat, "viewer".to_owned(), None));
+        return Ok(ResolvedSource {
+            splat,
+            source: "viewer".to_owned(),
+            path: None,
+            document: document.0,
+        });
     }
     if looks_like_path(&source) {
         let splat = read_splat_file(&source)?;
-        return Ok((splat, format!("path:{source}"), Some(source)));
+        return Ok(ResolvedSource {
+            splat,
+            source: format!("path:{source}"),
+            path: Some(source),
+            document: None,
+        });
     }
     Err(format!(
         "unknown source '{source}'; use '{SOURCE_VIEWER}', '{SOURCE_NEW}', or a .ply path"
@@ -321,14 +358,31 @@ pub fn resolve_source(
 
 /// PLY bytes of the splat the app displays, read back over the bridge.
 pub fn document_ply_bytes(link: &AppLink) -> Result<Vec<u8>, String> {
+    Ok(document_ply(link)?.1)
+}
+
+/// The displayed document's identity and bytes, in one bridge round trip.
+fn document_ply(link: &AppLink) -> Result<(Option<DocumentIdentity>, Vec<u8>), String> {
     let value = link.request(Method::DocumentGetPly, Value::Null)?;
     let encoded = value
         .get("ply_base64")
         .and_then(Value::as_str)
         .ok_or_else(|| "the app did not return the displayed splat".to_owned())?;
-    BASE64
+    let bytes = BASE64
         .decode(encoded.as_bytes())
-        .map_err(|error| format!("the app returned an unreadable splat: {error}"))
+        .map_err(|error| format!("the app returned an unreadable splat: {error}"))?;
+    // Identity is additive: an older app that does not report it still answers the bytes.
+    let document = match (
+        value.get("document_id").and_then(Value::as_str),
+        value.get("revision").and_then(Value::as_u64),
+    ) {
+        (Some(document_id), Some(revision)) => Some(DocumentIdentity {
+            document_id: document_id.to_owned(),
+            revision,
+        }),
+        _ => None,
+    };
+    Ok((document, bytes))
 }
 
 /// Applies `ops` to `splat` and reports each step.
@@ -406,6 +460,16 @@ pub fn edit_reply(
 
 /// Builds the reply of `splat_info`.
 pub fn info_reply(splat: &Splat, source: String, sample: Option<usize>) -> InfoReply {
+    info_reply_with_document(splat, source, sample, None)
+}
+
+/// Same, with the identity of the document the splat came from.
+pub fn info_reply_with_document(
+    splat: &Splat,
+    source: String,
+    sample: Option<usize>,
+    document: Option<DocumentIdentity>,
+) -> InfoReply {
     let sample = sample.map(|count| {
         splat
             .points
@@ -418,6 +482,7 @@ pub fn info_reply(splat: &Splat, source: String, sample: Option<usize>) -> InfoR
         summary: SplatSummary::of(splat),
         sample,
         source: Some(source),
+        document,
     }
 }
 
@@ -717,10 +782,11 @@ mod tests {
         assert!(error.contains("unknown source 'gallery'"), "{error}");
         assert!(error.contains("viewer"), "{error}");
 
-        let (empty, source, path) = resolve_source(&link, Some("new")).unwrap();
-        assert!(empty.is_empty());
-        assert_eq!(source, "new");
-        assert_eq!(path, None);
+        let resolved = resolve_source(&link, Some("new")).unwrap();
+        assert!(resolved.splat.is_empty());
+        assert_eq!(resolved.source, "new");
+        assert_eq!(resolved.path, None);
+        assert!(resolved.document.is_none(), "a new splat has no document identity");
 
         let error = resolve_source(&link, Some("C:/nowhere/missing.ply")).unwrap_err();
         assert!(error.contains("could not read"), "{error}");
@@ -733,6 +799,30 @@ mod tests {
         assert!(looks_like_path("sub\\dir\\file.ply"));
         assert!(!looks_like_path("viewer"));
         assert!(!looks_like_path("new"));
+    }
+
+    #[test]
+    fn the_info_reply_carries_the_document_identity_when_there_is_one() {
+        let splat = grid(2);
+        let reply = info_reply_with_document(
+            &splat,
+            "viewer".to_owned(),
+            None,
+            Some(DocumentIdentity {
+                document_id: "doc-7".to_owned(),
+                revision: 4,
+            }),
+        );
+        let encoded = serde_json::to_string(&reply).unwrap();
+        assert!(
+            encoded.contains("\"document\":{\"document_id\":\"doc-7\",\"revision\":4}"),
+            "{encoded}"
+        );
+
+        // A reply without identity omits the field entirely, so an older app or a .ply
+        // path does not add noise to the reply.
+        let plain = info_reply(&splat, "new".to_owned(), None);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("document"));
     }
 
     #[test]

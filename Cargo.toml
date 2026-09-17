@@ -3,6 +3,7 @@ members = [
     "crates/splatmcp-bridge",
     "crates/splatmcp-core",
     "crates/splatmcp-mcp",
+    "crates/splatmcp-python",
     "src-tauri",
 ]
 resolver = "3"

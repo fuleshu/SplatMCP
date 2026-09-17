@@ -14,17 +14,21 @@ use serde_json::{json, Value};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
     BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest, Handler, LoadPlyRequest, Method,
-    ViewerStatus,
+    PythonCancelRequest, PythonJobQuery, PythonRunRequest, ViewerStatus,
 };
 use tauri::{AppHandle, Manager};
 
 use crate::document::{AppState, Document};
+use crate::python::PythonHost;
 use crate::viewer::{Viewer, VIEWER_TIMEOUT};
 
-/// Bridge handler that turns requests into webview work or document reads.
+/// Bridge handler that turns requests into webview work, document reads or generation
+/// jobs.
 struct AppBridge {
     app: AppHandle,
     viewer: Arc<Viewer>,
+    /// The one generation service this process hosts; the panel uses the same one.
+    python: Arc<PythonHost>,
     started: Instant,
     app_version: String,
 }
@@ -65,6 +69,28 @@ impl Handler for AppBridge {
             }
             Method::ViewerLoadPly => self.load_ply(params),
             Method::DocumentGetPly => self.document_ply(),
+            Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
+            Method::PythonRunSplat => {
+                let request: PythonRunRequest = serde_json::from_value(params)
+                    .map_err(|error| format!("invalid python run request: {error}"))?;
+                let receipt = self.python.submit(request)?;
+                serde_json::to_value(receipt).map_err(|error| error.to_string())
+            }
+            Method::PythonJob => {
+                let query: PythonJobQuery = if params.is_null() {
+                    PythonJobQuery::default()
+                } else {
+                    serde_json::from_value(params)
+                        .map_err(|error| format!("invalid python job query: {error}"))?
+                };
+                self.python_job(query)
+            }
+            Method::PythonJobCancel => {
+                let request: PythonCancelRequest = serde_json::from_value(params)
+                    .map_err(|error| format!("invalid python cancel request: {error}"))?;
+                let view = self.python.cancel(request.job_id)?;
+                serde_json::to_value(view).map_err(|error| error.to_string())
+            }
         }
     }
 }
@@ -105,16 +131,35 @@ impl AppBridge {
         Ok(serde_json::to_value(status).map_err(|error| error.to_string())?)
     }
 
+    /// A job's status, or the job history when no job id was given.
+    fn python_job(&self, query: PythonJobQuery) -> Result<Value, String> {
+        if query.job_id == 0 {
+            let recent = self.python.recent(query.log_limit.unwrap_or(20).min(100));
+            return Ok(json!({ "recent": recent }));
+        }
+        let view = self.python.status(
+            query.job_id,
+            query.log_after.unwrap_or(0),
+            query.log_limit.unwrap_or(200).min(1000),
+        )?;
+        serde_json::to_value(view).map_err(|error| error.to_string())
+    }
+
     /// PLY bytes of the document the app displays.
     fn document_ply(&self) -> Result<Value, String> {
         let state = self.app.state::<AppState>();
         let Some(bytes) = state.ply_bytes()? else {
             return Err("no splat is loaded in the desktop app".to_owned());
         };
+        // Identity travels with the bytes: a Python edit has to quote the revision it is
+        // editing, and `splat_info` is where a caller reads it.
+        let identity = state.identity()?;
         Ok(json!({
             "ply_base64": BASE64.encode(bytes),
             "file_name": state.file_name()?,
             "point_count": state.point_count()?,
+            "document_id": identity.as_ref().map(|identity| identity.document_id.clone()),
+            "revision": identity.as_ref().map(|identity| identity.revision),
         }))
     }
 }
@@ -136,7 +181,7 @@ impl BridgeHost {
 }
 
 /// Binds the bridge, publishes `bridge.json` and starts serving.
-pub fn start(app: &AppHandle, viewer: Arc<Viewer>) -> Result<BridgeHost, String> {
+pub fn start(app: &AppHandle, viewer: Arc<Viewer>, python: Arc<PythonHost>) -> Result<BridgeHost, String> {
     let server = BridgeServer::bind().map_err(|error| error.to_string())?;
     let descriptor = server
         .publish(env!("CARGO_PKG_VERSION"))
@@ -144,6 +189,7 @@ pub fn start(app: &AppHandle, viewer: Arc<Viewer>) -> Result<BridgeHost, String>
     let handler = Arc::new(AppBridge {
         app: app.clone(),
         viewer,
+        python,
         started: Instant::now(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
     });

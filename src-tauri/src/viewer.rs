@@ -23,8 +23,6 @@ pub const BRIDGE_REQUEST_EVENT: &str = "splat://bridge-request";
 pub const VIEWER_WINDOW: &str = "main";
 /// Patience for requests that only read or set viewer state.
 pub const VIEWER_TIMEOUT: Duration = Duration::from_secs(15);
-/// Patience for requests that render a frame.
-pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Payload of [`BRIDGE_REQUEST_EVENT`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -136,6 +134,10 @@ mod tests {
 
     #[test]
     fn timeouts_are_generous_enough_for_a_render() {
+        // A capture renders a frame, so it gets more patience than a state read. The
+        // constant comes from the bridge crate, so the app and the MCP client cannot
+        // disagree about how long that is.
+        use splatmcp_bridge::client::CAPTURE_TIMEOUT;
         assert!(CAPTURE_TIMEOUT > VIEWER_TIMEOUT);
         assert!(VIEWER_TIMEOUT >= Duration::from_secs(5));
     }

@@ -6,6 +6,7 @@
 
 pub mod author;
 pub mod edit;
+pub mod python;
 pub mod viewer;
 
 use rmcp::schemars::{self, JsonSchema};

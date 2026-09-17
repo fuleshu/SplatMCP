@@ -10,6 +10,7 @@
 mod bridge;
 mod document;
 mod paths;
+mod python;
 mod settings;
 mod viewer;
 
@@ -65,7 +66,17 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<String>, String> {
     };
 
     std::fs::write(&path, bytes).map_err(|error| format!("could not write {path:?}: {error}"))?;
-    Ok(Some(path.to_string_lossy().to_string()))
+
+    // A PLY cannot hold recipe or component metadata, so a generated document's provenance
+    // is written next to it. Losing it must not fail a successful save.
+    let mut note = path.to_string_lossy().to_string();
+    if let Ok(Some(recipe)) = state.recipe() {
+        match splatmcp_python::script::RecipeRecord::write_sidecar(&path, &recipe) {
+            Ok(sidecar) => note = format!("{note} (recipe: {})", sidecar.display()),
+            Err(error) => eprintln!("splatmcp: could not write the recipe sidecar: {error}"),
+        }
+    }
+    Ok(Some(note))
 }
 
 /// Answers a bridge request that was forwarded into the webview.
@@ -91,7 +102,17 @@ fn main() {
             open_splat,
             current_splat_bytes,
             save_splat,
-            bridge_respond
+            bridge_respond,
+            python::python_runtime_info,
+            python::python_submit,
+            python::python_job,
+            python::python_job_cancel,
+            python::python_note_rendered,
+            python::python_note_display_failed,
+            python::splat_bytes_for_revision,
+            python::document_info,
+            python::python_read_script,
+            python::python_write_script
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -102,9 +123,15 @@ fn main() {
 
             let viewer = Arc::new(Viewer::new(handle.clone()));
             app.manage(bridge::ViewerState(viewer.clone()));
+
+            // The generation host starts before the bridge so an MCP-started job and a
+            // panel-started job share one interpreter and one job registry. A missing
+            // Python runtime only disables generation; the viewer keeps working.
+            let python = Arc::new(python::PythonHost::start(&handle));
+            app.manage(python::PythonHostState(python.clone()));
             // A bridge failure must not stop the viewer from working: without a data
             // directory only the MCP half of the app is unavailable.
-            match bridge::start(&handle, viewer) {
+            match bridge::start(&handle, viewer, python) {
                 Ok(host) => {
                     println!("splatmcp: bridge listening on 127.0.0.1:{}", host.port());
                     let state = app.state::<bridge::BridgeHostState>();
@@ -131,6 +158,9 @@ fn main() {
             // Leave no descriptor behind that points at a dead port.
             handle.state::<bridge::BridgeHostState>().shutdown();
             bridge::retire();
+            // Stop the interpreter after the window is gone: a script that ignores
+            // cancellation can only be waited for, not killed safely.
+            handle.state::<python::PythonHostState>().0.shutdown();
         }
     });
 }

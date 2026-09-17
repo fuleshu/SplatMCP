@@ -92,6 +92,102 @@
         color: var(--muted);
         pointer-events: none;
       }
+      .workspace {
+        display: flex;
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+      .sidebar {
+        flex: 0 0 320px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px 12px;
+        background: var(--panel);
+        border-right: 1px solid var(--border);
+        overflow-y: auto;
+      }
+      .sidebar h2 {
+        margin: 0;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .field label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .field input,
+      .field textarea {
+        font: inherit;
+        color: var(--text);
+        background: #14181c;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 5px 7px;
+      }
+      .field textarea {
+        min-height: 150px;
+        resize: vertical;
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 12px;
+        white-space: pre;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .row button {
+        flex: 0 0 auto;
+        font: inherit;
+        color: var(--text);
+        background: #23282e;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 5px 10px;
+        cursor: pointer;
+      }
+      .row button:disabled {
+        color: var(--muted);
+        opacity: 0.55;
+        cursor: default;
+      }
+      .checks {
+        display: flex;
+        gap: 14px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      #python-runtime[data-state="unavailable"] {
+        color: #ff9a8b;
+      }
+      #python-job {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      #python-log {
+        flex: 1 1 auto;
+        min-height: 90px;
+        max-height: 200px;
+        overflow-y: auto;
+        margin: 0;
+        padding: 6px 8px;
+        background: #12161a;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--muted);
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+        white-space: pre-wrap;
+      }
       .hint {
         position: absolute;
         left: 16px;
@@ -113,10 +209,71 @@
         <button id="save-button" type="button" disabled>Save Splat</button>
         <p id="status"></p>
       </header>
-      <main id="viewer">
-        <p id="splat-status" hidden></p>
-        <p class="hint">drag orbit &middot; right-drag pan &middot; wheel zoom &middot; WASD fly</p>
-      </main>
+      <div class="workspace">
+        <aside class="sidebar">
+          <h2>Python generation</h2>
+          <p id="python-runtime">Checking the Python runtime&hellip;</p>
+          <div class="field">
+            <label for="python-script-path">Script file</label>
+            <input id="python-script-path" type="text" placeholder="C:\recipes\terrain.py"
+                   title="Path of a .py file. Load reads it, Save writes it; Run snapshots the editor content." />
+          </div>
+          <div class="row">
+            <button id="python-load" type="button" title="Read the script file into the editor.">Load</button>
+            <button id="python-save" type="button" title="Write the editor content to the script file.">Save</button>
+          </div>
+          <div class="field">
+            <label for="python-script">Recipe</label>
+            <textarea id="python-script" spellcheck="false" placeholder="def generate(ctx):&#10;    return splatmcp.axis_fixture()"
+                      title="The script that runs in the embedded interpreter. It must define generate(ctx) and return splatmcp.batch(...)."></textarea>
+          </div>
+          <div class="field">
+            <label for="python-params">Params (JSON)</label>
+            <input id="python-params" type="text" placeholder='{"count": 200000}'
+                   title="Parameters the script reads as ctx.params." />
+          </div>
+          <div class="row">
+            <div class="field" style="flex: 1 1 auto">
+              <label for="python-seed">Seed</label>
+              <input id="python-seed" type="number" value="0" title="Seed for ctx.rng(); the same seed and recipe reproduce the same geometry." />
+            </div>
+            <div class="field" style="flex: 1 1 auto">
+              <label for="python-component">Component</label>
+              <input id="python-component" type="text" placeholder="(whole document)"
+                     title="Name of the component this job replaces. Leave empty to replace the whole document." />
+            </div>
+          </div>
+          <div class="row">
+            <div class="field" style="flex: 1 1 auto">
+              <label for="python-revision">Expected revision</label>
+              <input id="python-revision" type="number" min="0" placeholder="(new document)"
+                     title="Revision this edit starts from. A job that starts from a stale revision is refused instead of overwriting newer work." />
+            </div>
+            <div class="field" style="flex: 1 1 auto">
+              <label for="python-export">Export .ply</label>
+              <input id="python-export" type="text" placeholder="(none)"
+                     title="Optional path to write the generated result to as well as showing it." />
+            </div>
+          </div>
+          <div class="checks">
+            <label><input id="python-display" type="checkbox" checked
+                          title="Show the committed revision in the viewer when it is ready." /> Display</label>
+            <label><input id="python-frame" type="checkbox" checked
+                          title="Re-frame the camera on the new revision; uncheck to keep the current view." /> Frame</label>
+          </div>
+          <div class="row">
+            <button id="python-run" type="button" title="Submit the recipe to the app's shared generation service.">Run</button>
+            <button id="python-cancel" type="button" disabled
+                    title="Ask the running job to stop. A native NumPy call can delay the stop.">Cancel</button>
+          </div>
+          <p id="python-job"></p>
+          <div id="python-log"></div>
+        </aside>
+        <main id="viewer">
+          <p id="splat-status" hidden></p>
+          <p class="hint">drag orbit &middot; right-drag pan &middot; wheel zoom &middot; WASD fly</p>
+        </main>
+      </div>
     </div>
     <script type="module" src="./main.js"></script>
   </body>

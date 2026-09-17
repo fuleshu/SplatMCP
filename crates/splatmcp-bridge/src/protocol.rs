@@ -128,6 +128,14 @@ pub enum Method {
     ViewerLoadPly,
     /// The PLY bytes of the document the app currently displays.
     DocumentGetPly,
+    /// Readiness, versions and limits of the embedded Python runtime.
+    PythonRuntimeInfo,
+    /// Submit a Python generation job to the app's shared executor.
+    PythonRunSplat,
+    /// Read a generation job's state, timings, validation summary and logs.
+    PythonJob,
+    /// Ask a generation job to stop.
+    PythonJobCancel,
 }
 
 impl Method {
@@ -387,6 +395,112 @@ pub struct PingResult {
     pub uptime_ms: u64,
 }
 
+/// Parameters of `python.run_splat`, the typed request both MCP and the UI use.
+///
+/// The payload stays compact: a request carries code or a path to it, parameters and the
+/// target identity, never geometry. A 500k gaussian job is a few hundred bytes here.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PythonRunRequest {
+    /// Identity used for deduplication; the same id with different content is refused.
+    /// Defaulted so a missing id is reported by `validate` as a caller mistake rather than
+    /// as a transport decode failure.
+    #[serde(default)]
+    pub request_id: String,
+    /// Inline code. Exactly one of `code` and `script_path` must be given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Local script file; its bytes are snapshotted at submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_path: Option<String>,
+    /// Function the job calls; defaults to `generate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<String>,
+    /// Parameters handed to the script as `ctx.params`.
+    #[serde(default)]
+    pub params: Value,
+    /// Seed for the job's deterministic helpers.
+    #[serde(default)]
+    pub seed: u64,
+    /// Document being edited; absent creates a new document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    /// Named component to replace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    /// Revision the caller believes it is editing; required for an existing document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Name to save a newly created document under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// Show the committed revision when it is ready. Defaults to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
+    /// Re-frame the camera on the new revision. Defaults to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<bool>,
+    /// Optional `.ply` export of the candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_path: Option<String>,
+    /// Cooperative deadline in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_seconds: Option<u64>,
+}
+
+impl PythonRunRequest {
+    /// Rejects a request that does not identify itself or names two sources.
+    pub fn validate(&self) -> Result<()> {
+        if self.request_id.trim().is_empty() {
+            return Err(BridgeError::Protocol(
+                "request_id is required so the job can be deduplicated".to_owned(),
+            ));
+        }
+        match (&self.code, &self.script_path) {
+            (Some(_), Some(_)) => Err(BridgeError::Protocol(
+                "pass either code or script_path, not both".to_owned(),
+            )),
+            (None, None) => Err(BridgeError::Protocol(
+                "pass code or script_path".to_owned(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Entry point, defaulted.
+    pub fn entry_point(&self) -> String {
+        self.entry_point
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "generate".to_owned())
+    }
+}
+
+/// Parameters of `python.job`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PythonJobQuery {
+    pub job_id: u64,
+    /// Only return log lines newer than this cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_after: Option<u64>,
+    /// Largest number of log lines to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_limit: Option<usize>,
+}
+
+/// Parameters of `python.job_cancel`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PythonCancelRequest {
+    pub job_id: u64,
+}
+
+/// One compiled-in answer for a job that was refused before it was queued.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PythonErrorReport {
+    /// Stable machine readable code, e.g. `invalid_batch`.
+    pub code: String,
+    pub message: String,
+}
+
 /// Convenience for a camera parameter that may arrive as null.
 pub fn camera_param(value: Option<CameraRequest>) -> Value {
     match value {
@@ -485,6 +599,69 @@ mod tests {
         let error = response.into_result().unwrap_err();
         assert!(matches!(error, BridgeError::Remote(_)));
         assert!(error.to_string().contains("no splat is loaded"));
+    }
+
+    #[test]
+    fn python_methods_are_additive_and_do_not_need_a_viewer() {
+        // The protocol version is deliberately unchanged: adding methods cannot break a
+        // client that never sends them.
+        assert_eq!(PROTOCOL_VERSION, 1);
+        for (method, name) in [
+            (Method::PythonRuntimeInfo, "\"python_runtime_info\""),
+            (Method::PythonRunSplat, "\"python_run_splat\""),
+            (Method::PythonJob, "\"python_job\""),
+            (Method::PythonJobCancel, "\"python_job_cancel\""),
+        ] {
+            assert_eq!(serde_json::to_string(&method).unwrap(), name);
+            assert!(!method.needs_viewer());
+            assert!(!method.is_handshake());
+        }
+    }
+
+    #[test]
+    fn a_run_request_accepts_one_source_and_defaults_its_entry_point() {
+        let inline: PythonRunRequest = serde_json::from_value(json!({
+            "request_id": "job-1",
+            "code": "def generate(ctx): pass",
+        }))
+        .unwrap();
+        assert!(inline.validate().is_ok());
+        assert_eq!(inline.entry_point(), "generate");
+        assert_eq!(inline.seed, 0);
+        assert!(inline.display.is_none());
+
+        let from_file: PythonRunRequest = serde_json::from_value(json!({
+            "request_id": "job-2",
+            "script_path": "C:/recipes/terrain.py",
+            "entry_point": "build",
+            "params": {"size": 64},
+            "seed": 11,
+            "component_id": "terrain",
+            "expected_revision": 3,
+        }))
+        .unwrap();
+        assert!(from_file.validate().is_ok());
+        assert_eq!(from_file.entry_point(), "build");
+
+        let both: PythonRunRequest = serde_json::from_value(json!({
+            "request_id": "job-3",
+            "code": "x = 1",
+            "script_path": "C:/recipes/terrain.py",
+        }))
+        .unwrap();
+        assert!(both.validate().is_err());
+
+        let neither: PythonRunRequest = serde_json::from_value(json!({
+            "request_id": "job-4"
+        }))
+        .unwrap();
+        assert!(neither.validate().is_err());
+
+        let unnamed: PythonRunRequest = serde_json::from_value(json!({
+            "code": "x = 1"
+        }))
+        .unwrap();
+        assert!(unnamed.validate().is_err(), "a job needs an id to be deduplicated");
     }
 
     #[test]

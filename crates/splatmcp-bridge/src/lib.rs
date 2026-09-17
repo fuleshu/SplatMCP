@@ -24,7 +24,8 @@ pub use client::BridgeClient;
 pub use paths::{app_data_dir, bridge_descriptor_path, ensure_app_data_dir, settings_path};
 pub use protocol::{
     BridgeDescriptor, CameraRequest, CameraState, CaptureRequest, CaptureResult, LoadPlyRequest,
-    Method, Request, Response, ViewerStatus, PROTOCOL_VERSION,
+    Method, PythonCancelRequest, PythonErrorReport, PythonJobQuery, PythonRunRequest, Request,
+    Response, ViewerStatus, PROTOCOL_VERSION,
 };
 pub use server::{BridgeServer, BridgeService, Handler};
 pub use wire::{read_line_limited, read_message, write_message, MAX_FRAME_BYTES};

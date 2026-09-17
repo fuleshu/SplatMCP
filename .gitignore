@@ -1,3 +1,4 @@
+.python-runtime/ 
 /target/
 /src-tauri/target/
 /src-tauri/gen/schemas/
@@ -11,3 +12,5 @@
 *.user
 Thumbs.db
 /%SystemDrive%/ProgramData/Microsoft/Windows/Caches
+# The Python runtime is staged by tools\stage_python_runtime.py; it is build output.
+/src-tauri/resources/
