@@ -3417,12 +3417,23 @@ name = "splatmcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "rfd",
  "serde",
  "serde_json",
+ "splatmcp-bridge",
  "splatmcp-core",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "splatmcp-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3437,9 +3448,12 @@ name = "splatmcp-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "rmcp",
  "serde",
  "serde_json",
+ "splatmcp-bridge",
+ "splatmcp-core",
  "tokio",
 ]
 

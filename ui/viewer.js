@@ -43,12 +43,14 @@ export class SplatViewer {
     this.objectUrl = null;
     this.resizeObserver = null;
     this.loadToken = 0;
+    // Read from the PLY header on load; reported to the bridge as status.
+    this.plyPointCount = 0;
 
     this.handleResize = this.handleResize.bind(this);
   }
 
   /** Loads a splat from raw PLY bytes and frames it. */
-  async open({ fileBytes, fileName = "splat.ply" }) {
+  async open({ fileBytes, fileName = "splat.ply", frame = true }) {
     this.ensureApp();
     this.clearSplat();
     this.setStatus("Loading splat...");
@@ -67,9 +69,30 @@ export class SplatViewer {
     if (token !== this.loadToken) {
       return;
     }
-    this.frameView();
+    this.plyPointCount = countPlyVertices(fileBytes);
+    if (frame) {
+      this.frameView();
+    }
     this.setStatus("");
     this.start();
+  }
+
+  /** True once a splat is displayed. */
+  hasSplat() {
+    return Boolean(this.splatEntity && this.splatEntity.gsplat);
+  }
+
+  /** Gaussians in the displayed splat, read from the PLY header at load time. */
+  pointCount() {
+    return this.plyPointCount;
+  }
+
+  /** Current drawing buffer size in device pixels. */
+  canvasSize() {
+    return {
+      width: this.canvas?.width ?? 0,
+      height: this.canvas?.height ?? 0,
+    };
   }
 
   start() {
@@ -233,6 +256,34 @@ export class SplatViewer {
     this.splatEntity = entity;
     this.app.root.addChild(entity);
     entity.syncHierarchy();
+    await this.settle();
+  }
+
+  /**
+   * Renders until a freshly loaded splat is actually on screen.
+   *
+   * The asset's `load` event fires when the PLY has been parsed, not when the splat's
+   * GPU resources exist: that happens on the first frames after the entity is added. A
+   * capture taken straight after a load would otherwise show an empty scene, which is
+   * exactly what a tool that creates a splat and immediately screenshots it does.
+   */
+  async settle(frames = 3) {
+    for (let index = 0; index < frames; index += 1) {
+      this.app?.render();
+      await this.nextFrame();
+    }
+  }
+
+  /** Resolves after the next animation frame, or after a short wait without one. */
+  nextFrame() {
+    this.start();
+    return new Promise((resolve) => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => resolve());
+      } else {
+        setTimeout(resolve, 16);
+      }
+    });
   }
 
   clearSplat() {
@@ -271,12 +322,15 @@ export class SplatViewer {
   }
 
   placeCamera(position, focus, radius) {
-    const farClip = Math.max(1000, position.distance(focus) + radius * 20);
+    // Accept plain arrays so the bridge can stay free of engine types.
+    const positionVec = Array.isArray(position) ? new pc.Vec3(...position) : position;
+    const focusVec = Array.isArray(focus) ? new pc.Vec3(...focus) : focus;
+    const farClip = Math.max(1000, positionVec.distance(focusVec) + radius * 20);
     this.cameraEntity.camera.nearClip = 0.001;
     this.cameraEntity.camera.farClip = farClip;
-    this.cameraEntity.setPosition(position);
-    this.cameraEntity.lookAt(focus);
-    this.controls?.reset(focus, position);
+    this.cameraEntity.setPosition(positionVec);
+    this.cameraEntity.lookAt(focusVec);
+    this.controls?.reset(focusVec, positionVec);
   }
 
   handleResize() {
@@ -299,6 +353,22 @@ export class SplatViewer {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * Reads `element vertex <count>` from a PLY header.
+ *
+ * The header is ASCII even in binary PLY files, so scanning the first few kilobytes is
+ * enough and avoids depending on engine internals for the count.
+ */
+function countPlyVertices(bytes) {
+  if (!bytes || bytes.length === 0) {
+    return 0;
+  }
+  const head = new TextDecoder("ascii").decode(bytes.subarray(0, Math.min(bytes.length, 8192)));
+  const header = head.split("end_header")[0];
+  const match = header.match(/element\s+vertex\s+(\d+)/);
+  return match ? Number(match[1]) : 0;
 }
 
 function errorMessage(error) {

@@ -11,9 +11,13 @@
 //! - `opacity` is `0..=1` (PLY stores the sigmoid logit)
 //! - `rotation` is a unit quaternion `(w, x, y, z)` (PLY order `rot_0..rot_3`)
 
+mod authoring;
+mod edit;
 mod ply;
 mod splat;
 
+pub use authoring::{MAX_POINTS, Rng, Shape, SplatParams, build, splat_from_points};
+pub use edit::{Box3, EditOp, EditStep, OpReport, Selection, apply, apply_all};
 pub use ply::{read_ply, write_ply};
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
 

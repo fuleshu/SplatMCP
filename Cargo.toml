@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/splatmcp-bridge",
     "crates/splatmcp-core",
     "crates/splatmcp-mcp",
     "src-tauri",

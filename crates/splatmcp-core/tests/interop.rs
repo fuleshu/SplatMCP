@@ -1,8 +1,6 @@
 //! End-to-end check against a PLY file authored by hand (Python), i.e. bytes that
 //! this crate did not produce. Guards the reader against real 3DGS exports.
 
-use std::fs;
-
 use splatmcp_core::{Splat, read_ply, write_ply};
 
 const SAMPLE: &[u8] = include_bytes!("data/external_grid.ply");

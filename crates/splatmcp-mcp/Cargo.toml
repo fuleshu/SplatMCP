@@ -15,7 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Base64 for PLY bytes and captured frames travelling over the bridge.
+base64 = "0.22"
 # Official Rust MCP SDK: https://github.com/modelcontextprotocol/rust-sdk
+# The `server` feature also enables rmcp's schemars re-export, which is what the tool
+# parameter types derive from.
 rmcp = { version = "3", features = [
     "server",
     "macros",
@@ -23,4 +27,6 @@ rmcp = { version = "3", features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+splatmcp-bridge = { path = "../splatmcp-bridge" }
+splatmcp-core = { path = "../splatmcp-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
