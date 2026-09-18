@@ -103,6 +103,15 @@ pub fn run(link: &AppLink, input: &JobInput) -> Result<Value, String> {
             let operation = input.operation.clone().ok_or_else(|| {
                 "action submit needs operation: import, export or inspect".to_owned()
             })?;
+            if operation == "edit" {
+                // An edit is described once, in `edit_batch`. Sending the step list through this
+                // tool as well would duplicate that schema and let the two drift.
+                return Err(
+                    "edit batches are submitted with edit_batch's background:true, so the step \
+                     vocabulary stays described in one place"
+                        .to_owned(),
+                );
+            }
             let request = JobSubmitRequest {
                 operation: operation.clone(),
                 asset_id: input.asset_id.clone(),
@@ -110,6 +119,8 @@ pub fn run(link: &AppLink, input: &JobInput) -> Result<Value, String> {
                 document_id: input.document_id.clone(),
                 expected_revision: input.expected_revision,
                 operation_id: input.operation_id.clone(),
+                steps: Vec::new(),
+                display: None,
             };
             let params = serde_json::to_value(&request).map_err(|error| error.to_string())?;
             let reply: JobAdmissionReply = link

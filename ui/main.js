@@ -4,6 +4,7 @@
 import { ViewerBridge } from "./bridge.js";
 import { ComponentsPanel } from "./components.js";
 import { DisplayBadge } from "./display.js";
+import { DocumentState } from "./document-state.js";
 import { JobBar } from "./jobs.js";
 import { PythonPanel } from "./python-panel.js";
 
@@ -25,15 +26,48 @@ let pythonPanel = null;
 let componentsPanel = null;
 let jobBar = null;
 let displayBadge = null;
+let documentState = null;
 let hasSplat = false;
+let busy = false;
 
 function setStatus(message) {
   statusNode.textContent = message || "";
 }
 
 function setBusy(value) {
+  busy = value;
   openButton.disabled = value;
   saveButton.disabled = value || !hasSplat;
+}
+
+/**
+ * Applies the authoritative document state to the toolbar.
+ *
+ * Save exports the committed snapshot, so it follows *the app's* document - not a local flag the
+ * Open button happened to set. That is what makes a splat created or edited by a tool call enable
+ * Save exactly like a manually opened file, and what turns Save off again when nothing is loaded.
+ */
+function applyDocumentState(state) {
+  hasSplat = state.loaded;
+  saveButton.disabled = !state.loaded;
+  if (state.loaded && !busy) {
+    const parts = [];
+    if (state.fileName) {
+      parts.push(state.fileName);
+    }
+    if (state.pointCount) {
+      parts.push(`${state.pointCount} gaussians`);
+    }
+    if (state.revision !== null) {
+      parts.push(`revision ${state.revision}`);
+    }
+    if (state.displayFailure) {
+      parts.push(`display failed: ${state.displayFailure}`);
+    } else if (state.displayLagging) {
+      parts.push("not displayed yet");
+    }
+    setStatus(parts.join(" - "));
+  }
 }
 
 /** Tauri hands raw bytes back as an ArrayBuffer; accept the usual shapes anyway. */
@@ -103,6 +137,34 @@ async function startDisplayBadge() {
 }
 
 /**
+ * Starts the authoritative document state: one poll that feeds the toolbar and the badge.
+ *
+ * The badge and the Save button must never disagree about which document is loaded, so they read
+ * the same state rather than each polling on their own.
+ */
+async function startDocumentState() {
+  if (documentState || !invoke) {
+    return;
+  }
+  documentState = new DocumentState(invoke);
+  documentState.subscribe((state) => {
+    applyDocumentState(state);
+    if (displayBadge) {
+      displayBadge.render({
+        committed_revision: state.committedRevision ?? state.revision,
+        displayed_revision: state.displayedRevision,
+        is_current:
+          state.committedRevision !== null &&
+          state.committedRevision === state.displayedRevision,
+        display_lagging: state.displayLagging,
+        failures: state.displayFailure ? [{ revision: state.revision, reason: state.displayFailure }] : [],
+      });
+    }
+  });
+  await documentState.start();
+}
+
+/**
  * Starts the job bar: the one presentation of background work, from MCP or from here.
  *
  * It polls the app's job service, so a long import or export started by a tool call and one
@@ -140,10 +202,11 @@ async function openSplat() {
     const bytes = normalizeBytes(await invoke("current_splat_bytes"));
     const instance = await ensureViewer();
     await instance.open({ fileBytes: bytes, fileName: info.file_name });
-    hasSplat = true;
+    // The document state poller is what enables Save; refresh it now so the button reacts to a
+    // manual open as promptly as it does to a tool call.
+    await documentState?.refresh();
     setStatus(`${info.file_name} - ${info.point_count} gaussians`);
   } catch (error) {
-    hasSplat = false;
     setStatus(`Open failed: ${error?.message || error}`);
   } finally {
     setBusy(false);
@@ -184,5 +247,5 @@ if (!invoke) {
   startPythonPanel().catch((error) => setStatus(`Python panel unavailable: ${error?.message || error}`));
   startComponentsPanel().catch((error) => setStatus(`Component panel unavailable: ${error?.message || error}`));
   startJobBar().catch((error) => setStatus(`Job bar unavailable: ${error?.message || error}`));
-  startDisplayBadge().catch((error) => setStatus(`Display badge unavailable: ${error?.message || error}`));
+  startDocumentState().catch((error) => setStatus(`Document state unavailable: ${error?.message || error}`));
 }

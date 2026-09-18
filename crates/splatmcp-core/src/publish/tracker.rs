@@ -1,15 +1,28 @@
 //! The per-document publication state machine.
 //!
-//! [`PublicationTracker`] holds one [`DocumentPublication`] per document. Each one records the
-//! committed revision, the displayed revision, the request in flight and the history of what
-//! happened to earlier requests - and answers the only three questions the app needs:
+//! [`PublicationTracker`] holds one [`DocumentPublication`] per document, plus the knowledge
+//! that **only one document can be on screen at a time**. Each entry records the committed
+//! revision, the displayed revision, the request in flight and what happened to earlier
+//! requests, and answers the three questions the app needs:
 //!
 //! 1. *what should the viewer fetch?* [`DocumentPublication::begin`] mints a request and
 //!    supersedes anything older for the same document;
 //! 2. *did the viewer draw it?* [`DocumentPublication::acknowledge`] accepts only the request
-//!    that is actually in flight, so a late completion cannot claim the screen;
+//!    actually in flight, so a late completion cannot claim the screen;
 //! 3. *is the display behind the document?* [`DocumentPublication::status`] reports the two
 //!    revisions separately, and never derives one from the other.
+//!
+//! Three behaviours are worth stating because they are easy to get wrong:
+//!
+//! - **A commit is recorded even when nothing is published.** A `display:false` edit leaves
+//!   `displayed_revision` where it was and moves `committed_revision`, so the status says
+//!   "committed, not shown" instead of claiming a hidden revision is current.
+//! - **A pending request expires.** A viewer that never answers is a real outcome, and a
+//!   request that outlives [`ACK_TIMEOUT_MS`] is recorded as [`PublicationOutcome::TimedOut`]
+//!   on the next read - so a stall is reported rather than reported as "pending" forever.
+//! - **Switching documents moves the screen.** When a publication for another document is
+//!   displayed, that document becomes the active one and the previous document stops claiming
+//!   a displayed revision: it is not on screen any more.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -27,6 +40,12 @@ pub(crate) const MAX_HISTORY: usize = 32;
 /// How many failed requests are kept, with their reasons.
 pub(crate) const MAX_FAILURES: usize = 8;
 
+/// How long a publication may wait for an acknowledgement before it is reported as timed out.
+///
+/// The app's contract, not a guess: `renderer_capabilities` publishes the same number, so a
+/// caller can see how long "pending" may honestly last.
+pub const ACK_TIMEOUT_MS: u64 = 5_000;
+
 /// Publication state of one document.
 #[derive(Debug, Clone)]
 pub struct DocumentPublication {
@@ -37,6 +56,8 @@ pub struct DocumentPublication {
     next_token: u64,
     /// The request that is expected to be acknowledged, if any.
     pending: Option<PublicationRequest>,
+    /// When the request in flight was announced, for the acknowledgement timeout.
+    pending_since_ms: Option<u64>,
     /// The most recent request and what became of it.
     last: Option<(PublicationRequest, PublicationOutcome)>,
     /// Revisions superseded before they were displayed, newest first.
@@ -54,6 +75,7 @@ impl DocumentPublication {
             displayed_revision: None,
             next_token: 0,
             pending: None,
+            pending_since_ms: None,
             last: None,
             skipped: Vec::new(),
             failures: Vec::new(),
@@ -67,9 +89,15 @@ impl DocumentPublication {
     /// Records that the store now holds `revision`.
     ///
     /// Deliberately does **not** touch `displayed_revision`: committing is not displaying, and
-    /// the gap between the two is the whole point of this state machine.
+    /// the gap between the two is the whole point of this state machine. It is called for every
+    /// commit, including one nobody asked to display.
     pub fn committed(&mut self, revision: u64) {
-        self.committed_revision = Some(revision);
+        // The pointer only moves forward: a late or out-of-order report of an older revision
+        // must never make the document look older than it is.
+        self.committed_revision = Some(match self.committed_revision {
+            Some(current) => current.max(revision),
+            None => revision,
+        });
     }
 
     /// The revision a frame presented, if any.
@@ -95,6 +123,7 @@ impl DocumentPublication {
     /// reload geometry the viewer is showing.
     pub fn begin(
         &mut self,
+        now_ms: u64,
         revision: u64,
         source: PublicationSource,
         frame: bool,
@@ -105,6 +134,12 @@ impl DocumentPublication {
         if source == PublicationSource::Committed && self.displayed_revision == Some(revision) {
             return Err(PublicationError::AlreadyDisplayed { revision });
         }
+        // Publishing a committed revision asserts that it *is* committed: doing so here keeps
+        // the two facts consistent even if a caller forgot to record the commit, and the
+        // forward-only rule means publishing an older revision cannot move the pointer back.
+        if source == PublicationSource::Committed {
+            self.committed(revision);
+        }
         self.next_token += 1;
         let request = PublicationRequest {
             document_id: self.document_id.clone(),
@@ -112,6 +147,7 @@ impl DocumentPublication {
             token: self.next_token,
             source,
             frame,
+            started_at_ms: now_ms,
         };
         if let Some(previous) = self.pending.take() {
             self.last = Some((
@@ -123,6 +159,7 @@ impl DocumentPublication {
             self.remember_skipped(previous.revision);
         }
         self.pending = Some(request.clone());
+        self.pending_since_ms = Some(now_ms);
         self.last = Some((request.clone(), PublicationOutcome::Pending));
         Ok(request)
     }
@@ -130,8 +167,8 @@ impl DocumentPublication {
     /// Accepts the viewer's acknowledgement that it displayed one exact request.
     ///
     /// Only the request in flight may be acknowledged. Anything else - an older load finishing
-    /// late, a mismatched token, a request for another document - is recorded as a failure in
-    /// the history and refused with [`PublicationError::StaleAcknowledgement`], so it can never
+    /// late, a mismatched token, a request for another document - is recorded in the failure
+    /// history and refused with [`PublicationError::StaleAcknowledgement`], so it can never
     /// become the displayed revision.
     pub fn acknowledge(
         &mut self,
@@ -161,6 +198,7 @@ impl DocumentPublication {
             });
         }
         let request = self.pending.take().expect("matched above");
+        self.pending_since_ms = None;
         // A preview candidate is not a revision: the caller sees the frame, but the app's
         // displayed *revision* stays where it was.
         if request.source == PublicationSource::Committed {
@@ -181,6 +219,7 @@ impl DocumentPublication {
     ) -> Result<PublicationStatus, PublicationError> {
         let reason = reason.into();
         let pending = self.pending.take();
+        self.pending_since_ms = None;
         match pending {
             Some(request) if request.revision == revision => {
                 self.failures.insert(0, (revision, reason.clone()));
@@ -199,13 +238,35 @@ impl DocumentPublication {
     }
 
     /// Marks the request in flight as timed out, keeping the displayed revision as it was.
-    ///
-    /// A viewer that never answers is a real outcome: the app reports `timed_out` rather than
-    /// waiting forever or pretending the revision appeared.
     pub fn time_out(&mut self) -> Option<PublicationRequest> {
         let pending = self.pending.take()?;
+        self.pending_since_ms = None;
         self.last = Some((pending.clone(), PublicationOutcome::TimedOut));
         Some(pending)
+    }
+
+    /// Times the request in flight out when it has waited longer than `timeout_ms`.
+    ///
+    /// Called on every read and every new publication, so a viewer that never answers cannot
+    /// leave a request reading "pending" indefinitely. Returns the request that expired.
+    pub fn expire_pending(&mut self, now_ms: u64, timeout_ms: u64) -> Option<PublicationRequest> {
+        let since = self.pending_since_ms?;
+        if now_ms.saturating_sub(since) <= timeout_ms {
+            return None;
+        }
+        self.time_out()
+    }
+
+    /// Drops this document's claim to the screen because another document took it.
+    ///
+    /// The viewer shows exactly one document. When a publication for another document is
+    /// displayed, this entry stops reporting a displayed revision - it is not on screen - while
+    /// keeping its committed revision, so the status reads "committed here, showing elsewhere".
+    pub fn relinquish_screen(&mut self) -> bool {
+        if self.displayed_revision.take().is_some() {
+            return true;
+        }
+        false
     }
 
     /// The current status, with the two revisions kept separate.
@@ -225,6 +286,7 @@ impl DocumentPublication {
             skipped: self.skipped.clone(),
             failures: self.failures.clone(),
             display_lagging,
+            displayed_elsewhere: false,
         }
     }
 
@@ -238,6 +300,7 @@ impl DocumentPublication {
         self.committed_revision = None;
         self.displayed_revision = None;
         self.pending = None;
+        self.pending_since_ms = None;
         self.last = None;
         self.skipped.clear();
         self.failures.clear();
@@ -260,9 +323,17 @@ impl DocumentPublication {
     }
 }
 
-/// One publication tracker per process: it is the app's single answer to "what is on screen?".
+/// One publication tracker per process: the app's single answer to "what is on screen?".
 pub struct PublicationTracker {
-    documents: Mutex<BTreeMap<String, DocumentPublication>>,
+    documents: Mutex<TrackerState>,
+}
+
+/// Tracker contents: the entries plus which of them owns the screen.
+#[derive(Default)]
+struct TrackerState {
+    documents: BTreeMap<String, DocumentPublication>,
+    /// The document a publication was last displayed for, if any.
+    active: Option<String>,
 }
 
 impl Default for PublicationTracker {
@@ -275,15 +346,18 @@ impl PublicationTracker {
     /// An empty tracker.
     pub fn new() -> Self {
         Self {
-            documents: Mutex::new(BTreeMap::new()),
+            documents: Mutex::new(TrackerState::default()),
         }
     }
 
-    fn locked(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, DocumentPublication>>, PublicationError>
-    {
-        self.documents.lock().map_err(|error| PublicationError::Unavailable {
-            reason: error.to_string(),
-        })
+    fn locked(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, TrackerState>, PublicationError> {
+        self.documents
+            .lock()
+            .map_err(|error| PublicationError::Unavailable {
+                reason: error.to_string(),
+            })
     }
 
     /// Runs `work` against one document's state, creating it on first use.
@@ -292,74 +366,154 @@ impl PublicationTracker {
         document_id: &str,
         work: impl FnOnce(&mut DocumentPublication) -> T,
     ) -> Result<T, PublicationError> {
-        let mut documents = self.locked()?;
-        let entry = documents
+        let mut state = self.locked()?;
+        let entry = state
+            .documents
             .entry(document_id.to_owned())
             .or_insert_with(|| DocumentPublication::new(document_id));
         Ok(work(entry))
     }
 
+    /// Times out every request that has waited longer than the acknowledgement timeout.
+    ///
+    /// Runs on every read, so "pending" is never a permanent state: a viewer that stopped
+    /// answering shows up as `timed_out` and a display failure rather than an eternal promise.
+    fn sweep_expired(&self, state: &mut TrackerState, now_ms: u64, timeout_ms: u64) {
+        for entry in state.documents.values_mut() {
+            let _ = entry.expire_pending(now_ms, timeout_ms);
+        }
+    }
+
     /// Records that the store now holds `revision` of `document_id`.
+    ///
+    /// Called for every commit, displayed or not: a hidden commit must still move the
+    /// committed revision, or the status would keep claiming the old revision is current.
     pub fn committed(&self, document_id: &str, revision: u64) -> Result<(), PublicationError> {
         self.with(document_id, |entry| entry.committed(revision))
     }
 
     /// Starts a publication, superseding anything already in flight for that document.
-    pub fn begin(
+    pub fn begin_at(
         &self,
+        now_ms: u64,
+        timeout_ms: u64,
         document_id: &str,
         revision: u64,
         source: PublicationSource,
         frame: bool,
     ) -> Result<PublicationRequest, PublicationError> {
-        self.with(document_id, |entry| entry.begin(revision, source, frame))?
+        let mut state = self.locked()?;
+        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        let entry = state
+            .documents
+            .entry(document_id.to_owned())
+            .or_insert_with(|| DocumentPublication::new(document_id));
+        entry.begin(now_ms, revision, source, frame)
     }
 
     /// Accepts an acknowledgement and reports the status it produced.
-    pub fn acknowledge(
+    ///
+    /// A displayed publication makes its document the active one: any other document stops
+    /// claiming a displayed revision, because the viewer is showing this one now.
+    pub fn acknowledge_at(
         &self,
+        now_ms: u64,
+        timeout_ms: u64,
         document_id: &str,
         revision: u64,
         token: u64,
     ) -> Result<PublicationStatus, PublicationError> {
-        self.with(document_id, |entry| entry.acknowledge(document_id, revision, token))?
+        let mut state = self.locked()?;
+        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        let entry = state
+            .documents
+            .get_mut(document_id)
+            .ok_or_else(|| PublicationError::UnknownDocument {
+                document_id: document_id.to_owned(),
+            })?;
+        let status = entry.acknowledge(document_id, revision, token)?;
+        // The screen moved: every other document gives up its displayed revision.
+        if status.displayed_revision.is_some() {
+            for (other_id, other) in state.documents.iter_mut() {
+                if other_id != document_id {
+                    other.relinquish_screen();
+                }
+            }
+            state.active = Some(document_id.to_owned());
+        }
+        Ok(status)
     }
 
     /// Records a failed publication.
-    pub fn fail(
+    pub fn fail_at(
         &self,
+        now_ms: u64,
+        timeout_ms: u64,
         document_id: &str,
         revision: u64,
         reason: impl Into<String>,
     ) -> Result<PublicationStatus, PublicationError> {
-        self.with(document_id, |entry| entry.fail(revision, reason))?
+        let mut state = self.locked()?;
+        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        let entry = state
+            .documents
+            .get_mut(document_id)
+            .ok_or_else(|| PublicationError::UnknownDocument {
+                document_id: document_id.to_owned(),
+            })?;
+        entry.fail(revision, reason)
     }
 
     /// Marks the request in flight as timed out.
-    pub fn time_out(&self, document_id: &str) -> Result<Option<PublicationRequest>, PublicationError> {
+    pub fn time_out(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<PublicationRequest>, PublicationError> {
         self.with(document_id, |entry| entry.time_out())
     }
 
     /// One document's status, or `None` when nothing is known about it.
-    pub fn status(
+    ///
+    /// The status also says whether this document is the one on screen
+    /// ([`PublicationStatus::displayed_elsewhere`]) so a caller can tell "not displayed yet"
+    /// from "another document is displayed".
+    pub fn status_at(
         &self,
+        now_ms: u64,
+        timeout_ms: u64,
         document_id: &str,
     ) -> Result<Option<PublicationStatus>, PublicationError> {
-        let documents = self.locked()?;
-        Ok(documents.get(document_id).map(DocumentPublication::status))
+        let mut state = self.locked()?;
+        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        Ok(state.documents.get(document_id).map(|entry| {
+            let mut status = entry.status();
+            status.displayed_elsewhere =
+                status.displayed_revision.is_none() && state.active.is_some()
+                    && state.active.as_deref() != Some(document_id);
+            status
+        }))
+    }
+
+    /// The document that owns the screen, if any publication has been displayed.
+    pub fn active_document(&self) -> Result<Option<String>, PublicationError> {
+        Ok(self.locked()?.active.clone())
     }
 
     /// Forgets a document that was closed.
     pub fn forget(&self, document_id: &str) -> Result<(), PublicationError> {
-        let mut documents = self.locked()?;
-        documents.remove(document_id);
+        let mut state = self.locked()?;
+        state.documents.remove(document_id);
+        if state.active.as_deref() == Some(document_id) {
+            state.active = None;
+        }
         Ok(())
     }
 
     /// Every tracked document's status, for a diagnostics view.
     pub fn all(&self) -> Result<Vec<PublicationStatus>, PublicationError> {
-        let documents = self.locked()?;
-        Ok(documents
+        let state = self.locked()?;
+        Ok(state
+            .documents
             .values()
             .map(DocumentPublication::status)
             .collect())

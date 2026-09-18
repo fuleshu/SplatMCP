@@ -31,6 +31,56 @@ become the displayed revision**. The viewer applies the same rule from its own s
 load carries the request it belongs to, and a load a newer request superseded is abandoned
 before the swap.
 
+## Every commit is recorded, displayed or not
+
+`committed_revision` moves for **every** commit the store accepts, including one nobody asked to
+display (`display:false` on an edit or a patch, a job that commits quietly). A hidden commit
+therefore reads as:
+
+```json
+{"committed_revision": 3, "displayed_revision": 2, "is_current": false, "display_lagging": true}
+```
+
+instead of leaving the status on revision 2 and claiming the display was current. The commit is
+recorded even when the publication itself fails, and the pointer only ever moves forward: a late
+report of an older revision cannot make the document look older than it is.
+
+## A pending publication expires
+
+The viewer is not obliged to answer, and a request that never settles must not read as "pending"
+forever. Every read of the status (and every new publication) applies the acknowledgement timeout
+(`ACK_TIMEOUT_MS`, published in `renderer_capabilities`): a request that has waited longer is
+recorded as `timed_out` on the next read, so a stalled viewer shows up as a stall. The renderer
+applies its own bound too (`LOAD_TIMEOUT_MS` in `ui/viewer.js`), so a parse or GPU preparation that
+never completes is reported as a display failure rather than waited on.
+
+## One document is on screen at a time
+
+Switching documents is not a per-document affair: acknowledging a publication of document B makes
+B the active document, and A stops reporting a displayed revision — because it is not on screen.
+A status read for a document that is committed but has never been published, while another document
+owns the screen, says so explicitly (`displayed_elsewhere: true`, "another document is displayed"),
+which is what distinguishes "not displayed yet" from "displayed elsewhere".
+
+That, together with loading through this seam (below), is what stops a document switch from leaving
+the previous model on screen: the switch is itself a publication - the app announces the newly
+committed revision and the viewer fetches it by `(document, revision)`.
+
+## A load is a publication
+
+Opening or importing a document used to hand the raw request to the viewer, which meant an
+asset-backed load mutated the document and then failed with `ply_base64 is required`, and it meant
+a committed revision could never be displayed because the display step had already failed. A load
+now records its commit and announces it through the same publication seam as an edit or a job
+(`src-tauri::publication::announce`), so:
+
+- nothing large travels to the viewer and no legacy field is required,
+- the reply is the viewer's own facts plus the resolved identity, and
+- a load that nobody displays is still reported as *committed*, not as current.
+
+`viewer.load_ply` remains available for a client that sends bytes inline; it is no longer the path
+any SplatMCP tool uses.
+
 ## Coalescing, not queueing
 
 A newer publication for the same document supersedes the one in flight. The superseded request

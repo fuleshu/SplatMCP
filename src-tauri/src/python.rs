@@ -23,8 +23,7 @@ use splatmcp_python::runtime::{Limits, PythonRuntime, RuntimeRoots};
 use splatmcp_python::script::ScriptSnapshot;
 use splatmcp_python::{
     CommitOutcome, CommitRequest, DocumentIdentity, DocumentTarget, GenerationRequest,
-    GenerationService, JobReceipt, JobSummary, JobView, PublishOptions, PythonError, RuntimeReport,
-    ServiceConfig, TargetSpec,
+    GenerationService, PublishOptions, PythonError, RuntimeReport, ServiceConfig, TargetSpec,
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -59,9 +58,165 @@ pub struct RevisionPayload {
     pub frame: bool,
 }
 
-/// The app's Python host: one service, one interpreter, one document.
+/// Drives one script job on the shared job service, with the interpreter as the executor.
+///
+/// The engine still owns everything about running a script - the one interpreter, its queue, its
+/// validation and its commit - and this adapter owns the *job record*: phases, progress, logs,
+/// cancellation and the receipt all come from the shared service, so a script job is described
+/// exactly like an import or an export.
+///
+/// Cancellation is delegated rather than assumed. When the caller asks to stop (or the deadline
+/// passes), the engine is asked to cancel and the adapter keeps polling until the engine settles:
+/// a script that had already committed is reported as committed, never as cancelled, because
+/// "cancelled" must not be claimed while a result can still be published.
+fn run_python_job(
+    context: &splatmcp_core::JobContext,
+    engine: Arc<GenerationService>,
+    index: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+    generation: GenerationRequest,
+) -> Result<splatmcp_core::JobResult, splatmcp_core::JobFailure> {
+    let _ = context.check()?;
+    context.progress(splatmcp_core::JobPhase::Computing, 0, Some(100), Some("starting the interpreter".to_owned()));
+    let receipt = engine
+        .submit(generation)
+        .map_err(|error| python_failure(&error))?;
+    let engine_id = receipt.job_id;
+    if let Ok(mut ids) = index.lock() {
+        ids.insert(context.job_id().to_string(), engine_id);
+    }
+    context.log(
+        splatmcp_core::LogLevel::Info,
+        format!(
+            "engine job {engine_id} accepted for request '{}' ({})",
+            receipt.request_id,
+            receipt.state.name()
+        ),
+    );
+
+    let mut log_after = 0u64;
+    let mut cancel_forwarded = false;
+    loop {
+        let view = engine
+            .status(engine_id, log_after, 100)
+            .map_err(|error| python_failure(&error))?;
+        for line in &view.logs {
+            log_after = log_after.max(line.seq);
+            context.log(log_level(line.level), line.text.clone());
+        }
+        let done = (view.progress.clamp(0.0, 1.0) * 100.0).round() as u64;
+        context.progress(
+            python_phase(view.state),
+            done,
+            Some(100),
+            view.progress_message.clone(),
+        );
+        if view.state.is_terminal() {
+            return python_outcome(&view);
+        }
+        // Cooperative: ask the engine to stop, then keep reading until it settles.
+        let stop_requested = context.is_cancelled() || context.check().is_err();
+        if stop_requested && !cancel_forwarded {
+            context.log(
+                splatmcp_core::LogLevel::Warning,
+                "cancellation requested; asking the interpreter to stop at its next checkpoint",
+            );
+            let _ = engine.cancel(engine_id);
+            cancel_forwarded = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
+/// Maps the engine's terminal state onto the shared receipt's result or failure.
+fn python_outcome(
+    view: &splatmcp_python::JobView,
+) -> Result<splatmcp_core::JobResult, splatmcp_core::JobFailure> {
+    match view.state {
+        splatmcp_python::JobState::Committed => {
+            let revision = view.revision.unwrap_or_default();
+            let document_id = view
+                .document_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            Ok(splatmcp_core::JobResult::Document {
+                document_id,
+                revision,
+                point_count: view.point_count.unwrap_or_default(),
+            })
+        }
+        splatmcp_python::JobState::Cancelled => Err(splatmcp_core::JobFailure::cancelled()),
+        splatmcp_python::JobState::Conflict => Err(splatmcp_core::JobFailure::conflict(
+            view.error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "the document moved on before the script committed".to_owned()),
+        )),
+        splatmcp_python::JobState::Failed => Err(view
+            .error
+            .as_ref()
+            .map(|error| splatmcp_core::JobFailure::new(error.code.clone(), error.message.clone()))
+            .unwrap_or_else(|| {
+                splatmcp_core::JobFailure::new("script_failed", "the script did not complete")
+            })),
+        other => Err(splatmcp_core::JobFailure::new(
+            "script_incomplete",
+            format!("the script job ended in {}", other.name()),
+        )),
+    }
+}
+
+/// Names the document a script job targets, the way a receipt and a conflict message quote it.
+fn describe_target(target: &TargetSpec) -> String {
+    match (&target.document_id, target.expected_revision) {
+        (Some(document_id), Some(revision)) => format!("{document_id}@{revision}"),
+        (Some(document_id), None) => document_id.clone(),
+        (None, Some(revision)) => format!("the displayed document at revision {revision}"),
+        (None, None) => "a new document".to_owned(),
+    }
+}
+
+/// A python error as a job failure, keeping the engine's own stable code.
+fn python_failure(error: &PythonError) -> splatmcp_core::JobFailure {
+    splatmcp_core::JobFailure::new(error.code(), error.to_string())
+}
+
+/// The shared phase that matches an engine state.
+fn python_phase(state: splatmcp_python::JobState) -> splatmcp_core::JobPhase {
+    use splatmcp_core::JobPhase;
+    match state {
+        splatmcp_python::JobState::Queued => JobPhase::Admitted,
+        splatmcp_python::JobState::Running => JobPhase::Computing,
+        splatmcp_python::JobState::CancelRequested => JobPhase::Computing,
+        splatmcp_python::JobState::Validating => JobPhase::Validating,
+        splatmcp_python::JobState::Committing => JobPhase::Committing,
+        // Terminal states keep the phase they reached; the receipt's state carries the outcome.
+        _ => JobPhase::Computing,
+    }
+}
+
+/// The shared log level that matches an engine log line.
+fn log_level(level: splatmcp_python::LogLevel) -> splatmcp_core::LogLevel {
+    match level {
+        // A debug line from a script is informational for the job receipt.
+        splatmcp_python::LogLevel::Debug | splatmcp_python::LogLevel::Info => {
+            splatmcp_core::LogLevel::Info
+        }
+        splatmcp_python::LogLevel::Warning => splatmcp_core::LogLevel::Warning,
+        splatmcp_python::LogLevel::Error => splatmcp_core::LogLevel::Error,
+    }
+}
+
+/// The app's Python host: one engine, one interpreter, one document.
+///
+/// The engine owns the interpreter and its scheduling (task #10's contract). It does **not** own
+/// the app's job records: a script job is admitted by the shared [`crate::jobs::JobHost`], so it
+/// appears in the same list, with the same states, progress and receipts, as an import or an
+/// export. What this host keeps is a small index from the shared job id to the engine's own job
+/// id, which is an adapter mapping - not a second status model.
 pub struct PythonHost {
     service: Arc<GenerationService>,
+    /// Shared job id -> engine job id, for the jobs this process started.
+    engine_ids: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
 }
 
 impl PythonHost {
@@ -108,7 +263,10 @@ impl PythonHost {
                 }
             };
         let service = Arc::new(GenerationService::start(runner, config, target, report));
-        Self { service }
+        Self {
+            service,
+            engine_ids: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        }
     }
 
     /// Readiness, versions, limits and queue state.
@@ -133,8 +291,46 @@ impl PythonHost {
         value
     }
 
-    /// Files a job and returns its receipt.
-    pub fn submit(&self, request: splatmcp_bridge::PythonRunRequest) -> Result<JobReceipt, String> {
+    /// Files a script job on the shared job service and returns its admission.
+    ///
+    /// Submission returns as soon as the job is admitted, exactly like an import or an export:
+    /// the caller polls the returned job id, whose receipt is the shared one. Retry identity is
+    /// the request id plus the whole semantic request, so a *changed* script under the same
+    /// request id is refused rather than answered with the earlier receipt.
+    pub fn submit(
+        &self,
+        jobs: &Arc<crate::jobs::JobHost>,
+        request: splatmcp_bridge::PythonRunRequest,
+    ) -> Result<splatmcp_core::JobAdmission, String> {
+        let generation = self.generation_request(&request)?;
+        let job_request = splatmcp_core::JobRequest::new(splatmcp_core::JobKind::Generate, "run_python_splat")
+            .with_operation_id(request.request_id.clone())
+            .with_target(format!(
+                "{} for {}",
+                request
+                    .script_path
+                    .clone()
+                    .unwrap_or_else(|| format!("inline script {}", request.request_id)),
+                describe_target(&generation.target)
+            ))
+            .with_document(
+                generation.target.document_id.clone().unwrap_or_default(),
+                generation.target.expected_revision,
+            );
+        let engine = Arc::clone(&self.service);
+        let index = Arc::clone(&self.engine_ids);
+        jobs.submit(
+            job_request,
+            Box::new(move |context| run_python_job(context, engine, index, generation)),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Validates a run request and turns it into the engine's own generation request.
+    fn generation_request(
+        &self,
+        request: &splatmcp_bridge::PythonRunRequest,
+    ) -> Result<GenerationRequest, String> {
         request.validate().map_err(|error| error.to_string())?;
         let entry_point = request.entry_point();
         let snapshot = match (&request.code, &request.script_path) {
@@ -180,7 +376,7 @@ impl PythonHost {
             (None, None) => TargetSpec::new_document(request.file_name.clone()),
         };
 
-        let generation = GenerationRequest {
+        Ok(GenerationRequest {
             snapshot,
             target,
             display: request.display.unwrap_or(true),
@@ -189,29 +385,37 @@ impl PythonHost {
             frame: request.frame.unwrap_or(true),
             export_path: request.export_path.as_deref().map(PathBuf::from),
             deadline: request.deadline_seconds.map(std::time::Duration::from_secs),
-        };
-        self.service
-            .submit(generation)
-            .map_err(|error| error.to_string())
+        })
     }
 
-    /// Status of one job.
-    pub fn status(&self, job_id: u64, log_after: u64, log_limit: usize) -> Result<JobView, String> {
-        self.service
-            .status(job_id, log_after, log_limit)
-            .map_err(|error| error.to_string())
+    /// The engine job id behind a shared job id, when this process started it.
+    pub fn engine_id(&self, job_id: &str) -> Option<u64> {
+        self.engine_ids.lock().ok()?.get(job_id).copied()
     }
 
-    /// Job history, newest first.
-    pub fn recent(&self, limit: usize) -> Vec<JobSummary> {
-        self.service.recent(limit)
+    /// Asks the engine to stop a job, so the shared cancellation reaches the interpreter.
+    pub fn cancel_engine(&self, job_id: &str) -> Option<splatmcp_python::CancelView> {
+        let engine_id = self.engine_id(job_id)?;
+        self.service.cancel(engine_id).ok()
     }
 
-    /// Asks a job to stop.
-    pub fn cancel(&self, job_id: u64) -> Result<splatmcp_python::CancelView, String> {
-        self.service
-            .cancel(job_id)
-            .map_err(|error| error.to_string())
+    /// The engine's own detail for a job, when the engine still knows it.
+    ///
+    /// This is the python-specific part of a status reply - script hashes, timings, the revision
+    /// the viewer acknowledged - which the shared receipt does not carry.
+    pub fn engine_detail(&self, job_id: &str) -> Option<Value> {
+        let engine_id = self.engine_id(job_id)?;
+        let view = self.service.status(engine_id, 0, 200).ok()?;
+        Some(json!({
+            "engine_job_id": view.job_id,
+            "request_id": view.request_id,
+            "entry_point": view.entry_point,
+            "script_hash": view.script_hash,
+            "content_hash": view.content_hash,
+            "progress_message": view.progress_message,
+            "timings": view.timings,
+            "displayed_revision": view.displayed_revision,
+        }))
     }
 
     /// Records that the viewer rendered a revision.
@@ -481,40 +685,94 @@ pub fn python_runtime_info(host: tauri::State<'_, PythonHostState>) -> Value {
     host.0.runtime_info()
 }
 
-/// Tauri command: submit a generation job.
+/// Tauri command: submit a generation job through the shared job service.
+///
+/// The reply is an admission, not a receipt: the job is running on the app's job service with the
+/// interpreter as its executor, and its status is read with the same command the generic job list
+/// uses.
 #[tauri::command]
 pub fn python_submit(
     request: splatmcp_bridge::PythonRunRequest,
     host: tauri::State<'_, PythonHostState>,
-) -> Result<JobReceipt, String> {
-    host.0.submit(request)
+    jobs: tauri::State<'_, crate::jobs::JobHostState>,
+) -> Result<Value, String> {
+    let admission = host.0.submit(&jobs.0, request)?;
+    serde_json::to_value(splatmcp_bridge::JobAdmissionReply {
+        job_id: admission.job_id.to_string(),
+        state: admission.state.as_str().to_owned(),
+        replayed: admission.replayed,
+        limits: jobs.0.service().limits().describe(),
+    })
+    .map_err(|error| error.to_string())
 }
 
-/// Tauri command: read a job, or the job history when `job_id` is zero.
+/// Tauri command: read a script job from the shared service, with the engine's detail beside it.
 #[tauri::command]
 pub fn python_job(
     query: splatmcp_bridge::PythonJobQuery,
     host: tauri::State<'_, PythonHostState>,
+    jobs: tauri::State<'_, crate::jobs::JobHostState>,
 ) -> Result<Value, String> {
-    if query.job_id == 0 {
-        let recent = host.0.recent(query.log_limit.unwrap_or(20).min(100));
+    if query.job_id.trim().is_empty() {
+        let recent: Vec<Value> = jobs
+            .0
+            .recent(query.log_limit.unwrap_or(20).min(100))
+            .iter()
+            .map(|receipt| {
+                serde_json::to_value(splatmcp_bridge::JobSummary::from(receipt))
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
         return Ok(json!({ "recent": recent }));
     }
-    let view = host.0.status(
-        query.job_id,
-        query.log_after.unwrap_or(0),
-        query.log_limit.unwrap_or(200).min(1000),
-    )?;
-    serde_json::to_value(view).map_err(|error| error.to_string())
+    let job_id = crate::jobs::parse_job_id(&query.job_id)?;
+    let view = jobs
+        .0
+        .view(
+            &job_id,
+            query.log_after.unwrap_or(0),
+            query.log_limit.unwrap_or(200).min(500),
+        )
+        .map_err(|error| format!("{} ({})", error, error.code()))?;
+    let mut reply = serde_json::to_value(splatmcp_bridge::JobStatusReply::from(&view))
+        .map_err(|error| error.to_string())?;
+    if let Some(detail) = host.0.engine_detail(&query.job_id) {
+        if let Some(object) = reply.as_object_mut() {
+            object.insert("python".to_owned(), detail);
+        }
+    }
+    Ok(reply)
 }
 
-/// Tauri command: cancel a job.
+/// Tauri command: ask a script job to stop, and report what actually happened.
 #[tauri::command]
 pub fn python_job_cancel(
     request: splatmcp_bridge::PythonCancelRequest,
     host: tauri::State<'_, PythonHostState>,
-) -> Result<splatmcp_python::CancelView, String> {
-    host.0.cancel(request.job_id)
+    jobs: tauri::State<'_, crate::jobs::JobHostState>,
+) -> Result<Value, String> {
+    let job_id = crate::jobs::parse_job_id(&request.job_id)?;
+    let engine = host.0.cancel_engine(&request.job_id);
+    let receipt = jobs
+        .0
+        .cancel(&job_id)
+        .map_err(|error| format!("{} ({})", error, error.code()))?;
+    let mut reply = serde_json::to_value(splatmcp_bridge::JobSummary::from(&receipt))
+        .map_err(|error| error.to_string())?;
+    if let Some(object) = reply.as_object_mut() {
+        object.insert(
+            "engine".to_owned(),
+            match engine {
+                Some(view) => json!({
+                    "job_id": view.job_id,
+                    "state": view.state.name(),
+                    "still_unwinding": view.still_unwinding,
+                }),
+                None => Value::Null,
+            },
+        );
+    }
+    Ok(reply)
 }
 
 /// Tauri command: the viewer rendered a revision.

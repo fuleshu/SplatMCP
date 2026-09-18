@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use splatmcp_core::{
-    AssetHandle, AssetKind, DocumentHandle, Expected, JobAdmission, JobBody, JobCounts, JobError,
-    JobFailure, JobId, JobKind, JobLimits, JobPhase, JobReceipt, JobRequest, JobResult, JobService,
-    JobState, JobView, LogLevel, Mutation, PlyImportPolicy, SideEffectState,
+    AssetHandle, AssetKind, DocumentHandle, Expected, JobAdmission, JobBody, JobError, JobFailure,
+    JobId, JobKind, JobLimits, JobPhase, JobReceipt, JobRequest, JobResult, JobService, JobState,
+    JobView, LogLevel, Mutation, PlyImportPolicy, SideEffectState,
 };
 use tauri::{AppHandle, Manager};
 
@@ -71,20 +71,12 @@ impl JobHost {
         self.service.view(job_id, log_after, log_limit)
     }
 
-    pub fn status(&self, job_id: &JobId) -> Result<JobReceipt, JobError> {
-        self.service.status(job_id)
-    }
-
     pub fn cancel(&self, job_id: &JobId) -> Result<JobReceipt, JobError> {
         self.service.cancel(job_id)
     }
 
     pub fn recent(&self, limit: usize) -> Vec<JobReceipt> {
         self.service.recent(limit)
-    }
-
-    pub fn counts(&self) -> JobCounts {
-        self.service.stats().counts
     }
 
     /// Stops the service: queued work is cancelled outright and running work is asked to stop.
@@ -150,7 +142,7 @@ impl ImportJob {
                         policy,
                     )
                 };
-                imported.map_err(|error| JobFailure::new("import_failed", error.to_string()))?
+                imported.map_err(import_failure)?
             };
             let _ = context.check()?;
             context.progress(JobPhase::Validating, 1, Some(1), Some("checked".to_owned()));
@@ -173,27 +165,22 @@ impl ImportJob {
                     Some(1),
                     Some("announcing".to_owned()),
                 );
-                let announced = app
-                    .state::<crate::bridge::ViewerState>()
-                    .0
-                    .request(
-                        splatmcp_bridge::Method::ViewerLoadPly,
-                        splatmcp_bridge::asset_load_params(
-                            asset.id().as_str().to_owned(),
-                            None,
-                            Some(true),
-                        ),
-                        crate::viewer::VIEWER_TIMEOUT,
-                    )
-                    .is_ok();
-                // Announcing is not displaying: the receipt stays `pending` until the window
-                // acknowledges the revision it drew.
+                let receipt = splatmcp_core::ReceiptDocument {
+                    document_id: imported.metadata.handle.document_id.clone(),
+                    revision: imported.metadata.handle.revision,
+                    point_count: imported.metadata.point_count,
+                    file_name: imported.metadata.provenance.file_name.clone(),
+                };
+                // Through the one publication seam: an identity event with a request token, and
+                // bytes the viewer fetches by (document, revision). Announcing is not displaying,
+                // so the receipt stays `pending` until the window acknowledges what it drew - and
+                // a refusal to announce is reported as an unsuccessful display.
                 context.note_side_effect(
                     "display",
-                    if announced {
-                        SideEffectState::Pending
-                    } else {
-                        SideEffectState::Failed("the viewer did not answer".to_owned())
+                    match crate::publication::announce(&app, &receipt, None, true) {
+                        Ok(_) => SideEffectState::Pending,
+                        Err(error) if error.code() == "already_displayed" => SideEffectState::Done,
+                        Err(error) => SideEffectState::Failed(error.to_string()),
                     },
                 );
             }
@@ -216,9 +203,16 @@ impl ExportJob {
                 let state = app.state::<AppState>();
                 // Serialisation runs outside every document lock: the store hands out an
                 // immutable snapshot and the write happens here.
-                state
-                    .export(expected.clone(), std::path::Path::new(&path))
-                    .map_err(|error| JobFailure::new("export_failed", error.to_string()))?
+                match state.export(expected.clone(), std::path::Path::new(&path)) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // The export *was* requested and did fail. Reporting `not_requested`
+                        // here would hide a downstream failure behind the job's failure code.
+                        context
+                            .note_side_effect("export", SideEffectState::Failed(error.to_string()));
+                        return Err(export_failure(error));
+                    }
+                }
             };
             let checksum = outcome.checksum.clone();
             let bytes = outcome.bytes;
@@ -269,6 +263,25 @@ impl InspectJob {
     }
 }
 
+/// Classifies an import failure, so a revision conflict lands in the `conflict` state.
+///
+/// Reporting a stale target as `import_failed` would leave the caller to read the prose for the
+/// one outcome it can act on: a conflict is its own state, with its own code and counter.
+fn import_failure(error: crate::document::ServiceError) -> JobFailure {
+    if error.is_conflict() {
+        return JobFailure::conflict(error.to_string());
+    }
+    JobFailure::new(error.code(), error.to_string())
+}
+
+/// Classifies an export failure: a stale revision is a conflict, anything else is a failure.
+fn export_failure(error: crate::document::ServiceError) -> JobFailure {
+    if error.is_conflict() {
+        return JobFailure::conflict(error.to_string());
+    }
+    JobFailure::new("export_failed", error.to_string())
+}
+
 /// The file name of a provenance string, for a document's display name.
 fn file_name_of(source: &str) -> String {
     std::path::Path::new(source)
@@ -304,9 +317,13 @@ impl JobHost {
                 asset.kind().as_str()
             ));
         }
+        // The whole request is the retry identity: the same asset into the same revision is a
+        // retry, while the same asset into a *different* revision is different work and must not
+        // be answered with the earlier receipt.
         let request = JobRequest::new(JobKind::Import, "import_asset")
-            .with_target(asset.id().to_string())
-            .with_request_hash(asset.checksum().value);
+            .with_target(format!("{} into {}", asset.id(), expected.describe()))
+            .with_asset(asset.id().to_string())
+            .with_document(expected.describe(), expected.handle().map(|handle| handle.revision));
         let request = match operation_id {
             Some(operation_id) => request.with_operation_id(operation_id),
             None => request,
@@ -332,8 +349,9 @@ impl JobHost {
         operation_id: Option<String>,
     ) -> Result<JobAdmission, String> {
         let request = JobRequest::new(JobKind::Export, "export")
-            .with_target(path.clone())
-            .with_request_hash(splatmcp_core::document::fingerprint(path.as_bytes()));
+            .with_target(format!("{path} from {}", expected.describe()))
+            .with_path(path.clone())
+            .with_document(expected.describe(), expected.handle().map(|handle| handle.revision));
         let request = match operation_id {
             Some(operation_id) => request.with_operation_id(operation_id),
             None => request,
@@ -351,8 +369,9 @@ impl JobHost {
         expected: Expected,
         operation_id: Option<String>,
     ) -> Result<JobAdmission, String> {
-        let request =
-            JobRequest::new(JobKind::Inspect, "inspect_document").with_target(expected.describe());
+        let request = JobRequest::new(JobKind::Inspect, "inspect_document")
+            .with_target(expected.describe())
+            .with_document(expected.describe(), expected.handle().map(|handle| handle.revision));
         let request = match operation_id {
             Some(operation_id) => request.with_operation_id(operation_id),
             None => request,
@@ -361,6 +380,115 @@ impl JobHost {
         self.service
             .submit(request, body)
             .map_err(|e| e.to_string())
+    }
+
+    /// Submits an edit batch as a job.
+    ///
+    /// The batch runs through the app's one transaction service, so an edit submitted this way is
+    /// the same atomic, retry-safe, undoable commit as `edit_splat` - it simply does not hold the
+    /// request open while it runs, and its progress, logs and receipt appear in the job list.
+    pub fn edit(
+        &self,
+        app: &AppHandle,
+        expected: Expected,
+        batch: splatmcp_core::EditBatch,
+        display: bool,
+        operation_id: Option<String>,
+    ) -> Result<JobAdmission, String> {
+        let steps = batch.steps.len();
+        // The batch's own canonical hash is the semantic content of an edit, so it belongs in the
+        // retry identity: the same operation id with a *different* batch must be refused rather
+        // than replayed.
+        let hash = batch.request_hash();
+        let request = JobRequest::new(JobKind::Edit, "edit_batch")
+            .with_target(format!(
+                "{} ({steps} step(s), batch {hash:016x})",
+                expected.describe()
+            ))
+            .with_document(expected.describe(), expected.handle().map(|handle| handle.revision));
+        let request = match operation_id.or_else(|| batch.operation_id.clone()) {
+            Some(operation_id) => request.with_operation_id(operation_id),
+            None => request,
+        };
+        let body = EditJob::body(app.clone(), expected, batch, display);
+        self.service
+            .submit(request, body)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Starts an edit job: one atomic batch committed through the shared transaction service.
+pub struct EditJob;
+
+impl EditJob {
+    /// The job body for one edit batch.
+    pub fn body(
+        app: AppHandle,
+        expected: Expected,
+        batch: splatmcp_core::EditBatch,
+        display: bool,
+    ) -> JobBody {
+        Box::new(move |context| {
+            context.log(
+                LogLevel::Info,
+                format!(
+                    "applying {} step(s) to {}",
+                    batch.steps.len(),
+                    expected.describe()
+                ),
+            );
+            context.progress(JobPhase::Validating, 0, Some(batch.steps.len() as u64), None);
+            let _ = context.check()?;
+            context.progress(
+                JobPhase::Committing,
+                batch.steps.len() as u64,
+                Some(batch.steps.len() as u64),
+                Some("committing".to_owned()),
+            );
+            // The commit is the linearization point: cancellation is checked immediately before
+            // it, and from here on the transaction wins.
+            let receipt = context.commit(|| {
+                let state = app.state::<AppState>();
+                state
+                    .commit_batch(expected.clone(), &batch, "edit_job")
+                    .map_err(|error| JobFailure::new(error.code(), error.to_string()))
+            })?;
+            let recorded = receipt.recorded();
+            let result = JobResult::Document {
+                document_id: recorded.document_id.to_string(),
+                revision: recorded.revision,
+                point_count: recorded.point_count,
+            };
+            // The commit is recorded on the publication tracker even when nobody displays it, so
+            // a hidden edit cannot leave the status claiming the old revision is current.
+            let publications = app
+                .state::<crate::publication::PublicationHostState>()
+                .0
+                .clone();
+            if let Err(error) = publications.committed(&recorded.handle()) {
+                context.log(
+                    LogLevel::Warning,
+                    format!("could not record the commit for display status: {error}"),
+                );
+            }
+            if display {
+                context.progress(
+                    JobPhase::Publishing,
+                    1,
+                    Some(1),
+                    Some("announcing".to_owned()),
+                );
+                context.note_side_effect(
+                    "display",
+                    match crate::publication::announce(&app, &recorded, None, false) {
+                        Ok(_) => SideEffectState::Pending,
+                        Err(error) if error.code() == "already_displayed" => SideEffectState::Done,
+                        Err(error) => SideEffectState::Failed(error.to_string()),
+                    },
+                );
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -451,11 +579,6 @@ pub fn stats_json(host: &JobHost) -> Value {
     })
 }
 
-/// State a job was started with, for the window's own start button.
-pub fn parse_state(text: &str) -> Option<JobState> {
-    JobState::parse(text)
-}
-
 /// A submitted job's admission as the wire shape both callers read.
 pub fn admission_json(admission: &JobAdmission) -> Value {
     json!({
@@ -463,6 +586,53 @@ pub fn admission_json(admission: &JobAdmission) -> Value {
         "state": admission.state.as_str(),
         "replayed": admission.replayed,
     })
+}
+
+/// The document handle a receipt names, when it names one.
+pub fn receipt_handle(receipt: &JobReceipt) -> Option<DocumentHandle> {
+    match &receipt.result {
+        JobResult::Document {
+            document_id,
+            revision,
+            ..
+        } => splatmcp_core::DocumentId::parse(document_id)
+            .map(|id| splatmcp_core::DocumentHandle::new(id, *revision)),
+        _ => None,
+    }
+}
+
+/// One line describing how a job ended, for the window and for a caller's log.
+pub fn completion_summary(receipt: &JobReceipt) -> String {
+    match receipt.state {
+        splatmcp_core::JobState::Committed => format!("committed {}", receipt.result.describe()),
+        splatmcp_core::JobState::Completed => format!("completed {}", receipt.result.describe()),
+        splatmcp_core::JobState::Cancelled => "cancelled".to_owned(),
+        splatmcp_core::JobState::Conflict => format!(
+            "refused: {}",
+            receipt
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+                .unwrap_or_else(|| "revision conflict".to_owned())
+        ),
+        splatmcp_core::JobState::Failed => format!(
+            "failed: {}",
+            receipt
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+                .unwrap_or_else(|| "unknown failure".to_owned())
+        ),
+        other => other.as_str().to_owned(),
+    }
+}
+
+/// True when a failure means the caller should look for a different job rather than retry.
+pub fn is_unknown_job(error: &JobError) -> bool {
+    matches!(
+        error,
+        JobError::UnknownJob { .. } | JobError::ReceiptExpired { .. }
+    )
 }
 
 /// Tauri command: submit an import of a registered PLY asset.
@@ -592,53 +762,6 @@ pub fn job_wait(
     match host.0.service().wait(&job_id, timeout) {
         Ok(receipt) => Ok(receipt_json(&receipt)),
         Err(error) => Ok(json!({ "error": error_json(&error) })),
-    }
-}
-
-/// True when a failure means the caller should look for a different job rather than retry.
-pub fn is_unknown_job(error: &JobError) -> bool {
-    matches!(
-        error,
-        JobError::UnknownJob { .. } | JobError::ReceiptExpired { .. }
-    )
-}
-
-/// The document handle a receipt names, when it names one.
-pub fn receipt_handle(receipt: &JobReceipt) -> Option<DocumentHandle> {
-    match &receipt.result {
-        JobResult::Document {
-            document_id,
-            revision,
-            ..
-        } => splatmcp_core::DocumentId::parse(document_id)
-            .map(|id| DocumentHandle::new(id, *revision)),
-        _ => None,
-    }
-}
-
-/// True when a job produced a document revision: the message the UI shows for it.
-pub fn completion_summary(receipt: &JobReceipt) -> String {
-    match receipt.state {
-        JobState::Committed => format!("committed {}", receipt.result.describe()),
-        JobState::Completed => format!("completed {}", receipt.result.describe()),
-        JobState::Cancelled => "cancelled".to_owned(),
-        JobState::Conflict => format!(
-            "refused: {}",
-            receipt
-                .failure
-                .as_ref()
-                .map(|failure| failure.message.clone())
-                .unwrap_or_else(|| "revision conflict".to_owned())
-        ),
-        JobState::Failed => format!(
-            "failed: {}",
-            receipt
-                .failure
-                .as_ref()
-                .map(|failure| failure.message.clone())
-                .unwrap_or_else(|| "unknown failure".to_owned())
-        ),
-        other => other.as_str().to_owned(),
     }
 }
 

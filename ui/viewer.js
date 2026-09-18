@@ -35,6 +35,10 @@ const REQUIRED_PLY_PROPERTIES = new Set([
 // +Y axis back down, which `fixtures::axis_fixture` exists to catch.
 const PLY_DEFAULT_X_FLIP_DEG = 180;
 
+// How long a candidate may take to parse and prepare before it is reported as a failure. Longer
+// than any plausible 500k parse, short enough that a stall is reported rather than waited on.
+const LOAD_TIMEOUT_MS = 20000;
+
 export class SplatViewer {
   constructor(container, statusNode) {
     this.container = container;
@@ -169,19 +173,30 @@ export class SplatViewer {
     entity.syncHierarchy();
   }
 
-  /** Removes one asset and its GPU resources. */
+  /**
+   * Removes one asset and its GPU resources.
+   *
+   * Only this viewer's own listeners are detached: a blanket `asset.off()` also removes the
+   * engine's internal handlers, which can leave a load that is still in progress never
+   * completing - exactly the stall that left a publication pending forever.
+   */
   disposeAsset(asset) {
     if (!asset) {
       return;
     }
-    asset.off();
     if (this.app?.assets?.get(asset.id)) {
       this.app.assets.remove(asset);
     }
     asset.unload();
   }
 
-  /** Loads PLY bytes into a PlayCanvas asset that is not attached to anything yet. */
+  /**
+   * Loads PLY bytes into a PlayCanvas asset that is not attached to anything yet.
+   *
+   * Bounded: a parse or GPU preparation that never completes is reported as a failure after
+   * `LOAD_TIMEOUT_MS`, so the app records a failed publication instead of leaving it pending
+   * until an acknowledgement that will never arrive.
+   */
   async prepareAsset(url, fileName) {
     const asset = new pc.Asset(
       fileName || "splat.ply",
@@ -194,18 +209,24 @@ export class SplatViewer {
       { crossOrigin: null, minimalMemory: true },
     );
     await new Promise((resolve, reject) => {
-      const cleanup = () => {
+      let settled = false;
+      const finish = (outcome) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
         asset.off("load", onLoad);
         asset.off("error", onError);
+        outcome();
       };
-      const onLoad = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = (error) => {
-        cleanup();
-        reject(new Error(errorMessage(error) || "could not parse the splat"));
-      };
+      const timeout = setTimeout(
+        () => finish(() => reject(new Error(`the splat did not load within ${LOAD_TIMEOUT_MS} ms`))),
+        LOAD_TIMEOUT_MS,
+      );
+      const onLoad = () => finish(resolve);
+      const onError = (error) =>
+        finish(() => reject(new Error(errorMessage(error) || "could not parse the splat")));
       asset.on("load", onLoad);
       asset.on("error", onError);
       this.app.assets.add(asset);
@@ -438,21 +459,14 @@ export class SplatViewer {
     this.app.start();
   }
 
-  /** Object URL for a layer that is not the document, so it is not revoked by a document load. */
+  /**
+   * Object URL for a layer that is not the document, so it is not revoked by a document load.
+   *
+   * A URL stays alive until the asset using it is disposed: revoking it while a parse is still
+   * reading the blob aborts the load and leaves a publication pending.
+   */
   objectUrlForLayer(fileBytes) {
     return URL.createObjectURL(new Blob([fileBytes], { type: "application/octet-stream" }));
-  }
-
-  objectUrlFor(fileBytes) {
-    if (!fileBytes) {
-      throw new Error("splat bytes are missing");
-    }
-    if (this.objectUrl) {
-      URL.revokeObjectURL(this.objectUrl);
-    }
-    const blob = new Blob([fileBytes], { type: "application/octet-stream" });
-    this.objectUrl = URL.createObjectURL(blob);
-    return this.objectUrl;
   }
 
   /**

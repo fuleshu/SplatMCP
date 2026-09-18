@@ -145,7 +145,7 @@ fn an_identical_retry_replays_instead_of_queueing_a_second_mutation() {
     let runs = Arc::new(AtomicUsize::new(0));
     let request = JobRequest::new(JobKind::Edit, "edit_batch")
         .with_operation_id("recipe-7")
-        .with_request_hash(0xabc);
+        .with_document("doc-4f2a-1", Some(3));
 
     let counter = Arc::clone(&runs);
     let first = service
@@ -177,12 +177,120 @@ fn an_identical_retry_replays_instead_of_queueing_a_second_mutation() {
     // A different request under the same operation id is refused, not silently replaced.
     let error = service
         .submit(
-            request.with_request_hash(0xdef),
+            request.clone().with_document("doc-4f2a-1", Some(4)),
             Box::new(|_| Ok(JobResult::None)),
         )
         .unwrap_err();
     assert_eq!(error.code(), "operation_conflict");
-    assert!(error.to_string().contains("recorded 0000000000000abc"));
+    let message = error.to_string();
+    assert!(message.contains("recipe-7"), "{message}");
+    // The message names what the recorded job acted on, which is what a caller compares: the
+    // first request targeted the displayed document, the refused one named a revision.
+    assert!(message.contains("the displayed document"), "{message}");
+}
+
+#[test]
+fn a_reused_operation_id_with_a_changed_target_asset_or_destination_is_refused() {
+    // The reported defect: a job key reused for a different target or revision replayed the
+    // earlier receipt, so the caller was told about work that had acted on something else.
+    //
+    // A roomier service than the overload test uses: this one is about admission identity, and a
+    // queue bound must not be what refuses a submission.
+    let service = JobService::with_session(
+        0x4f2a,
+        JobLimits {
+            max_queued: 16,
+            ..JobLimits::default()
+        },
+    );
+
+    // Inspect: the displayed document versus an explicit revision of it.
+    let inspect = JobRequest::new(JobKind::Inspect, "inspect_document")
+        .with_operation_id("look-1")
+        .with_target("the displayed document");
+    service
+        .submit(inspect.clone(), Box::new(|_| Ok(JobResult::None)))
+        .unwrap();
+    let error = service
+        .submit(
+            inspect.clone().with_document("doc-4f2a-1", Some(3)),
+            Box::new(|_| Ok(JobResult::None)),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "operation_conflict");
+
+    // Export: the same destination, but a different source revision.
+    let export = JobRequest::new(JobKind::Export, "export")
+        .with_operation_id("dump-1")
+        .with_target("C:/out/scene.ply from doc-4f2a-1@3")
+        .with_path("C:/out/scene.ply")
+        .with_document("doc-4f2a-1", Some(3));
+    service
+        .submit(export.clone(), Box::new(|_| Ok(JobResult::None)))
+        .unwrap();
+    let error = service
+        .submit(
+            export.clone().with_document("doc-4f2a-1", Some(4)),
+            Box::new(|_| Ok(JobResult::None)),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "operation_conflict");
+    assert!(error.to_string().contains("C:/out/scene.ply"), "{error}");
+
+    // Import: the same asset, but a different expected revision.
+    let import = JobRequest::new(JobKind::Import, "import_asset")
+        .with_operation_id("take-1")
+        .with_asset("asset-4f2a-1")
+        .with_document("doc-4f2a-1", Some(3));
+    service
+        .submit(import.clone(), Box::new(|_| Ok(JobResult::None)))
+        .unwrap();
+    let error = service
+        .submit(
+            import.clone().with_document("doc-4f2a-1", Some(4)),
+            Box::new(|_| Ok(JobResult::None)),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "operation_conflict");
+
+    // A different asset is a different request too.
+    let error = service
+        .submit(
+            import.clone().with_asset("asset-4f2a-2"),
+            Box::new(|_| Ok(JobResult::None)),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "operation_conflict");
+
+    // And an unchanged request still replays: the point is to compare the whole request, not to
+    // refuse retries.
+    let replay = service
+        .submit(import, Box::new(|_| Ok(JobResult::None)))
+        .unwrap();
+    assert!(replay.replayed);
+}
+
+#[test]
+fn the_identity_hash_covers_every_semantic_field() {
+    let base = JobRequest::new(JobKind::Export, "export")
+        .with_target("C:/out/scene.ply from doc-4f2a-1@3")
+        .with_path("C:/out/scene.ply")
+        .with_document("doc-4f2a-1", Some(3));
+    let same = base.clone();
+    assert_eq!(base.identity_hash(), same.identity_hash());
+
+    // Each semantic change is a different request; the operation id is not part of the hash.
+    assert_ne!(base.identity_hash(), base.clone().with_document("doc-4f2a-1", Some(4)).identity_hash());
+    assert_ne!(base.identity_hash(), base.clone().with_path("C:/other/scene.ply").identity_hash());
+    assert_ne!(base.identity_hash(), base.clone().with_asset("asset-4f2a-1").identity_hash());
+    assert_ne!(
+        base.identity_hash(),
+        base.clone().with_target("something else").identity_hash()
+    );
+    assert_eq!(
+        base.identity_hash(),
+        base.clone().with_operation_id("dump-9").identity_hash()
+    );
 }
 
 #[test]
@@ -639,8 +747,8 @@ fn the_view_carries_the_receipt_and_the_logs_it_was_asked_for() {
         .submit(
             JobRequest::new(JobKind::Generate, "run_python_splat")
                 .with_operation_id("job-recipe-1")
-                .with_request_hash(7)
-                .with_target("doc-4f2a-1@3"),
+                .with_target("doc-4f2a-1@3")
+                .with_document("doc-4f2a-1", Some(3)),
             Box::new(|context| {
                 context.log(LogLevel::Error, "a script error");
                 Err(JobFailure::new("script_error", "NameError: name 'x' is not defined"))
@@ -652,7 +760,7 @@ fn the_view_carries_the_receipt_and_the_logs_it_was_asked_for() {
     service.wait(&admission.job_id, Duration::from_secs(5)).unwrap();
     let view = service.view(&admission.job_id, 0, 10).unwrap();
     assert_eq!(view.receipt.operation, "run_python_splat");    assert_eq!(view.receipt.operation_id.as_deref(), Some("job-recipe-1"));
-    assert_eq!(view.receipt.request_hash, 7);
+    assert_ne!(view.receipt.request_hash, 0, "the receipt records the request identity");
     assert_eq!(view.receipt.target.as_deref(), Some("doc-4f2a-1@3"));
     assert_eq!(view.receipt.contract_version, JOB_CONTRACT_VERSION);
     assert_eq!(

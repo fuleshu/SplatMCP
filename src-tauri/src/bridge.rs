@@ -27,14 +27,13 @@ use tauri::{AppHandle, Emitter, Manager};
 use splatmcp_core::validation::ValidationLimits;
 use splatmcp_core::{
     BatchStep, BatchTargets, Box3, ComponentId, EditBatch, EditOp, Expected, Frame, LocalTransform,
-    PlyImportPolicy, PointId, PublicationSource, ReceiptSlot, SelectionQuery, SideEffect, Sphere,
-    SplatPoint,
+    PlyImportPolicy, PointId, ReceiptSlot, SelectionQuery, SideEffect, Sphere, SplatPoint,
 };
 
 use crate::assets::AssetHost;
 use crate::document::{self, AppState, Mutation, MutationKind, OutcomeInfo, SplatInfo};
 use crate::publication::PublicationHostState;
-use crate::python::{PythonHost, RevisionPayload};
+use crate::python::PythonHost;
 use crate::viewer::{VIEWER_TIMEOUT, VIEWER_WINDOW, Viewer};
 
 /// Bridge handler that turns requests into webview work, document reads, generation
@@ -122,8 +121,17 @@ impl Handler for AppBridge {
             Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
                     .map_err(|error| format!("invalid python run request: {error}"))?;
-                let receipt = self.python.submit(request)?;
-                serde_json::to_value(receipt).map_err(|error| error.to_string())
+                // Submitted through the shared job service, with the interpreter as its
+                // executor: the returned id is the one the generic job list shows.
+                let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+                let admission = self.python.submit(&jobs, request)?;
+                serde_json::to_value(splatmcp_bridge::JobAdmissionReply {
+                    job_id: admission.job_id.to_string(),
+                    state: admission.state.as_str().to_owned(),
+                    replayed: admission.replayed,
+                    limits: jobs.service().limits().describe(),
+                })
+                .map_err(|error| error.to_string())
             }
             Method::PythonJob => {
                 let query: PythonJobQuery = if params.is_null() {
@@ -137,8 +145,7 @@ impl Handler for AppBridge {
             Method::PythonJobCancel => {
                 let request: PythonCancelRequest = serde_json::from_value(params)
                     .map_err(|error| format!("invalid python cancel request: {error}"))?;
-                let view = self.python.cancel(request.job_id)?;
-                serde_json::to_value(view).map_err(|error| error.to_string())
+                self.python_cancel(&request.job_id)
             }
         }
     }
@@ -239,11 +246,7 @@ impl AppBridge {
             }
         }
 
-        let value = self.viewer.request(
-            Method::ViewerLoadPly,
-            serde_json::to_value(&request).map_err(|error| error.to_string())?,
-            CAPTURE_TIMEOUT,
-        )?;
+        let value = self.publish_load(&imported.metadata, request.frame.unwrap_or(true))?;
         let mut status: ViewerStatus = serde_json::from_value(value)
             .map_err(|error| format!("the viewer returned an unexpected reply: {error}"))?;
         status.point_count = info.point_count;
@@ -255,18 +258,103 @@ impl AppBridge {
         serde_json::to_value(status).map_err(|error| error.to_string())
     }
 
-    /// A job's status, or the job history when no job id was given.
+    /// Announces one loaded revision to the viewer and reports the viewer's own facts.
+    ///
+    /// Deliberately **not** a round trip into the webview with the payload: a load used to
+    /// forward the raw request to the viewer, which meant an asset-backed load mutated the
+    /// document and then failed with `ply_base64 is required`, and it meant the store committed
+    /// a revision that display could never catch up with. Instead the revision is published
+    /// through the one publication seam - an identity event with a request token, and bytes the
+    /// viewer fetches by `(document, revision)` - exactly as an edit or a job publishes.
+    ///
+    /// The viewer status is read first so the reply carries the renderer's own facts (canvas
+    /// size, camera), which is what the legacy `viewer.load_ply` reply also reported.
+    fn publish_load(
+        &self,
+        metadata: &document::DocumentMetadata,
+        frame: bool,
+    ) -> Result<Value, String> {
+        let receipt = splatmcp_core::ReceiptDocument {
+            document_id: metadata.handle.document_id.clone(),
+            revision: metadata.handle.revision,
+            point_count: metadata.point_count,
+            file_name: metadata.provenance.file_name.clone(),
+        };
+        // Record the commit even before publishing: a load that nobody displays is still a
+        // committed revision, and the status has to say so.
+        self.record_commit(&metadata.handle);
+        let side = self.publish(&receipt, None, frame);
+        self.note_display(&metadata.handle, &side);
+        let viewer_status = self
+            .viewer
+            .request(Method::ViewerStatus, Value::Null, VIEWER_TIMEOUT)
+            .ok()
+            .and_then(|value| serde_json::from_value::<ViewerStatus>(value).ok())
+            .unwrap_or_default();
+        Ok(serde_json::to_value(viewer_status).map_err(|error| error.to_string())?)
+    }
+
+    /// A script job's status, or the recent jobs when no job id was given.
+    ///
+    /// Read from the **shared** job service, so what a caller sees here is the same record the
+    /// generic job list shows. The python-specific detail (script hash, timings, the revision the
+    /// viewer acknowledged) rides beside it, supplied by the engine when it still knows the job.
     fn python_job(&self, query: PythonJobQuery) -> Result<Value, String> {
-        if query.job_id == 0 {
-            let recent = self.python.recent(query.log_limit.unwrap_or(20).min(100));
+        let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+        if query.job_id.trim().is_empty() {
+            let recent: Vec<Value> = jobs
+                .recent(query.log_limit.unwrap_or(20).min(100))
+                .iter()
+                .map(|receipt| {
+                    serde_json::to_value(splatmcp_bridge::JobSummary::from(receipt))
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
             return Ok(json!({ "recent": recent }));
         }
-        let view = self.python.status(
-            query.job_id,
-            query.log_after.unwrap_or(0),
-            query.log_limit.unwrap_or(200).min(1000),
-        )?;
-        serde_json::to_value(view).map_err(|error| error.to_string())
+        let job_id = crate::jobs::parse_job_id(&query.job_id)?;
+        let view = jobs
+            .view(
+                &job_id,
+                query.log_after.unwrap_or(0),
+                query.log_limit.unwrap_or(200).min(500),
+            )
+            .map_err(|error| format!("{} ({})", error, error.code()))?;
+        let mut reply = serde_json::to_value(splatmcp_bridge::JobStatusReply::from(&view))
+            .map_err(|error| error.to_string())?;
+        if let Some(detail) = self.python.engine_detail(&query.job_id) {
+            if let Some(object) = reply.as_object_mut() {
+                object.insert("python".to_owned(), detail);
+            }
+        }
+        Ok(reply)
+    }
+
+    /// Asks a script job to stop: the shared service records the request and the engine is told,
+    /// so the interpreter stops at its own next checkpoint.
+    fn python_cancel(&self, job_id: &str) -> Result<Value, String> {
+        let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+        let parsed = crate::jobs::parse_job_id(job_id)?;
+        let engine = self.python.cancel_engine(job_id);
+        let receipt = jobs
+            .cancel(&parsed)
+            .map_err(|error| format!("{} ({})", error, error.code()))?;
+        let mut reply = serde_json::to_value(splatmcp_bridge::JobSummary::from(&receipt))
+            .map_err(|error| error.to_string())?;
+        if let Some(object) = reply.as_object_mut() {
+            object.insert(
+                "engine".to_owned(),
+                match engine {
+                    Some(view) => json!({
+                        "job_id": view.job_id,
+                        "state": view.state.name(),
+                        "still_unwinding": view.still_unwinding,
+                    }),
+                    None => Value::Null,
+                },
+            );
+        }
+        Ok(reply)
     }
 
     /// Bounded metadata of a document revision.
@@ -309,6 +397,7 @@ impl AppBridge {
         };
         let policy = PlyImportPolicy::from_repair_flag(request.repair);
         let imported = state.reload(expected, policy)?;
+        self.record_commit(&imported.metadata.handle);
         serde_json::to_value(DocumentReply {
             document: DocumentSummary::from(&imported.metadata),
             retention: RetentionSummary::from(state.retention()),
@@ -331,6 +420,7 @@ impl AppBridge {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "set_component".to_owned());
         let metadata = state.set_component(expected, &request.component_id, &operation)?;
+        self.record_commit(&metadata.handle);
         serde_json::to_value(DocumentReply {
             document: DocumentSummary::from(&metadata),
             retention: RetentionSummary::from(state.retention()),
@@ -403,9 +493,29 @@ impl AppBridge {
                 jobs.export(&self.app, expected, path, request.operation_id)?
             }
             "inspect" => jobs.inspect(&self.app, expected, request.operation_id)?,
+            "edit" => {
+                // The batch arrives as the same step vocabulary `document.edit_batch` accepts, so
+                // there is one description of an edit, and it commits through the same
+                // transaction service.
+                let batch_request: EditBatchRequest = serde_json::from_value(json!({
+                    "document_id": request.document_id,
+                    "expected_revision": request.expected_revision,
+                    "operation_id": request.operation_id,
+                    "steps": request.steps,
+                }))
+                .map_err(|error| format!("invalid job.submit 'edit' request: {error}"))?;
+                let batch = to_batch(&batch_request, &self.assets)?;
+                jobs.edit(
+                    &self.app,
+                    expected,
+                    batch,
+                    request.display.unwrap_or(true),
+                    request.operation_id,
+                )?
+            }
             other => {
                 return Err(format!(
-                    "unknown job operation '{other}'; use import, export or inspect"
+                    "unknown job operation '{other}'; use import, export, inspect or edit"
                 ));
             }
         };
@@ -974,45 +1084,24 @@ impl AppBridge {
         component_id: Option<String>,
         frame: bool,
     ) -> SideEffect {
-        let handle = document.handle();
-        let publications = self.app.state::<PublicationHostState>().0.clone();
-        // A newer publication supersedes anything still in flight: the superseded request is
-        // recorded as skipped, so it can never later be acknowledged as displayed.
-        let request = match publications.begin(&handle, PublicationSource::Committed, frame) {
-            Ok(request) => request,
+        match crate::publication::announce(&self.app, document, component_id, frame) {
+            Ok(_) => SideEffect::Published,
             // Re-publishing the revision already on screen is not a failure: there is simply
             // nothing to announce.
-            Err(error) if error.code() == "already_displayed" => {
-                return SideEffect::Done;
-            }
-            Err(error) => return SideEffect::Failed(error.to_string()),
-        };
-        let payload = RevisionPayload {
-            revision: document.revision,
-            document_id: document.document_id.to_string(),
-            token: request.token,
-            source: request.source.as_str().to_owned(),
-            file_name: document.file_name.clone(),
-            point_count: document.point_count,
-            component_id,
-            frame,
-        };
-        match self
-            .app
-            .emit_to(VIEWER_WINDOW, EDIT_REVISION_EVENT, payload)
-        {
-            Ok(()) => SideEffect::Published,
-            Err(error) => {
-                let _ = publications.fail(
-                    request.document_id.as_str(),
-                    request.revision,
-                    format!("could not tell the viewer: {error}"),
-                );
-                SideEffect::Failed(format!(
-                    "could not tell the viewer about {}@{}: {error}",
-                    document.document_id, document.revision
-                ))
-            }
+            Err(error) if error.code() == "already_displayed" => SideEffect::Done,
+            Err(error) => SideEffect::Failed(error.to_string()),
+        }
+    }
+
+    /// Records one committed revision on the publication tracker.
+    ///
+    /// Every commit goes through here, whether or not the caller asked to display it. A hidden
+    /// commit is a fact about the document - the status has to report it, and stop claiming the
+    /// display is current - and it is not a fact about any frame.
+    fn record_commit(&self, handle: &splatmcp_core::DocumentHandle) {
+        let publications = self.app.state::<PublicationHostState>().0.clone();
+        if let Err(error) = publications.committed(handle) {
+            eprintln!("splatmcp: could not record {handle} on the publication tracker: {error}");
         }
     }
 
@@ -1087,6 +1176,9 @@ impl AppBridge {
         let handle = outcome.handle().ok_or_else(|| {
             "the app recorded an unreadable document id for this commit".to_owned()
         })?;
+        // Recorded whether or not this commit is displayed: a hidden commit still moves the
+        // document, and the status must say "committed, not shown" rather than "current".
+        self.record_commit(&handle);
         if !outcome.replayed {
             // A replay already did all of this: re-exporting or re-announcing it would act on
             // state the original request never produced.
@@ -1119,6 +1211,9 @@ impl AppBridge {
         let mut outcome = state
             .commit_preview(request.preview_id, expected, request.operation_id.clone())
             .map_err(transaction_message)?;
+        if let Some(handle) = outcome.handle() {
+            self.record_commit(&handle);
+        }
         if !outcome.replayed {
             let handle = outcome.handle().ok_or_else(|| {
                 "the app recorded an unreadable document id for this commit".to_owned()
@@ -1151,6 +1246,7 @@ impl AppBridge {
         }
         .map_err(transaction_message)?;
         if let Some(handle) = outcome.handle() {
+            self.record_commit(&handle);
             let side = match request.display.unwrap_or(true) {
                 true => self.publish(&outcome.recorded(), None, false),
                 false => SideEffect::NotRequested,
@@ -1327,6 +1423,9 @@ impl AppBridge {
         let metadata = state
             .metadata()
             .ok_or_else(|| "no splat is loaded".to_owned())?;
+        // A component action that changed metadata advanced the revision; recording it here
+        // keeps the status truthful for those commits too.
+        self.record_commit(&metadata.handle);
         let reply = ComponentsReply {
             document: DocumentSummary::from(&metadata),
             retention: RetentionSummary::from(state.retention()),

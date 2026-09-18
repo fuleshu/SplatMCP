@@ -337,6 +337,12 @@ pub struct JobLogEntry {
 }
 
 /// What a caller asks for, recorded on the receipt so a retry is recognisable.
+///
+/// Every field of the semantic request is part of [`JobRequest::identity_hash`], which is what
+/// admission dedup compares. That matters because a caller may reuse one operation id while
+/// changing what the job acts on - a different revision of the same document, a different
+/// destination file, a different asset - and those are *different* jobs. Treating them as a
+/// replay would answer with a receipt for work that did something else.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobRequest {
     pub kind: JobKind,
@@ -344,11 +350,16 @@ pub struct JobRequest {
     pub operation: String,
     /// Caller-supplied identity for retry detection.
     pub operation_id: Option<String>,
-    /// Stable hash of the canonical request. Two submissions with the same operation id and
-    /// hash are one mutation, never two.
-    pub request_hash: u64,
     /// Source or target identity, e.g. `doc-4f2a-1@7` or a file path.
     pub target: Option<String>,
+    /// Registered asset the job reads, when it reads one.
+    pub asset_id: Option<String>,
+    /// File the job writes, when it writes one.
+    pub path: Option<String>,
+    /// Document the job acts on, when it names one.
+    pub document_id: Option<String>,
+    /// Revision that document must still be at, when the caller stated one.
+    pub expected_revision: Option<u64>,
     /// Absolute deadline; an expired job fails with `deadline_exceeded` before it commits.
     pub deadline_ms: Option<u64>,
 }
@@ -360,8 +371,11 @@ impl JobRequest {
             kind,
             operation: operation.into(),
             operation_id: None,
-            request_hash: 0,
             target: None,
+            asset_id: None,
+            path: None,
+            document_id: None,
+            expected_revision: None,
             deadline_ms: None,
         }
     }
@@ -371,19 +385,58 @@ impl JobRequest {
         self
     }
 
-    pub fn with_request_hash(mut self, request_hash: u64) -> Self {
-        self.request_hash = request_hash;
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
         self
     }
 
-    pub fn with_target(mut self, target: impl Into<String>) -> Self {
-        self.target = Some(target.into());
+    pub fn with_asset(mut self, asset_id: impl Into<String>) -> Self {
+        self.asset_id = Some(asset_id.into());
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Names the document and the revision the job acts on.
+    pub fn with_document(mut self, document_id: impl Into<String>, revision: Option<u64>) -> Self {
+        self.document_id = Some(document_id.into());
+        self.expected_revision = revision;
         self
     }
 
     pub fn with_deadline_ms(mut self, deadline_ms: u64) -> Self {
         self.deadline_ms = Some(deadline_ms);
         self
+    }
+
+    /// Canonical text of the whole semantic request.
+    ///
+    /// Built field by field rather than through a serialisation crate, so the hash cannot change
+    /// when a dependency changes its formatting.
+    pub fn canonical(&self) -> String {
+        format!(
+            "kind={}|operation={}|target={:?}|asset={:?}|path={:?}|document={:?}|revision={:?}",
+            self.kind.as_str(),
+            self.operation,
+            self.target,
+            self.asset_id,
+            self.path,
+            self.document_id,
+            self.expected_revision
+        )
+    }
+
+    /// Stable hash of the whole request: the identity admission dedup compares.
+    ///
+    /// A changed target, revision, asset or destination produces a different hash, so a reused
+    /// operation id with different work is refused as a conflict instead of replaying a receipt
+    /// for something else. The operation id itself is deliberately *not* part of the hash - it is
+    /// the key a caller chooses, and the hash is what makes a retry recognisable.
+    pub fn identity_hash(&self) -> u64 {
+        crate::document::fingerprint(self.canonical().as_bytes())
     }
 }
 
@@ -563,8 +616,11 @@ pub enum JobError {
     /// The submission names an operation id that was used for a different request.
     OperationConflict {
         operation_id: String,
+        /// Hash of the request that was submitted now.
         expected_hash: u64,
+        /// Hash of the request the recorded job answered.
         recorded_hash: u64,
+        /// The recorded job, so the caller can see what it really acted on.
         recorded: Box<JobReceipt>,
     },
     /// The service is shutting down and accepts no new work.
@@ -589,13 +645,15 @@ impl fmt::Display for JobError {
             ),
             Self::OperationConflict {
                 operation_id,
-                expected_hash,
-                recorded_hash,
-                ..
+                expected_hash: _,
+                recorded_hash: _,
+                recorded,
             } => write!(
                 formatter,
-                "operation_id '{operation_id}' was already used for a different request \
-                 (recorded {recorded_hash:016x}, this one {expected_hash:016x})"
+                "operation_id '{operation_id}' was already used for a different request: the \
+                 recorded job acted on '{}', while this request names a different target, asset, \
+                 destination or revision",
+                recorded.target.as_deref().unwrap_or("the displayed document")
             ),
             Self::ShuttingDown => {
                 write!(formatter, "the app is shutting down and accepts no new jobs")

@@ -20,8 +20,7 @@ use serde_json::Value;
 use splatmcp_bridge::{
     AssetInfoReply, AssetQueryRequest, AssetRegisterReply, AssetRegisterRequest,
     AssetReleaseRequest, AssetStatsSummary, AssetSummary, AssetUploadBeginRequest,
-    AssetUploadChunkRequest, AssetUploadReply, AssetUploadRequest, AttributePatchParams,
-    BatchOpParams, Method,
+    AssetUploadChunkRequest, AssetUploadReply, AssetUploadRequest, AttributePatchParams, Method,
 };
 use splatmcp_core::asset::{
     AssetBudgets, AttributePatch, PatchAttribute, PatchDescriptor, PatchDtype, PatchEncoding,
@@ -360,11 +359,6 @@ fn patch_message(attribute: &str) -> String {
 /// An asset failure as a sentence a caller can act on, with its stable code.
 fn describe_asset_error(error: AssetError) -> String {
     format!("{} ({})", error, error.code())
-}
-
-/// True when a batch step needs the asset host to be turned into a core step.
-pub fn step_needs_assets(op: &BatchOpParams) -> bool {
-    op.asset_id.is_some() || op.patch.is_some()
 }
 
 /// Tauri command: register an asset from a file path or a small inline payload.

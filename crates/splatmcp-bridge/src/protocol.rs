@@ -395,6 +395,12 @@ pub struct JobSubmitRequest {
     /// Caller-supplied identity that makes an identical retry a replay, not a second run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
+    /// Steps of an `edit` job, in the same vocabulary `document.edit_batch` accepts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<BatchOpParams>,
+    /// Show the result of an `edit` job; defaults to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
 }
 
 /// Parameters of `job.status`: which job, and where to continue its logs.
@@ -1923,9 +1929,15 @@ impl PythonRunRequest {
 }
 
 /// Parameters of `python.job`.
+///
+/// The job id is the **shared** job id (`job-<session>-<n>`), because a script job is admitted by
+/// the same job service as an import or an export: the identifier a caller got from
+/// `run_python_splat` is the one the generic job list shows, and an empty id returns the recent
+/// jobs instead.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PythonJobQuery {
-    pub job_id: u64,
+    #[serde(default)]
+    pub job_id: String,
     /// Only return log lines newer than this cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_after: Option<u64>,
@@ -1937,7 +1949,8 @@ pub struct PythonJobQuery {
 /// Parameters of `python.job_cancel`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PythonCancelRequest {
-    pub job_id: u64,
+    /// Shared job id, as returned by `run_python_splat`.
+    pub job_id: String,
 }
 
 /// One compiled-in answer for a job that was refused before it was queued.

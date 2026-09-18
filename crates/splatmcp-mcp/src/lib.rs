@@ -336,7 +336,8 @@ impl SplatMcpServer {
                        revision or nothing changes. dry_run reports a preview without committing; \
                        commit it later with preview_id (refused if the document moved on). \
                        operation_id makes a retry safe; undo, redo and history are shared with \
-                       the window.",
+                       the window. background:true runs the same batch as a job and returns a \
+                       job_id to poll.",
         annotations(title = "Edit batch", read_only_hint = false, open_world_hint = false)
     )]
     async fn edit_batch(
@@ -351,6 +352,35 @@ impl SplatMcpServer {
                     .link
                     .request(Method::DocumentEditBatch, params)
                     .map_err(tool_error)?;
+                Ok(tool_text(reply))
+            }
+            edit::BatchCall::Background(request) => {
+                // The same batch, submitted as a job: the app admits it at once and the caller
+                // polls the job, which reports progress, logs and the same receipt. The batch
+                // still commits through the one transaction service, so this is not a second
+                // edit path - only a second way to wait for it.
+                let params = json!({
+                    "operation": "edit",
+                    "document_id": request.document_id,
+                    "expected_revision": request.expected_revision,
+                    "operation_id": request.operation_id,
+                    "display": request.display,
+                    "steps": request.steps,
+                });
+                let reply = self
+                    .link
+                    .request(Method::JobSubmit, params)
+                    .map_err(tool_error)?;
+                let mut reply = reply;
+                if let Some(object) = reply.as_object_mut() {
+                    object.insert(
+                        "note".to_owned(),
+                        json!(
+                            "the batch is running as a job; poll document_job with action:status \
+                             and this job_id for its progress, receipt and logs"
+                        ),
+                    );
+                }
                 Ok(tool_text(reply))
             }
             edit::BatchCall::CommitPreview(request) => {
@@ -479,10 +509,11 @@ impl SplatMcpServer {
     /// Runs a Python recipe that generates or edits Gaussians in the app.
     #[tool(
         description = "Run an embedded-Python recipe that builds Gaussians with NumPy and shows \
-                       the result in the window. Pass code or script_path plus a request_id, then \
-                       poll the job id with get_python_job. display:false commits without \
-                       changing what is shown; frame:false keeps the camera. Scripts are local \
-                       code execution, not a sandbox.",
+                       the result in the window. Pass code or script_path plus a request_id: the \
+                       reply is a job id (the app's shared job id, also in document_job's list), \
+                       which get_python_job polls. display:false commits without changing what is \
+                       shown; frame:false keeps the camera. Scripts are local code execution, not \
+                       a sandbox.",
         annotations(
             title = "Run Python splat",
             read_only_hint = false,
@@ -499,10 +530,10 @@ impl SplatMcpServer {
 
     /// Reads the state, logs and result identity of a Python job.
     #[tool(
-        description = "Read a run_python_splat job: state, progress, timings, revision, point \
-                       count, bounds, export, structured error and logs. Pass log_after from the \
-                       previous reply for only new lines. A committed job is not proof the viewer \
-                       rendered it: check display.",
+        description = "Read a run_python_splat job from the app's shared job service: state, \
+                       phase, percent, result, export, display, structured error and logs. Pass \
+                       log_after (the previous reply's next_log_sequence) for only new lines. A \
+                       committed job is not proof the viewer displayed it: check display.",
         annotations(
             title = "Get Python job",
             read_only_hint = true,
@@ -519,9 +550,10 @@ impl SplatMcpServer {
 
     /// Asks a Python job to stop and reports the honest state.
     #[tool(
-        description = "Cancel a run_python_splat job. A queued job stops immediately; a running \
-                       job stops at its next checkpoint, so a native call can keep it in \
-                       cancel_requested. A late result is discarded, not committed.",
+        description = "Ask a run_python_splat job to stop. A queued job stops immediately; a \
+                       running one stops at its next checkpoint, so a native call can keep it \
+                       unwinding - still_unwinding says so, and a job that had already committed \
+                       stays committed.",
         annotations(
             title = "Cancel Python job",
             read_only_hint = false,

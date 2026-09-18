@@ -31,7 +31,7 @@
 
 mod tracker;
 
-pub use tracker::{DocumentPublication, PublicationTracker};
+pub use tracker::{ACK_TIMEOUT_MS, DocumentPublication, PublicationTracker};
 
 use std::fmt;
 
@@ -49,6 +49,8 @@ pub struct PublicationRequest {
     pub source: PublicationSource,
     /// Whether the camera should be reframed on the new revision.
     pub frame: bool,
+    /// When the request was announced, so a stall can be measured rather than assumed.
+    pub started_at_ms: u64,
 }
 
 impl PublicationRequest {
@@ -164,6 +166,9 @@ pub struct PublicationStatus {
     pub failures: Vec<(u64, String)>,
     /// True when what is displayed is behind what is committed.
     pub display_lagging: bool,
+    /// True when another document is the one on screen, so nothing of *this* document is
+    /// displayed yet. Distinguishes "not displayed yet" from "displayed elsewhere".
+    pub displayed_elsewhere: bool,
 }
 
 impl PublicationStatus {
@@ -183,6 +188,9 @@ impl PublicationStatus {
         );
         if self.display_lagging {
             line.push_str(" (display lagging)");
+        }
+        if self.displayed_elsewhere {
+            line.push_str(" (another document is displayed)");
         }
         if let Some(pending) = &self.pending {
             line.push_str(&format!("; awaiting {}", pending.describe()));

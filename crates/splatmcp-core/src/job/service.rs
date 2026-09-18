@@ -164,9 +164,10 @@ impl JobService {
                 return Err(JobError::ShuttingDown);
             }
             inner.sweep_retention(self.limits, now);
+            let hash = request.identity_hash();
             if let Some(operation_id) = &request.operation_id {
                 if let Some((recorded_hash, job_id)) = inner.dedup.get(operation_id).cloned() {
-                    if recorded_hash == request.request_hash {
+                    if recorded_hash == hash {
                         let recorded = inner
                             .jobs
                             .get(&job_id)
@@ -188,7 +189,7 @@ impl JobService {
                         .map(|entry| Box::new(entry.receipt.clone()));
                     return Err(JobError::OperationConflict {
                         operation_id: operation_id.clone(),
-                        expected_hash: request.request_hash,
+                        expected_hash: hash,
                         recorded_hash,
                         recorded: recorded.unwrap_or_else(|| {
                             Box::new(empty_receipt(
@@ -214,7 +215,7 @@ impl JobService {
                 state: JobState::Queued,
                 operation: request.operation.clone(),
                 operation_id: request.operation_id.clone(),
-                request_hash: request.request_hash,
+                request_hash: hash,
                 target: request.target.clone(),
                 admitted_at_ms: now,
                 started_at_ms: None,
@@ -249,10 +250,7 @@ impl JobService {
                 body: Some(body),
             });
             if let Some(operation_id) = &request.operation_id {
-                inner.dedup.insert(
-                    operation_id.clone(),
-                    (request.request_hash, key.clone()),
-                );
+                inner.dedup.insert(operation_id.clone(), (hash, key.clone()));
             }
             inner.counts.queued = inner.queue.len();
             // Retention is applied after the insert, so the bound counts this job too and a

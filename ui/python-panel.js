@@ -154,6 +154,8 @@ export class PythonPanel {
     this.logCursor = 0;
     this.nodes.log.textContent = "";
     try {
+      // The app admits the job on its shared job service: the id is a job id, not a promise
+      // that the script already ran, and the same id is what the job list shows.
       const receipt = await this.invoke("python_submit", { request });
       this.jobId = receipt.job_id;
       this.appendLog(`job ${receipt.job_id} ${receipt.state}`);
@@ -175,7 +177,13 @@ export class PythonPanel {
       const reply = await this.invoke("python_job_cancel", {
         request: { job_id: this.jobId },
       });
-      this.appendLog(`${reply.message} (state ${reply.state})`);
+      // `still_unwinding` means the interpreter has not stopped and may still publish a result;
+      // the panel says that rather than claiming the job is gone.
+      this.appendLog(
+        `cancel: ${reply.message ?? "requested"} (state ${reply.state}${
+          reply.still_unwinding ? ", still unwinding" : ""
+        })`,
+      );
     } catch (error) {
       this.appendLog(`cancel failed: ${error?.message || error}`);
     }
@@ -197,26 +205,31 @@ export class PythonPanel {
     if (!this.jobId) {
       return;
     }
-    const job = await this.invoke("python_job", {
+    const view = await this.invoke("python_job", {
       query: { job_id: this.jobId, log_after: this.logCursor, log_limit: 100 },
     });
-    this.logCursor = job.log_cursor ?? this.logCursor;
-    for (const line of job.logs ?? []) {
-      this.appendLog(`[${line.level}] ${line.text}`);
+    if (view?.error) {
+      this.appendLog(`${view.error.code}: ${view.error.message}`);
+      return;
+    }
+    const job = view.job ?? {};
+    this.logCursor = job.next_log_sequence ?? this.logCursor;
+    for (const line of view.logs ?? []) {
+      this.appendLog(`[${line.level}] ${line.message}`);
     }
     this.nodes.job.textContent = describeJob(job);
     this.nodes.job.dataset.state = job.state;
 
-    if (isTerminal(job.state)) {
+    if (job.terminal) {
       clearInterval(this.timer);
       this.timer = null;
       this.nodes.run.disabled = false;
       this.nodes.cancel.disabled = true;
-      if (job.error) {
-        this.appendLog(`${job.error.code}: ${job.error.message}`);
+      if (job.failure) {
+        this.appendLog(`${job.failure.code}: ${job.failure.message}`);
       }
-      if (job.export?.error) {
-        this.appendLog(`export failed: ${job.export.error}`);
+      if (job.export === "failed") {
+        this.appendLog("the export did not complete");
       }
       await this.refreshDocument();
       this.setStatus(describeJob(job));
@@ -439,34 +452,30 @@ export class PythonPanel {
 }
 
 /** One line summarising a job, for the panel's badge. */
-export function describeJob(job) {
-  if (!job) {
-    return "";
+export /** One line for a job, from the shared receipt plus the engine's detail. */
+function describeJob(job) {
+  const parts = [job.state];
+  if (typeof job.percent === "number" && !job.terminal) {
+    parts.push(`${job.percent}%`);
   }
-  const parts = [`job ${job.job_id}`, job.state];
-  if (job.point_count) {
-    parts.push(`${job.point_count} gaussians`);
+  if (job.phase && !job.terminal) {
+    parts.push(job.phase);
   }
-  if (job.revision !== null && job.revision !== undefined) {
-    parts.push(`revision ${job.revision}`);
+  if (job.result && job.result !== "no result") {
+    parts.push(job.result);
   }
-  const display = job.display?.state;
-  if (display && display !== "not_requested") {
-    parts.push(`display ${display}`);
+  if (job.failure) {
+    parts.push(`${job.failure.message} (${job.failure.code})`);
   }
-  if (job.timings?.execution_ms) {
-    parts.push(`${job.timings.execution_ms} ms`);
+  // Display is a separate fact from the commit: a job can commit without the window showing it.
+  if (job.display === "pending") {
+    parts.push("waiting for the viewer");
+  } else if (job.display === "failed") {
+    parts.push("display failed");
   }
-  return parts.join(" - ");
+  return parts.filter(Boolean).join(" - ");
 }
 
-const TERMINAL_STATES = new Set(["committed", "cancelled", "failed", "conflict"]);
-
-export function isTerminal(state) {
-  return TERMINAL_STATES.has(state);
-}
-
-/** Unique request id, so a resubmitted recipe is deduplicated rather than rerun. */
-export function newRequestId() {
+function newRequestId() {
   return `ui-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
 }

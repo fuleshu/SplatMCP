@@ -1,14 +1,16 @@
-//! The Python generation tools: runtime readiness, job submission, polling and
-//! cancellation.
+//! The Python generation tools: runtime readiness, job submission, polling and cancellation.
 //!
 //! All four go through the desktop app's loopback bridge, because the app - not this
 //! process - hosts the supported interpreter and the displayed document. Nothing here
 //! sends geometry: a 500k gaussian job is a compact script plus parameters, and the reply
-//! is a receipt with an identity to poll.
+//! is an admitted job id to poll.
 //!
-//! The reply types are this crate's own compact mirror of the app's job records. They are
-//! deliberately narrower than the app's full status: a tool reply that repeats every
-//! internal field costs the model context without telling it anything new.
+//! A script job is admitted by the app's **shared** job service, with the embedded interpreter
+//! as its executor. That is why the job id here is a string (`job-<session>-<n>`) rather than a
+//! number: it is the same id the generic job surface shows, so a script job appears in the same
+//! list, with the same states, progress, logs and receipts, as an import or an export. The
+//! python-specific detail (script hash, the revision the viewer acknowledged) rides beside the
+//! shared record.
 
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -16,7 +18,6 @@ use serde_json::{Value, json};
 use splatmcp_bridge::{Method, PythonRunRequest};
 
 use crate::bridge::AppLink;
-use crate::tools::round3;
 
 /// `run_python_splat` arguments.
 ///
@@ -92,9 +93,10 @@ impl RunPythonInput {
 /// `get_python_job` arguments.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct JobQueryInput {
-    /// Job id returned by `run_python_splat`.
-    pub job_id: u64,
-    /// Only return log lines newer than this cursor, so repeated polls stay small.
+    /// Job id returned by `run_python_splat` (a shared job id).
+    pub job_id: String,
+    /// Only return log lines newer than this cursor, so repeated polls stay small. Pass the
+    /// `next_log_sequence` from the previous reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_after: Option<u64>,
 }
@@ -102,26 +104,108 @@ pub struct JobQueryInput {
 /// `cancel_python_job` arguments.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CancelJobInput {
-    /// Job id returned by `run_python_splat`.
-    pub job_id: u64,
+    /// Job id returned by `run_python_splat` (a shared job id).
+    pub job_id: String,
 }
 
-// The reply types below are decoded from the app's JSON; only the fields a caller acts on
-// are kept, because every field of a reply costs the model context.
-
-/// Receipt of an accepted job.
+/// Receipt of an accepted script job.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobReceiptReply {
-    pub job_id: u64,
-    pub request_id: String,
+    /// Shared job id; quote it back to `get_python_job` and `cancel_python_job`.
+    pub job_id: String,
     pub state: String,
-    pub queued_at_ms: u64,
-    /// True when this request id had already been accepted with the same content.
+    /// True when an identical earlier request was replayed instead of queueing again.
     #[serde(default)]
-    pub deduplicated: bool,
-    pub content_hash: String,
+    pub replayed: bool,
+    /// The job service's real bounds, so a caller sees the ceiling rather than guessing.
+    #[serde(default)]
+    pub limits: String,
+    /// Where to go next, filled in by this tool so a caller does not have to infer it.
+    #[serde(default)]
+    pub note: String,
+}
+
+/// One captured log line from the shared job record.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobLogReply {
+    pub sequence: u64,
+    pub level: String,
+    pub message: String,
+}
+
+/// Structured failure of a job.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobErrorReply {
+    /// Stable code, e.g. `document_conflict`, `cancelled`, `script_error`.
+    pub code: String,
+    pub message: String,
+}
+
+/// The engine's own detail, present while the engine still knows the job.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PythonDetailReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display: Option<Value>,
+    pub engine_job_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_hash: Option<String>,
+    /// Revision the viewer acknowledged, once it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed_revision: Option<u64>,
+}
+
+/// `get_python_job` reply: the shared job record, narrowed, with the python detail beside it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobReply {
+    pub job_id: String,
+    /// queued, running, cancel_requested, validating, committing, committed, completed,
+    /// cancelled, failed or conflict.
+    pub state: String,
+    pub terminal: bool,
+    pub success: bool,
+    pub phase: String,
+    pub percent: u32,
+    /// Bounded description of the result: identity and counts, never a payload.
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<JobErrorReply>,
+    /// Export outcome, kept separate from the commit: `not_requested`, `pending`, `done` or
+    /// `failed`.
+    pub export: String,
+    /// Whether the viewer is showing the result. A committed job is not proof that it is
+    /// displayed.
+    pub display: String,
+    /// Pass this as `log_after` on the next poll.
+    pub next_log_sequence: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<JobLogReply>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<PythonDetailReply>,
+}
+
+/// `cancel_python_job` reply: the shared state, plus what the interpreter is doing about it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CancelReply {
+    pub job_id: String,
+    pub state: String,
+    /// True while the interpreter is still unwinding, e.g. inside a native call. A job in this
+    /// state has not stopped and may still publish a result.
+    pub still_unwinding: bool,
+    pub message: String,
+}
+
+/// Short entry in the shared job history.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobSummaryReply {
+    pub job_id: String,
+    pub kind: String,
+    pub state: String,
+    pub percent: u32,
 }
 
 /// One package in the runtime report.
@@ -175,147 +259,6 @@ pub struct RuntimeInfoReply {
     pub error: Option<String>,
 }
 
-/// Structured failure of a job.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JobErrorReply {
-    /// Stable code, e.g. `invalid_batch`, `document_conflict`, `job_cancelled`.
-    pub code: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub traceback: Option<String>,
-}
-
-/// One captured log line.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JobLogReply {
-    pub seq: u64,
-    pub level: String,
-    pub text: String,
-}
-
-/// Timings of a job, in milliseconds.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct TimingsReply {
-    /// Time the job spent waiting for the interpreter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting_ms: Option<u64>,
-    /// How long the script itself ran. Reported for every terminal state, including a
-    /// successful commit, so a caller can measure a recipe.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_ms: Option<u64>,
-}
-
-/// Where the result went.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CommittedReply {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub document_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub component_id: Option<String>,
-}
-
-/// Export outcome, reported separately from the compute result.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ExportReply {
-    pub path: String,
-    pub bytes: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sidecar: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// `get_python_job` reply: the app's job record, narrowed to what a caller acts on.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JobReply {
-    pub job_id: u64,
-    pub request_id: String,
-    /// queued, running, cancel_requested, validating, committing, committed, cancelled,
-    /// failed or conflict.
-    pub state: String,
-    /// Progress in `0..=1`. Reported by the script, and forced to `1.0` once its work is
-    /// finished, so a committed job never reads as 0%.
-    pub progress: f32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress_message: Option<String>,
-    /// Whether the viewer is showing the result: not_requested, pending, rendered or
-    /// failed. A committed job is not proof that the viewer rendered it.
-    pub display: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub displayed_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub document_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub component_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub point_count: Option<usize>,
-    /// Bounds of the candidate, rounded for a reply.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bounds: Option<BoundsReply>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timings: Option<TimingsReply>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub export: Option<ExportReply>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<JobErrorReply>,
-    #[serde(default)]
-    pub logs: Vec<JobLogReply>,
-    /// Pass this as `log_after` on the next poll.
-    pub log_cursor: u64,
-    /// True when older log lines were dropped by the log bound.
-    #[serde(default)]
-    pub log_truncated: bool,
-}
-
-/// Bounds of a generated candidate.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct BoundsReply {
-    pub center: [f32; 3],
-    pub radius: f32,
-    pub min: [f32; 3],
-    pub max: [f32; 3],
-}
-
-impl BoundsReply {
-    /// Rounds a bound so a reply stays short.
-    pub fn rounded(value: &Self) -> Self {
-        Self {
-            center: value.center.map(round3),
-            radius: round3(value.radius),
-            min: value.min.map(round3),
-            max: value.max.map(round3),
-        }
-    }
-}
-
-/// `cancel_python_job` reply.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CancelReply {
-    pub job_id: u64,
-    pub state: String,
-    /// True while the interpreter is still unwinding a native call.
-    pub still_unwinding: bool,
-    pub message: String,
-}
-
-/// Short entry in the app's job history.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JobSummaryReply {
-    pub job_id: u64,
-    pub request_id: String,
-    pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub point_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// Readiness, versions and limits of the app's embedded runtime.
 pub fn runtime_info(link: &AppLink) -> Result<RuntimeInfoReply, String> {
     let mut reply: RuntimeInfoReply = link.request_typed(Method::PythonRuntimeInfo, Value::Null)?;
@@ -325,7 +268,7 @@ pub fn runtime_info(link: &AppLink) -> Result<RuntimeInfoReply, String> {
     Ok(reply)
 }
 
-/// Submits a job and returns its receipt.
+/// Submits a script job and returns its admission from the shared job service.
 pub fn run(link: &AppLink, input: &RunPythonInput) -> Result<JobReceiptReply, String> {
     let request = input.to_request();
     request.validate().map_err(|error| error.to_string())?;
@@ -339,12 +282,20 @@ pub fn run(link: &AppLink, input: &RunPythonInput) -> Result<JobReceiptReply, St
                 .to_owned(),
         );
     }
-    link.request_typed(Method::PythonRunSplat, json!(request))
+    // The app admits the job on its shared service and answers at once: the interpreter runs on
+    // a job worker, so a long script never holds this request open.
+    let value = link.request(Method::PythonRunSplat, json!(request))?;
+    let mut reply: JobReceiptReply = serde_json::from_value(value)
+        .map_err(|error| format!("the app returned an unexpected receipt: {error}"))?;
+    reply.note = "poll document_job (or get_python_job) with this job_id; the script keeps \
+                  running even if this connection drops"
+        .to_owned();
+    Ok(reply)
 }
 
-/// Reads a job's state, with any log lines newer than the cursor.
+/// Reads a script job from the shared service, with the engine's detail beside it.
 pub fn job(link: &AppLink, input: &JobQueryInput) -> Result<JobReply, String> {
-    let mut reply: JobReply = link.request_typed(
+    let value = link.request(
         Method::PythonJob,
         json!({
             "job_id": input.job_id,
@@ -352,21 +303,105 @@ pub fn job(link: &AppLink, input: &JobQueryInput) -> Result<JobReply, String> {
             "log_limit": 200,
         }),
     )?;
-    if let Some(bounds) = reply.bounds.take() {
-        reply.bounds = Some(BoundsReply::rounded(&bounds));
+    job_reply_from_shared(&value)
+}
+
+/// Narrows one shared job view into this tool's reply.
+///
+/// Kept as a function of the raw reply so it can be tested without an app: the narrowing is
+/// where a field could quietly be dropped.
+fn job_reply_from_shared(value: &Value) -> Result<JobReply, String> {
+    if let Some(error) = value.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("the app did not describe that job")
+            .to_owned());
+    }
+    let job = value.get("job").cloned().unwrap_or(Value::Null);
+    // Built as a `Value` first, then decoded, so a field the app adds later cannot break the
+    // tool: the schema of the reply is this crate's own.
+    let narrowed = json!({
+        "job_id": job.get("job_id").cloned().unwrap_or(Value::Null),
+        "state": job.get("state").cloned().unwrap_or(Value::Null),
+        "terminal": job.get("terminal").cloned().unwrap_or(json!(false)),
+        "success": job.get("success").cloned().unwrap_or(json!(false)),
+        "phase": job.get("phase").cloned().unwrap_or(Value::Null),
+        "percent": job.get("percent").cloned().unwrap_or(json!(0)),
+        "result": job.get("result").cloned().unwrap_or(Value::Null),
+        "failure": job.get("failure").cloned().unwrap_or(Value::Null),
+        "export": job.get("export").cloned().unwrap_or(json!("not_requested")),
+        "display": job.get("display").cloned().unwrap_or(json!("not_requested")),
+        "next_log_sequence": job.get("next_log_sequence").cloned().unwrap_or(json!(0)),
+        "logs": value.get("logs").cloned().unwrap_or(json!([])),
+        "notes": job.get("notes").cloned().unwrap_or(json!([])),
+        "python": value.get("python").cloned().unwrap_or(Value::Null),
+    });
+    let mut reply: JobReply = serde_json::from_value(narrowed)
+        .map_err(|error| format!("the app returned an unexpected job: {error}"))?;
+    // A detail block with no engine id says nothing; drop it rather than print empty fields.
+    if reply
+        .python
+        .as_ref()
+        .is_some_and(|detail| detail.engine_job_id.is_none())
+    {
+        reply.python = None;
     }
     Ok(reply)
 }
 
-/// Asks a job to stop and reports what actually happened.
+/// Asks a script job to stop and reports what actually happened.
+///
+/// The shared service records the request and the interpreter is told, so a queued job stops
+/// immediately and a running one stops at its next checkpoint. `still_unwinding` says when the
+/// interpreter has not stopped yet - which means it may still publish a result.
 pub fn cancel(link: &AppLink, input: &CancelJobInput) -> Result<CancelReply, String> {
-    link.request_typed(Method::PythonJobCancel, json!({ "job_id": input.job_id }))
+    let value = link.request(Method::PythonJobCancel, json!({ "job_id": input.job_id }))?;
+    if let Some(error) = value.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("the app refused the cancellation")
+            .to_owned());
+    }
+    let state = value
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let engine_state = value
+        .get("engine")
+        .and_then(|engine| engine.get("state"))
+        .and_then(Value::as_str);
+    let still_unwinding = value
+        .get("engine")
+        .and_then(|engine| engine.get("still_unwinding"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        // A job still in `cancel_requested` has not stopped; that is the honest signal even when
+        // the engine has nothing to add.
+        || state == "cancel_requested";
+    Ok(CancelReply {
+        job_id: value
+            .get("job_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&input.job_id)
+            .to_owned(),
+        state: engine_state.unwrap_or(&state).to_owned(),
+        still_unwinding,
+        message: if still_unwinding {
+            "the interpreter has not stopped yet; it may still publish a result".to_owned()
+        } else {
+            "the job will not publish a result".to_owned()
+        },
+    })
 }
 
-/// The job history the app's panel shows, so a tool caller and the UI agree.
+/// The shared job history, so a tool caller and the window's job list agree.
 pub fn recent(link: &AppLink, limit: usize) -> Result<Vec<JobSummaryReply>, String> {
-    let value = link.request(Method::PythonJob, json!({ "job_id": 0, "limit": limit }))?;
-    serde_json::from_value(value.get("recent").cloned().unwrap_or(Value::Null))
+    let value = link.request(Method::PythonJob, json!({ "job_id": "", "log_limit": limit }))?;
+    let recent = value.get("recent").cloned().unwrap_or(Value::Null);
+    serde_json::from_value(recent)
         .map_err(|error| format!("the app returned an unexpected job list: {error}"))
 }
 
@@ -405,52 +440,83 @@ mod tests {
     }
 
     #[test]
-    fn a_job_reply_narrows_the_app_record_and_rounds_bounds() {
-        let app_reply = json!({
-            "job_id": 3,
-            "request_id": "req-1",
-            "state": "committed",
-            "progress": 1.0,
-            "display": {"state": "rendered"},
-            "revision": 4,
-            "point_count": 500000,
-            "bounds": {
-                "min": [-1.000123, -0.500456, -1.0],
-                "max": [1.000789, 0.5, 1.0],
-                "center": [0.000333, 0.0, 0.0],
-                "radius": 1.000456
+    fn a_job_reply_narrows_the_shared_record() {
+        // The shared service's view, with the engine's detail beside it.
+        let shared = json!({
+            "job": {
+                "job_id": "job-4f2a-3",
+                "kind": "generate",
+                "state": "committed",
+                "terminal": true,
+                "success": true,
+                "phase": "committing",
+                "percent": 100,
+                "result": "doc-4f2a-1@4 with 500000 gaussians",
+                "export": "done",
+                "display": "pending",
+                "next_log_sequence": 2,
+                "notes": ["the viewer has not acknowledged revision 4 yet"],
+                "unknown_future_field": true
             },
-            "timings": {"waiting_ms": 5, "execution_ms": 2600},
-            "logs": [{"seq": 1, "level": "info", "text": "generated 500000 gaussians"}],
-            "log_cursor": 1,
-            "unknown_future_field": true
+            "logs": [{"sequence": 1, "level": "info", "message": "generated 500000 gaussians"}],
+            "python": {"engine_job_id": 3, "request_id": "req-1", "script_hash": "abc"}
         });
-        let reply: JobReply = serde_json::from_value(app_reply).unwrap();
+        let reply = job_reply_from_shared(&shared).unwrap();
+        assert_eq!(reply.job_id, "job-4f2a-3");
         assert_eq!(reply.state, "committed");
-        assert_eq!(reply.point_count, Some(500000));
-        let bounds = BoundsReply::rounded(&reply.bounds.unwrap());
-        assert_eq!(bounds.radius, 1.0);
-        assert_eq!(bounds.center[0], 0.0);
-        assert_eq!(reply.logs[0].text, "generated 500000 gaussians");
-        // A field the app adds later does not break this tool.
-        assert_eq!(reply.log_cursor, 1);
+        assert!(reply.terminal && reply.success);
+        assert_eq!(reply.percent, 100);
+        assert_eq!(reply.export, "done");
+        assert_eq!(reply.display, "pending");
+        assert_eq!(reply.next_log_sequence, 2);
+        assert_eq!(reply.logs[0].message, "generated 500000 gaussians");
+        assert_eq!(reply.notes.len(), 1);
+        assert_eq!(reply.python.unwrap().engine_job_id, Some(3));
     }
 
     #[test]
-    fn a_conflict_is_reported_with_its_code_and_no_traceback() {
-        let reply: JobReply = serde_json::from_value(json!({
-            "job_id": 9,
-            "request_id": "req-2",
-            "state": "conflict",
-            "progress": 0.0,
-            "display": {"state": "not_requested"},
-            "error": {"code": "document_conflict", "message": "the document moved on"},
-            "log_cursor": 0
+    fn a_conflict_is_reported_with_its_code() {
+        let shared = json!({
+            "job": {
+                "job_id": "job-4f2a-9",
+                "kind": "generate",
+                "state": "conflict",
+                "terminal": true,
+                "success": false,
+                "phase": "computing",
+                "percent": 40,
+                "result": "no result",
+                "failure": {"code": "document_conflict", "message": "the document moved on"},
+                "export": "not_requested",
+                "display": "not_requested",
+                "next_log_sequence": 0
+            }
+        });
+        let reply = job_reply_from_shared(&shared).unwrap();
+        assert_eq!(reply.failure.unwrap().code, "document_conflict");
+        assert!(reply.python.is_none(), "no engine detail means no block");
+        assert_eq!(reply.display, "not_requested");
+    }
+
+    #[test]
+    fn an_unknown_job_is_an_error_not_an_empty_reply() {
+        let error = job_reply_from_shared(&json!({
+            "error": {"code": "unknown_job", "message": "job job-1-1 is not available"}
         }))
-        .unwrap();
-        let error = reply.error.unwrap();
-        assert_eq!(error.code, "document_conflict");
-        assert!(error.traceback.is_none());
-        assert_eq!(reply.revision, None);
+        .unwrap_err();
+        assert!(error.contains("not available"), "{error}");
+    }
+
+    #[test]
+    fn a_cancelled_job_that_is_still_unwinding_says_so() {
+        let reply = CancelReply {
+            job_id: "job-4f2a-4".to_owned(),
+            state: "cancel_requested".to_owned(),
+            still_unwinding: true,
+            message: "the interpreter has not stopped yet; it may still publish a result".to_owned(),
+        };
+        let encoded = serde_json::to_string(&reply).unwrap();
+        assert!(encoded.contains("still_unwinding\":true"));
+        assert!(encoded.contains("may still publish"));
     }
 }

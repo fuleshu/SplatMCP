@@ -288,6 +288,13 @@ pub struct EditBatchInput {
     /// Show the result. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<bool>,
+    /// Run the batch as a background job instead of holding this call open.
+    ///
+    /// The batch is the same atomic, retry-safe transaction either way; as a job it reports
+    /// progress and logs and appears in the job list, which is what a long edit over a large
+    /// document wants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
 }
 
 /// Parameters of `edit_history`.
@@ -351,6 +358,8 @@ pub struct ComponentsInput {
 pub enum BatchCall {
     /// Run (or dry-run) a batch.
     Batch(EditBatchRequest),
+    /// Run the batch as a background job on the app's shared job service.
+    Background(EditBatchRequest),
     /// Commit a retained preview candidate.
     CommitPreview(CommitPreviewRequest),
 }
@@ -569,7 +578,7 @@ pub fn batch_call(input: &EditBatchInput) -> Result<BatchCall, String> {
         .enumerate()
         .map(|(index, step)| step_params(step, index))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(BatchCall::Batch(EditBatchRequest {
+    let request = EditBatchRequest {
         document_id: input.document_id.clone(),
         expected_revision: input.expected_revision,
         operation_id: input.operation_id.clone(),
@@ -578,7 +587,13 @@ pub fn batch_call(input: &EditBatchInput) -> Result<BatchCall, String> {
         display: input.display,
         export_path: None,
         steps,
-    }))
+    };
+    // A dry run is answered before it is queued: a preview is its own reply (a handle to commit
+    // later), so running it as a job would only add a poll before the same answer.
+    if input.background.unwrap_or(false) && !request.dry_run.unwrap_or(false) {
+        return Ok(BatchCall::Background(request));
+    }
+    Ok(BatchCall::Batch(request))
 }
 
 /// True when `source` names the displayed document.
@@ -1337,6 +1352,38 @@ mod tests {
             asset_id: None,
             patch: None,
         }
+    }
+
+    #[test]
+    fn a_background_batch_is_offered_as_a_job_and_a_dry_run_is_not() {
+        let mut input = EditBatchInput::default();
+        input.steps = Some(vec![EditOpInput {
+            op: EditOpKind::Translate,
+            by: Some([1.0, 0.0, 0.0]),
+            ..step(EditOpKind::Translate)
+        }]);
+        input.background = Some(true);
+        match batch_call(&input).unwrap() {
+            BatchCall::Background(request) => {
+                assert_eq!(request.steps.len(), 1);
+                assert!(request.dry_run.is_none());
+            }
+            other => panic!("expected a background batch, got {other:?}"),
+        }
+
+        // A dry run is answered with a preview handle, so it stays synchronous even when the
+        // caller asked for the background form: queueing it would only add a poll before the
+        // same answer.
+        input.dry_run = Some(true);
+        match batch_call(&input).unwrap() {
+            BatchCall::Batch(request) => assert_eq!(request.dry_run, Some(true)),
+            other => panic!("expected a synchronous dry run, got {other:?}"),
+        }
+
+        // Without the switch the batch runs inline, exactly as before.
+        input.background = None;
+        input.dry_run = None;
+        assert!(matches!(batch_call(&input).unwrap(), BatchCall::Batch(_)));
     }
 
     #[test]

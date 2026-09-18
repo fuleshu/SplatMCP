@@ -57,9 +57,9 @@ pub use ply::{
     PlyImportPolicy, PlyReport, read_ply, read_ply_repairing, read_ply_with_policy, write_ply,
 };
 pub use publish::{
-    DocumentPublication, PUBLICATION_CONTRACT_VERSION, PublicationError, PublicationOutcome,
-    PublicationRequest, PublicationSource, PublicationStatus, PublicationTracker,
-    RendererCapabilities,
+    ACK_TIMEOUT_MS, DocumentPublication, PUBLICATION_CONTRACT_VERSION, PublicationError,
+    PublicationOutcome, PublicationRequest, PublicationSource, PublicationStatus,
+    PublicationTracker, RendererCapabilities,
 };
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
 pub use transaction::{

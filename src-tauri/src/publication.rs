@@ -1,49 +1,62 @@
 //! The desktop's publication seam: which revision the viewer is showing, and which it must fetch.
 //!
 //! [`crate::document::AppState`] owns the authoritative revisions; the window owns the picture.
-//! This module is the bridge between the two, and it is deliberately small:
+//! This module is the bridge between the two:
 //!
-//! - every commit records the new revision on a [`splatmcp_core::PublicationTracker`];
-//! - every publication mints a request token *before* the event is emitted, so the viewer's
-//!   acknowledgement can be matched to the exact request it answers;
-//! - the binary payload the viewer fetches is addressed by `(document_id, revision)`, so a
-//!   delayed old fetch cannot be mistaken for a newer one;
-//! - a frame the viewer could not prepare leaves the previous model displayed and is reported
-//!   as a failure, never as a displayed revision.
+//! - **every commit** records the new revision on a [`splatmcp_core::PublicationTracker`],
+//!   including a commit nobody asked to display, so a hidden revision is reported as committed
+//!   and *not* displayed rather than as the current one;
+//! - **every publication** mints a request token before the event is emitted, and the token is
+//!   what the acknowledgement must quote;
+//! - **every pending request expires** after [`ACK_TIMEOUT_MS`]: the tracker sweeps on read and
+//!   on the next publication, so a viewer that stopped answering is reported as `timed_out`
+//!   instead of leaving a caller waiting on a promise that will never settle;
+//! - **the binary payload** the viewer fetches is addressed by `(document_id, revision)`, so a
+//!   delayed old fetch cannot be mistaken for a newer one.
 //!
 //! The tracker holds no geometry and takes no document lock: it answers "what is on screen?"
-//! without touching the store, which is what keeps a status query from waiting on a large
-//! serialisation.
+//! without touching the store, which keeps a status query from waiting on a serialisation.
 
 use std::sync::Arc;
 
 use serde_json::json;
+use tauri::{Emitter, Manager};
 use splatmcp_core::{
-    DocumentHandle, PUBLICATION_CONTRACT_VERSION, PublicationError, PublicationOutcome,
-    PublicationRequest, PublicationSource, PublicationStatus, PublicationTracker,
-    RendererCapabilities, RevisionRecord,
+    document::now_ms, DocumentHandle, PublicationError, PublicationOutcome, PublicationRequest,
+    PublicationSource, PublicationStatus, PublicationTracker, RendererCapabilities,
+    ACK_TIMEOUT_MS, PUBLICATION_CONTRACT_VERSION,
 };
-use tauri::Manager;
 
 /// The process-wide publication tracker.
 pub struct PublicationHost {
     tracker: Arc<PublicationTracker>,
     /// How long a publication waits for the viewer's acknowledgement.
     ack_timeout_ms: u64,
+    /// Reads the clock, so a test can drive expiry without sleeping.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl Default for PublicationHost {
     fn default() -> Self {
-        Self::new(5_000)
+        Self::new(ACK_TIMEOUT_MS)
     }
 }
 
 impl PublicationHost {
     /// A host whose publications time out after `ack_timeout_ms`.
     pub fn new(ack_timeout_ms: u64) -> Self {
+        Self::with_clock(ack_timeout_ms, Arc::new(now_ms))
+    }
+
+    /// The same host, reading time from `clock`. Used by tests that drive the timeout.
+    pub fn with_clock(
+        ack_timeout_ms: u64,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
         Self {
             tracker: Arc::new(PublicationTracker::new()),
             ack_timeout_ms,
+            clock,
         }
     }
 
@@ -52,26 +65,17 @@ impl PublicationHost {
         &self.tracker
     }
 
-    /// How long a publication waits for acknowledgement.
-    pub fn ack_timeout_ms(&self) -> u64 {
-        self.ack_timeout_ms
+    fn now(&self) -> u64 {
+        (self.clock)()
     }
 
     /// Records that the store holds this revision.
+    ///
+    /// Called from every commit path, displayed or not: that is what makes a hidden revision
+    /// show up as "committed, not displayed" instead of leaving the status on the old one.
     pub fn committed(&self, handle: &DocumentHandle) -> Result<(), PublicationError> {
         self.tracker
             .committed(handle.document_id.as_str(), handle.revision)
-    }
-
-    /// Records several commits at once, for a caller that already has the history.
-    pub fn committed_all(&self, handle: &DocumentHandle, history: &[RevisionRecord]) {
-        let _ = self.committed(handle);
-        for record in history {
-            let _ = self
-                .tracker
-                .committed(handle.document_id.as_str(), record.revision);
-        }
-        let _ = self.committed(handle);
     }
 
     /// Starts a publication and returns the request the viewer must fetch.
@@ -81,10 +85,17 @@ impl PublicationHost {
         source: PublicationSource,
         frame: bool,
     ) -> Result<PublicationRequest, PublicationError> {
-        self.tracker
-            .committed(handle.document_id.as_str(), handle.revision)?;
-        self.tracker
-            .begin(handle.document_id.as_str(), handle.revision, source, frame)
+        // The commit that led here is recorded first, so a publication can never announce a
+        // revision the tracker does not know is committed.
+        self.committed(handle)?;
+        self.tracker.begin_at(
+            self.now(),
+            self.ack_timeout_ms,
+            handle.document_id.as_str(),
+            handle.revision,
+            source,
+            frame,
+        )
     }
 
     /// Records a viewer acknowledgement and returns the resulting status.
@@ -94,7 +105,13 @@ impl PublicationHost {
         revision: u64,
         token: u64,
     ) -> Result<PublicationStatus, PublicationError> {
-        self.tracker.acknowledge(document_id, revision, token)
+        self.tracker.acknowledge_at(
+            self.now(),
+            self.ack_timeout_ms,
+            document_id,
+            revision,
+            token,
+        )
     }
 
     /// Records a viewer failure: the previous model stays displayed.
@@ -104,10 +121,11 @@ impl PublicationHost {
         revision: u64,
         reason: impl Into<String>,
     ) -> Result<PublicationStatus, PublicationError> {
-        self.tracker.fail(document_id, revision, reason)
+        self.tracker
+            .fail_at(self.now(), self.ack_timeout_ms, document_id, revision, reason)
     }
 
-    /// Marks the request in flight as timed out.
+    /// Marks the request in flight as timed out, for a caller that is giving up on this viewer.
     pub fn time_out(
         &self,
         document_id: &str,
@@ -116,21 +134,33 @@ impl PublicationHost {
     }
 
     /// One document's publication status, if anything is known about it.
-    pub fn status(&self, document_id: &str) -> Result<Option<PublicationStatus>, PublicationError> {
-        self.tracker.status(document_id)
+    ///
+    /// Reading it also applies the acknowledgement timeout, so a stalled publication is
+    /// reported as timed out rather than as pending forever.
+    pub fn status(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<PublicationStatus>, PublicationError> {
+        self.tracker
+            .status_at(self.now(), self.ack_timeout_ms, document_id)
+    }
+
+    /// The document that currently owns the screen, if any.
+    pub fn active_document(&self) -> Result<Option<String>, PublicationError> {
+        self.tracker.active_document()
     }
 
     /// Renderer capabilities, with the timeout this app actually uses.
+    ///
+    /// The displayed revision comes from the tracker when it has one, because that is the value
+    /// the app itself acknowledges; the viewer's own report is used for what only the renderer
+    /// knows (whether a splat is loaded, and its gaussian count).
     pub fn capabilities(
         &self,
-        displayed_revision: Option<u64>,
+        displayed_elsewhere: Option<u64>,
         displayed_point_count: usize,
     ) -> RendererCapabilities {
-        RendererCapabilities::of(
-            displayed_revision,
-            displayed_point_count,
-            self.ack_timeout_ms,
-        )
+        RendererCapabilities::of(displayed_elsewhere, displayed_point_count, self.ack_timeout_ms)
     }
 }
 
@@ -139,16 +169,11 @@ pub struct PublicationHostState(pub Arc<PublicationHost>);
 
 /// The payload of the event that asks the viewer to display one exact request.
 ///
-/// Small on purpose: identity, revision, token and the two switches. The geometry travels
-/// through the binary `splat_bytes_for_revision` response, so a 500 000 gaussian revision never
-/// becomes a JSON payload.
-pub fn request_payload(
-    request: &PublicationRequest,
-    file_name: &str,
-    point_count: usize,
-) -> serde_json::Value {
+/// An event, never a payload carrier: identity, revision, token and the two switches. The geometry
+/// travels through the binary `splat_bytes_for_revision` response.
+pub fn request_payload(request: &PublicationRequest, file_name: &str, point_count: usize) -> serde_json::Value {
     json!({
-        "contract_version": PUBLICATION_CONTRACT_VERSION,
+        "contract_version": splatmcp_core::PUBLICATION_CONTRACT_VERSION,
         "document_id": request.document_id,
         "revision": request.revision,
         "token": request.token,
@@ -157,6 +182,16 @@ pub fn request_payload(
         "file_name": file_name,
         "point_count": point_count,
     })
+}
+
+/// True for the outcome that means the requested revision did *not* reach the screen.
+pub fn needs_attention(outcome: &PublicationOutcome) -> bool {
+    matches!(
+        outcome,
+        PublicationOutcome::Failed(_)
+            | PublicationOutcome::TimedOut
+            | PublicationOutcome::Skipped { .. }
+    )
 }
 
 /// A publication status as the window and a tool read it.
@@ -168,11 +203,13 @@ pub fn status_json(status: &PublicationStatus) -> serde_json::Value {
         "displayed_revision": status.displayed_revision,
         "is_current": status.is_current(),
         "display_lagging": status.display_lagging,
+        "displayed_elsewhere": status.displayed_elsewhere,
         "pending": status.pending.as_ref().map(|request| json!({
             "revision": request.revision,
             "token": request.token,
             "source": request.source.as_str(),
             "frame": request.frame,
+            "started_at_ms": request.started_at_ms,
         })),
         "last": status.last.as_ref().map(|(request, outcome)| json!({
             "revision": request.revision,
@@ -208,14 +245,46 @@ pub fn error_json(error: &PublicationError) -> serde_json::Value {
     json!({ "code": error.code(), "message": error.to_string() })
 }
 
-/// True for the outcome that means the requested revision did *not* reach the screen.
-pub fn needs_attention(outcome: &PublicationOutcome) -> bool {
-    matches!(
-        outcome,
-        PublicationOutcome::Failed(_)
-            | PublicationOutcome::TimedOut
-            | PublicationOutcome::Skipped { .. }
-    )
+/// Emits the publication event for one exact revision and records the request.
+///
+/// One implementation for every producer - a load, an edit batch, a preview commit, a Python
+/// job - so the viewer sees the same request shape and the tracker sees the same bookkeeping.
+/// The commit is recorded first, then a token is minted, then the identity-only event is sent;
+/// the geometry travels separately through the binary `(document, revision)` response.
+///
+/// An error means the request was recorded but could not be announced, and the publication is
+/// marked failed so the status does not leave it looking pending.
+pub fn announce(
+    app: &tauri::AppHandle,
+    receipt: &splatmcp_core::ReceiptDocument,
+    component_id: Option<String>,
+    frame: bool,
+) -> Result<PublicationRequest, PublicationError> {
+    let publications = app.state::<PublicationHostState>().0.clone();
+    let handle = receipt.handle();
+    let request = publications.begin(&handle, PublicationSource::Committed, frame)?;
+    let payload = crate::python::RevisionPayload {
+        revision: receipt.revision,
+        document_id: receipt.document_id.to_string(),
+        token: request.token,
+        source: request.source.as_str().to_owned(),
+        file_name: receipt.file_name.clone(),
+        point_count: receipt.point_count,
+        component_id,
+        frame,
+    };
+    if let Err(error) = app.emit_to(crate::viewer::VIEWER_WINDOW, crate::bridge::EDIT_REVISION_EVENT, payload)
+    {
+        let _ = publications.fail(
+            request.document_id.as_str(),
+            request.revision,
+            format!("could not tell the viewer: {error}"),
+        );
+        return Err(PublicationError::Unavailable {
+            reason: format!("could not tell the viewer about {handle}: {error}"),
+        });
+    }
+    Ok(request)
 }
 
 /// Tauri command: the status of one document's publication, or of every tracked document.
@@ -234,9 +303,14 @@ pub fn publication_status(
             Err(error) => Ok(json!({ "error": error_json(&error) })),
         },
         None => {
-            let statuses = host.0.tracker().all().map_err(|error| error.to_string())?;
+            let statuses = host
+                .0
+                .tracker()
+                .all()
+                .map_err(|error| error.to_string())?;
             Ok(json!({
                 "documents": statuses.iter().map(status_json).collect::<Vec<_>>(),
+                "active_document": host.0.active_document().map_err(|error| error.to_string())?,
             }))
         }
     }
@@ -260,14 +334,15 @@ pub fn renderer_capabilities(
         )
         .ok()
         .and_then(|value| serde_json::from_value::<splatmpc_status::ViewerStatus>(value).ok());
-    let (displayed_revision, point_count) = match status {
-        Some(status) => (
-            status.document.as_ref().map(|document| document.revision),
-            status.point_count,
-        ),
-        None => (None, 0),
-    };
-    capabilities_json(&host.0.capabilities(displayed_revision, point_count))
+    let point_count = status.as_ref().map(|status| status.point_count).unwrap_or(0);
+    // The displayed revision is the app's own answer (the tracker records acknowledgements);
+    // the viewer only supplies the facts only it knows.
+    let acknowledged = app
+        .state::<crate::document::AppState>()
+        .active_handle()
+        .and_then(|handle| host.0.status(handle.document_id.as_str()).ok().flatten())
+        .and_then(|status| status.displayed_revision);
+    capabilities_json(&host.0.capabilities(acknowledged, point_count))
 }
 
 /// A local alias so the viewer status type is named once, in the capabilities command.
@@ -299,9 +374,18 @@ pub fn splat_bytes_for_handle(
 mod tests {
     use super::*;
     use splatmcp_core::{DocumentId, PublicationTracker};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn handle() -> DocumentHandle {
         DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 4)
+    }
+
+    /// A host on a clock the test moves by hand.
+    fn clocked() -> (PublicationHost, Arc<AtomicU64>) {
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let reader = Arc::clone(&clock);
+        let host = PublicationHost::with_clock(1_000, Arc::new(move || reader.load(Ordering::SeqCst)));
+        (host, clock)
     }
 
     #[test]
@@ -315,13 +399,71 @@ mod tests {
         let encoded = status_json(&status);
         assert_eq!(encoded["is_current"], false);
         assert_eq!(encoded["display_lagging"], true);
-        assert!(
-            encoded["summary"]
-                .as_str()
-                .unwrap()
-                .contains("committing nothing")
-                == false
+    }
+
+    #[test]
+    fn a_hidden_commit_moves_the_committed_revision_and_stops_claiming_current() {
+        // The reported defect: a `display:false` edit left the status on the old revision and
+        // still claimed the display was current.
+        let host = PublicationHost::new(1_000);
+        let request = host
+            .begin(&handle(), PublicationSource::Committed, false)
+            .unwrap();
+        host.acknowledge("doc-4f2a-1", 4, request.token).unwrap();
+
+        // A hidden commit of revision 5: recorded, not published.
+        let hidden = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 5);
+        host.committed(&hidden).unwrap();
+        let status = host.status("doc-4f2a-1").unwrap().unwrap();
+        assert_eq!(status.committed_revision, Some(5));
+        assert_eq!(status.displayed_revision, Some(4));
+        assert!(!status.is_current());
+        assert!(status.display_lagging);
+        assert!(status.pending.is_none(), "a hidden commit publishes nothing");
+        let encoded = status_json(&status);
+        assert_eq!(encoded["is_current"], false);
+        assert_eq!(encoded["committed_revision"], 5);
+        assert_eq!(encoded["displayed_revision"], 4);
+    }
+
+    #[test]
+    fn a_pending_publication_expires_instead_of_waiting_forever() {
+        let (host, clock) = clocked();
+        let request = host
+            .begin(&handle(), PublicationSource::Committed, false)
+            .unwrap();
+        // Still inside the timeout: the request is honestly pending.
+        clock.store(1_500, Ordering::SeqCst);
+        let status = host.status("doc-4f2a-1").unwrap().unwrap();
+        assert_eq!(status.pending.as_ref().map(|p| p.token), Some(request.token));
+        assert_eq!(status.pending.as_ref().map(|p| p.started_at_ms), Some(1_000));
+
+        // Past it: the read applies the timeout, so a stall is reported as a stall.
+        clock.store(1_000 + ACK_TIMEOUT_MS + 1, Ordering::SeqCst);
+        let status = host.status("doc-4f2a-1").unwrap().unwrap();
+        assert!(status.pending.is_none());
+        assert_eq!(
+            status.last.as_ref().map(|(_, outcome)| outcome.clone()),
+            Some(PublicationOutcome::TimedOut)
         );
+        assert!(needs_attention(&PublicationOutcome::TimedOut));
+    }
+
+    #[test]
+    fn a_new_publication_expires_the_stalled_one_it_supersedes() {
+        let (host, clock) = clocked();
+        let first = host
+            .begin(&handle(), PublicationSource::Committed, false)
+            .unwrap();
+        clock.store(1_000 + ACK_TIMEOUT_MS + 5, Ordering::SeqCst);
+        // The next publication sweeps first, so the stalled request is timed out before the
+        // new one is queued: it is never left looking like work still in progress.
+        let second = host
+            .begin(&handle(), PublicationSource::Committed, false)
+            .unwrap();
+        assert_ne!(first.token, second.token);
+        let status = host.status("doc-4f2a-1").unwrap().unwrap();
+        assert_eq!(status.pending.as_ref().map(|p| p.token), Some(second.token));
     }
 
     #[test]
@@ -349,18 +491,20 @@ mod tests {
 
     #[test]
     fn a_stale_acknowledgement_is_refused_and_the_newest_keeps_the_screen() {
-        let host = PublicationHost::new(1_000);
+        let (host, clock) = clocked();
+        let four = handle();
+        let five = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 5);
         let first = host
-            .begin(&handle(), PublicationSource::Committed, true)
+            .begin(&four, PublicationSource::Committed, true)
             .unwrap();
-        host.tracker().committed("doc-4f2a-1", 5).unwrap();
+        clock.store(1_100, Ordering::SeqCst);
         let second = host
-            .tracker()
-            .begin("doc-4f2a-1", 5, PublicationSource::Committed, false)
+            .begin(&five, PublicationSource::Committed, false)
             .unwrap();
+        assert_ne!(first.token, second.token);
+        // The delayed acknowledgement of revision 4 arrives after 5 was announced.
         let error = host.acknowledge("doc-4f2a-1", 4, first.token).unwrap_err();
         assert_eq!(error.code(), "stale_acknowledgement");
-        assert!(needs_attention(&PublicationOutcome::TimedOut));
         let status = host.acknowledge("doc-4f2a-1", 5, second.token).unwrap();
         assert_eq!(status.displayed_revision, Some(5));
         assert!(status.skipped.contains(&4));
@@ -368,27 +512,70 @@ mod tests {
 
     #[test]
     fn a_failed_publication_keeps_the_old_frame_and_reports_the_failure() {
-        let host = PublicationHost::new(1_000);
+        let (host, clock) = clocked();
         let shown = host
             .begin(&handle(), PublicationSource::Committed, true)
             .unwrap();
         host.acknowledge("doc-4f2a-1", 4, shown.token).unwrap();
-        host.tracker().committed("doc-4f2a-1", 5).unwrap();
-        host.tracker()
-            .begin("doc-4f2a-1", 5, PublicationSource::Committed, false)
-            .unwrap();
+        clock.store(2_000, Ordering::SeqCst);
+        let hidden = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 5);
+        host.committed(&hidden).unwrap();
+        host.begin(&hidden, PublicationSource::Committed, false).unwrap();
         let status = host.fail("doc-4f2a-1", 5, "parse failed").unwrap();
         assert_eq!(status.displayed_revision, Some(4), "the old frame stays");
         assert_eq!(status.committed_revision, Some(5));
         let encoded = status_json(&status);
         assert_eq!(encoded["failures"][0]["revision"], 5);
         assert_eq!(encoded["failures"][0]["reason"], "parse failed");
-        assert!(
-            encoded["summary"]
-                .as_str()
-                .unwrap()
-                .contains("last request failed")
-        );
+        assert!(encoded["summary"].as_str().unwrap().contains("last request failed"));
+    }
+
+    #[test]
+    fn switching_documents_moves_the_screen_and_the_old_one_stops_claiming_it() {
+        // The reported stall: the status of the new document had to say "not displayed yet",
+        // and the old document had to stop reporting itself as displayed.
+        let host = PublicationHost::new(1_000);
+        let a = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 7);
+        let shown = host
+            .begin(&a, PublicationSource::Committed, true)
+            .unwrap();
+        host.acknowledge(a.document_id.as_str(), 7, shown.token)
+            .unwrap();
+        assert_eq!(host.active_document().unwrap().as_deref(), Some("doc-4f2a-1"));
+
+        // Document B becomes the displayed one.
+        let b = DocumentHandle::new(DocumentId::mint(0x4f2a, 2), 1);
+        let first_b = host.begin(&b, PublicationSource::Committed, true).unwrap();
+        let status_b = host
+            .acknowledge(b.document_id.as_str(), 1, first_b.token)
+            .unwrap();
+        assert_eq!(status_b.displayed_revision, Some(1));
+        assert_eq!(host.active_document().unwrap().as_deref(), Some("doc-4f2a-2"));
+
+        let status_a = host.status(a.document_id.as_str()).unwrap().unwrap();
+        assert_eq!(status_a.displayed_revision, None, "A is not on screen any more");
+        assert_eq!(status_a.committed_revision, Some(7));
+        assert!(status_a.display_lagging);
+    }
+
+    #[test]
+    fn a_document_that_has_never_been_displayed_says_so_while_another_one_is() {
+        let host = PublicationHost::new(1_000);
+        let a = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 1);
+        let shown = host.begin(&a, PublicationSource::Committed, true).unwrap();
+        host.acknowledge(a.document_id.as_str(), 1, shown.token)
+            .unwrap();
+
+        // B has a commit but no publication yet: the status must distinguish that from "B is
+        // displayed somewhere".
+        let b = DocumentHandle::new(DocumentId::mint(0x4f2a, 2), 3);
+        host.committed(&b).unwrap();
+        let status = host.status(b.document_id.as_str()).unwrap().unwrap();
+        assert_eq!(status.displayed_revision, None);
+        assert!(status.displayed_elsewhere, "A owns the screen");
+        let encoded = status_json(&status);
+        assert_eq!(encoded["displayed_elsewhere"], true);
+        assert!(encoded["summary"].as_str().unwrap().contains("another document is displayed"));
     }
 
     #[test]
@@ -400,12 +587,7 @@ mod tests {
         assert_eq!(encoded["revision_addressed"], true);
         assert_eq!(encoded["ack_timeout_ms"], 1_500);
         assert_eq!(encoded["displayed_revision"], 7);
-        assert!(
-            encoded["summary"]
-                .as_str()
-                .unwrap()
-                .contains("200000 gaussians")
-        );
+        assert!(encoded["summary"].as_str().unwrap().contains("200000 gaussians"));
     }
 
     #[test]
