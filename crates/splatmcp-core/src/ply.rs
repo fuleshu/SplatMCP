@@ -4,9 +4,30 @@
 //! (`f_rest_*`, `nx/ny/nz`) and extra elements (`face`), so files produced by
 //! training tools load unchanged. Writing emits the canonical INRIA/3DGS
 //! property order at SH degree 0, which PlayCanvas and other viewers accept.
+//!
+//! # What an import does with a file
+//!
+//! The model is fixed-colour, so a file's higher spherical-harmonic bands and its normals
+//! have nowhere to go. [`read_ply`] drops them and says nothing; [`read_ply_with_report`]
+//! returns the same splat plus a [`PlyReport`] that names every discarded attribute, every
+//! element that was stepped over, and every value that had to be repaired so a damaged
+//! file could load at all.
+//!
+//! Two kinds of value are deliberately not confused:
+//!
+//! - **Serialized endpoints** are valid data. A log-scale of `0.0` is a radius of 1 m, a
+//!   logit of `+inf` is fully opaque, and a `f_dc` coefficient at the edge of the
+//!   representable range is a black or white gaussian. None of these is reported.
+//! - **Repairs** are recorded. A radius that is unreadable or not positive becomes
+//!   [`f32::MIN_POSITIVE`] (a gaussian with no size cannot be rendered), a quaternion
+//!   that is unreadable or degenerate becomes the identity rotation, and a colour
+//!   coefficient outside the representable range is clamped to the endpoint. A position or
+//!   coefficient that is not a number at all is an error, not a repair: nothing sensible
+//!   can be invented for it.
 
 use std::io::Write;
 
+use crate::contract::{self, PlyAttributeUse};
 use crate::{Result, Splat, SplatError, SplatPoint, normalize_quat};
 
 /// Properties required to interpret a Gaussian.
@@ -86,6 +107,135 @@ struct Header {
 
 fn format_error(message: impl Into<String>) -> SplatError {
     SplatError::Format(message.into())
+}
+
+/// Largest number of repaired values one report lists.
+pub const MAX_REPORTED_REPAIRS: usize = 16;
+
+/// One `vertex` attribute the model does not keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscardedAttribute {
+    pub property: String,
+    /// Why it was dropped, from [`contract::ply_attribute_use`].
+    pub reason: &'static str,
+}
+
+/// One element (other than `vertex`) that was stepped over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredElement {
+    pub name: String,
+    pub count: usize,
+}
+
+/// One value the importer repaired so a damaged file could load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    /// Index of the gaussian the value belonged to.
+    pub point: usize,
+    /// Field that was repaired.
+    pub field: &'static str,
+    /// What the importer stored instead.
+    pub action: &'static str,
+}
+
+/// What an import did besides producing gaussians.
+///
+/// A caller can decide for itself how much of this matters: a training export with
+/// `f_rest_*` bands is normal and expected, while a repaired radius suggests the file is
+/// damaged. Nothing here is fatal, which is why it travels beside the splat rather than as
+/// an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlyReport {
+    /// True when the file was ASCII rather than binary little endian.
+    pub ascii: bool,
+    /// Vertices the header declared.
+    pub vertex_count: usize,
+    /// Properties on the `vertex` element.
+    pub vertex_properties: usize,
+    /// Attributes that were dropped, with the reason.
+    pub discarded: Vec<DiscardedAttribute>,
+    /// Elements that were not `vertex`.
+    pub ignored_elements: Vec<IgnoredElement>,
+    /// Repaired values, bounded by [`MAX_REPORTED_REPAIRS`].
+    pub repairs: Vec<Repair>,
+    /// Repairs performed, including any beyond the bounded list.
+    pub total_repairs: usize,
+}
+
+impl PlyReport {
+    /// True when the file was read exactly as stored: nothing dropped, nothing repaired.
+    pub fn is_lossless(&self) -> bool {
+        self.discarded.is_empty() && self.ignored_elements.is_empty() && self.total_repairs == 0
+    }
+
+    /// True when repairs happened but more of them than the list holds.
+    pub fn repairs_truncated(&self) -> bool {
+        self.total_repairs > self.repairs.len()
+    }
+
+    /// Records one repair, counting every one and listing the first few.
+    pub fn record_repair(&mut self, point: usize, field: &'static str, action: &'static str) {
+        self.total_repairs += 1;
+        if self.repairs.len() < MAX_REPORTED_REPAIRS {
+            self.repairs.push(Repair {
+                point,
+                field,
+                action,
+            });
+        }
+    }
+
+    /// Names of the dropped attributes, which is what a caller shows first.
+    pub fn discarded_names(&self) -> Vec<&str> {
+        self.discarded
+            .iter()
+            .map(|attribute| attribute.property.as_str())
+            .collect()
+    }
+
+    /// One line, bounded, describing the import.
+    pub fn summary(&self) -> String {
+        if self.is_lossless() {
+            return format!(
+                "{} gaussians read with no loss ({} attributes)",
+                self.vertex_count, self.vertex_properties
+            );
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !self.discarded.is_empty() {
+            let names = self.discarded_names();
+            let shown = names
+                .iter()
+                .take(6)
+                .copied()
+                .collect::<Vec<&str>>()
+                .join(", ");
+            parts.push(format!(
+                "{} attribute(s) dropped ({}{}): {}",
+                names.len(),
+                shown,
+                if names.len() > 6 { ", ..." } else { "" },
+                self.discarded
+                    .first()
+                    .map(|attribute| attribute.reason)
+                    .unwrap_or("")
+            ));
+        }
+        if !self.ignored_elements.is_empty() {
+            parts.push(format!(
+                "{} non-vertex element(s) skipped",
+                self.ignored_elements.len()
+            ));
+        }
+        if self.total_repairs > 0 {
+            parts.push(format!("{} value(s) repaired", self.total_repairs));
+        }
+        format!(
+            "{} gaussians read with {}",
+            self.vertex_count,
+            parts.join("; ")
+        )
+    }
 }
 
 /// Parses a PLY header along with the byte length it occupied.
@@ -261,30 +411,90 @@ fn read_scalar(scalar: ScalarType, bytes: &[u8]) -> f32 {
 }
 
 /// Builds one point from a flat row using the resolved `REQUIRED` field slots.
-fn point_from(values: &[f32], fields: &[usize], row: usize) -> Result<SplatPoint> {
+///
+/// Reads the serialized form into the activated contract, recording - never hiding - any
+/// value it had to repair. Serialized endpoints (a fully saturated logit, a log-scale of
+/// zero) are valid data and are not reported.
+fn point_from(
+    values: &[f32],
+    fields: &[usize],
+    row: usize,
+    report: &mut PlyReport,
+) -> Result<SplatPoint> {
     let get = |slot: usize| values[fields[slot]];
-    let mut point = SplatPoint::default();
-    point.position = [get(0), get(1), get(2)];
-    point.set_dc([get(3), get(4), get(5)]);
-    point.set_opacity_logit(get(6));
+    let position = [get(0), get(1), get(2)];
+    if let Some(axis) = position.iter().position(|value| !value.is_finite()) {
+        return Err(format_error(format!(
+            "PLY vertex {row} has a non-finite position on axis {axis}"
+        )));
+    }
+
+    let dc = [get(3), get(4), get(5)];
+    if let Some(axis) = dc.iter().position(|value| !value.is_finite()) {
+        return Err(format_error(format!(
+            "PLY vertex {row} has a non-finite f_dc_{axis} coefficient"
+        )));
+    }
+    if dc
+        .iter()
+        .any(|value| !(contract::DC_MIN..=contract::DC_MAX).contains(value))
+    {
+        report.record_repair(row, "color", "clamped to the linear RGB endpoint");
+    }
+
+    let opacity_logit = get(6);
+    if opacity_logit.is_nan() {
+        // +inf and -inf are the fully opaque and fully transparent endpoints; NaN is not a
+        // logit at all, and sigmoid() would carry it into the document.
+        return Err(format_error(format!(
+            "PLY vertex {row} has a non-finite opacity logit"
+        )));
+    }
+
+    // The remaining fields are written from the serialized values below, so the
+    // constructor only has to place the position.
+    let mut point = SplatPoint {
+        position,
+        ..SplatPoint::default()
+    };
+    point.set_dc(dc);
+    point.set_opacity_logit(opacity_logit);
     point.set_log_scale([get(7), get(8), get(9)]);
-    point.rotation = normalize_quat([get(10), get(11), get(12), get(13)]);
-    for axis in 0..3 {
-        if !point.position[axis].is_finite() {
-            return Err(format_error(format!(
-                "PLY vertex {row} has a non-finite position on axis {axis}"
-            )));
+    let raw_rotation = [get(10), get(11), get(12), get(13)];
+    point.rotation = normalize_quat(raw_rotation);
+    if point.rotation != raw_rotation {
+        // Either the quaternion was rescaled (normal, and reported only when it is not a
+        // usable quaternion) or it was unreadable and became the identity.
+        if !contract::is_usable_quaternion(raw_rotation) {
+            report.record_repair(row, "rotation", "stored as the identity rotation");
         }
-        // A zero or NaN radius cannot be rendered; use a tiny ellipsoid instead.
+    }
+
+    for axis in 0..3 {
+        // A zero or unreadable radius cannot be rendered, so a tiny ellipsoid is used
+        // instead - and reported, because the file did not say that.
         if !point.scale[axis].is_finite() || point.scale[axis] <= 0.0 {
             point.scale[axis] = f32::MIN_POSITIVE;
+            report.record_repair(row, "scale", "stored as the smallest positive radius");
         }
     }
     Ok(point)
 }
 
 /// Reads a Gaussian splat from PLY bytes, discarding higher SH bands.
+///
+/// The report of what was dropped or repaired is [`read_ply_with_report`]; this is the
+/// same read with the report discarded, for callers that only need the gaussians.
 pub fn read_ply(bytes: &[u8]) -> Result<Splat> {
+    Ok(read_ply_with_report(bytes)?.0)
+}
+
+/// Reads a Gaussian splat together with what the import dropped or repaired.
+///
+/// The gaussians are identical to [`read_ply`]'s: a report never changes the result, it
+/// only makes the import honest about a file whose extra attributes were dropped or whose
+/// damaged values were repaired.
+pub fn read_ply_with_report(bytes: &[u8]) -> Result<(Splat, PlyReport)> {
     let (header, data_start) = parse_header(bytes)?;
     let vertex = header
         .elements
@@ -310,6 +520,29 @@ pub fn read_ply(bytes: &[u8]) -> Result<Splat> {
         })
         .collect();
 
+    let mut report = PlyReport {
+        ascii: header.ascii,
+        vertex_count: vertex.count,
+        vertex_properties: vertex.properties.len(),
+        ..PlyReport::default()
+    };
+    for property in &vertex.properties {
+        if let PlyAttributeUse::Discarded(reason) = contract::ply_attribute_use(&property.name) {
+            report.discarded.push(DiscardedAttribute {
+                property: property.name.clone(),
+                reason,
+            });
+        }
+    }
+    for element in &header.elements {
+        if element.name != "vertex" {
+            report.ignored_elements.push(IgnoredElement {
+                name: element.name.clone(),
+                count: element.count,
+            });
+        }
+    }
+
     let mut points: Vec<SplatPoint> = Vec::new();
 
     if header.ascii {
@@ -328,7 +561,7 @@ pub fn read_ply(bytes: &[u8]) -> Result<Splat> {
                     points.len()
                 )));
             }
-            points.push(point_from(&values, &fields, points.len())?);
+            points.push(point_from(&values, &fields, points.len(), &mut report)?);
         }
         if points.len() != vertex.count {
             return Err(format_error(format!(
@@ -337,7 +570,7 @@ pub fn read_ply(bytes: &[u8]) -> Result<Splat> {
                 points.len()
             )));
         }
-        return Ok(Splat::from_points(points));
+        return Ok((Splat::from_points(points), report));
     }
 
     let mut cursor = data_start;
@@ -371,11 +604,11 @@ pub fn read_ply(bytes: &[u8]) -> Result<Splat> {
                 values[slot] = read_scalar(*scalar, &row_data[read..read + size]);
                 read += size;
             }
-            points.push(point_from(&values, &fields, row)?);
+            points.push(point_from(&values, &fields, row, &mut report)?);
         }
         cursor += total;
     }
-    Ok(Splat::from_points(points))
+    Ok((Splat::from_points(points), report))
 }
 
 /// Canonical 3DGS property order written by [`write_ply`].
@@ -600,5 +833,126 @@ mod tests {
         header.push_str("end_header\n0 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
         let error = read_ply(header.as_bytes()).unwrap_err();
         assert!(error.to_string().contains("declares 3"), "{error}");
+    }
+
+    /// An ASCII PLY whose single row is exactly `row`, with the canonical properties.
+    fn ascii_with_row(row: &str) -> Vec<u8> {
+        let mut header = String::from("ply\nformat ascii 1.0\nelement vertex 1\n");
+        for name in REQUIRED {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        header.push_str(&format!("end_header\n{row}\n"));
+        header.into_bytes()
+    }
+
+    #[test]
+    fn a_report_names_dropped_attributes_and_skipped_elements() {
+        let header = [
+            "ply",
+            "format ascii 1.0",
+            "element vertex 1",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property float f_dc_0",
+            "property float f_dc_1",
+            "property float f_dc_2",
+            "property float opacity",
+            "property float scale_0",
+            "property float scale_1",
+            "property float scale_2",
+            "property float rot_0",
+            "property float rot_1",
+            "property float rot_2",
+            "property float rot_3",
+            "property float nx",
+            "property float f_rest_0",
+            "element face 0",
+            "property list uchar int vertex_indices",
+            "end_header",
+        ]
+        .join("\n");
+        let row = "1 2 3 0.1 0.2 0.3 1.0 -8 -8 -8 1 0 0 0 0.5 7.5";
+        let (splat, report) =
+            read_ply_with_report(format!("{header}\n{row}\n").as_bytes()).unwrap();
+
+        assert_eq!(splat.len(), 1);
+        assert_eq!(splat.points[0].position, [1.0, 2.0, 3.0]);
+        assert_eq!(report.vertex_count, 1);
+        assert_eq!(report.vertex_properties, 16);
+        assert!(report.ascii);
+        assert!(!report.is_lossless());
+        assert_eq!(report.discarded_names(), vec!["nx", "f_rest_0"]);
+        assert!(report.discarded[1].reason.contains("degree 0"));
+        assert_eq!(report.ignored_elements.len(), 1);
+        assert_eq!(report.ignored_elements[0].name, "face");
+        assert_eq!(report.total_repairs, 0, "a valid row needs no repair");
+
+        let summary = report.summary();
+        assert!(summary.contains("attribute(s) dropped"), "{summary}");
+        assert!(summary.contains("non-vertex element"), "{summary}");
+        assert!(summary.len() < 300, "{summary}");
+    }
+
+    #[test]
+    fn a_report_changes_nothing_about_the_splat() {
+        let bytes = write_ply(&sample()).unwrap();
+        let plain = read_ply(&bytes).unwrap();
+        let (with_report, report) = read_ply_with_report(&bytes).unwrap();
+        assert_eq!(plain, with_report);
+        assert!(report.vertex_properties > REQUIRED.len());
+    }
+
+    #[test]
+    fn repairs_are_reported_rather_than_hidden() {
+        let bytes = ascii_with_row("0 0 0 9 -1.7 -1.7 1 NaN NaN NaN 0 0 0 0");
+        let (splat, report) = read_ply_with_report(&bytes).unwrap();
+        let point = splat.points[0];
+        assert_eq!(point.color[0], 1.0, "the DC coefficient was clamped");
+        assert!(point.color[1] < 0.05, "{:?}", point.color);
+        assert_eq!(point.scale, [f32::MIN_POSITIVE; 3]);
+        assert_eq!(point.rotation, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(report.total_repairs, 5, "one colour, three radii, one rotation");
+        assert!(!report.repairs_truncated());
+        assert!(report.repairs.iter().any(|repair| repair.field == "scale"));
+        assert!(report.repairs.iter().any(|repair| repair.field == "rotation"));
+        assert!(report.summary().contains("5 value(s) repaired"));
+        // The repaired gaussians are still a readable document.
+        splat.validate().unwrap();
+    }
+
+    #[test]
+    fn repair_listing_is_bounded_but_counted_completely() {
+        let mut report = PlyReport::default();
+        for point in 0..(MAX_REPORTED_REPAIRS + 4) {
+            report.record_repair(point, "scale", "stored as the smallest positive radius");
+        }
+        assert_eq!(report.total_repairs, MAX_REPORTED_REPAIRS + 4);
+        assert_eq!(report.repairs.len(), MAX_REPORTED_REPAIRS);
+        assert!(report.repairs_truncated());
+    }
+
+    #[test]
+    fn an_unreadable_logit_is_an_error_rather_than_a_repair() {
+        let bytes = ascii_with_row("0 0 0 0 0 0 NaN -8 -8 -8 1 0 0 0");
+        let error = read_ply_with_report(&bytes).unwrap_err().to_string();
+        assert!(error.contains("opacity logit"), "{error}");
+
+        // +inf and -inf are the serialized endpoints of opacity, not damage.
+        let bytes = ascii_with_row("0 0 0 0 0 0 inf -8 -8 -8 1 0 0 0");
+        let (splat, report) = read_ply_with_report(&bytes).unwrap();
+        assert_eq!(splat.points[0].opacity, 1.0);
+        let bytes = ascii_with_row("0 0 0 0 0 0 -inf -8 -8 -8 1 0 0 0");
+        let (splat, report_neg) = read_ply_with_report(&bytes).unwrap();
+        assert_eq!(splat.points[0].opacity, 0.0);
+        assert_eq!(report.total_repairs + report_neg.total_repairs, 0);
+    }
+
+    #[test]
+    fn a_zero_log_scale_is_a_one_metre_radius_not_a_repair() {
+        let bytes = ascii_with_row("0 0 0 0 0 0 0 0 0 0 1 0 0 0");
+        let (splat, report) = read_ply_with_report(&bytes).unwrap();
+        assert!((splat.points[0].scale[0] - 1.0).abs() < 1e-6);
+        assert_eq!(report.total_repairs, 0);
     }
 }

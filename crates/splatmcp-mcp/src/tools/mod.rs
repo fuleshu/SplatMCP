@@ -12,6 +12,7 @@ pub mod viewer;
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 use serde::Serialize;
+use splatmcp_bridge::InspectionSummary;
 use splatmcp_core::{Bounds, Splat, SplatPoint};
 
 /// A factor that may be given as one number or one per axis.
@@ -69,6 +70,27 @@ pub struct SplatSummary {
 }
 
 impl SplatSummary {
+    /// Summarises a document from an inspection reply instead of its gaussians.
+    ///
+    /// `splat_info` reads the displayed document as bounded metadata when no sample was
+    /// asked for, and the reply keeps the same summary fields either way.
+    pub fn of_inspection(inspection: &InspectionSummary) -> Self {
+        let bounds = inspection.bounds.unwrap_or(splatmcp_bridge::BoundsSummary {
+            min: [0.0; 3],
+            max: [0.0; 3],
+            center: [0.0; 3],
+            radius: 0.0,
+        });
+        Self {
+            point_count: inspection.point_count,
+            center: round3_vec(bounds.center),
+            radius: round3(bounds.radius),
+            min_opacity: round3(inspection.opacity.min),
+            max_opacity: round3(inspection.opacity.max),
+            mean_color: round3_vec(inspection.mean_color),
+        }
+    }
+
     /// Summarises a splat, using zeroed bounds for an empty one.
     pub fn of(splat: &Splat) -> Self {
         let stats = splat.stats();
@@ -199,5 +221,21 @@ mod tests {
         assert_eq!(summary.point_count, 0);
         assert_eq!(summary.center, [0.0, 0.0, 0.0]);
         assert_eq!(summary.radius, 0.0);
+    }
+
+    #[test]
+    fn a_summary_can_be_built_from_bounded_metadata() {
+        let splat = splatmcp_core::fixtures::axis_fixture();
+        let inspection = InspectionSummary::from(
+            &splat.inspection(splatmcp_core::ValidationLimits::default()),
+        );
+        let from_metadata = SplatSummary::of_inspection(&inspection);
+        let from_splat = SplatSummary::of(&splat);
+        assert_eq!(from_metadata, from_splat);
+
+        // An empty document summarises to zeroes, exactly as an empty splat does.
+        let empty = InspectionSummary::default();
+        assert_eq!(SplatSummary::of_inspection(&empty).point_count, 0);
+        assert_eq!(SplatSummary::of_inspection(&empty).radius, 0.0);
     }
 }

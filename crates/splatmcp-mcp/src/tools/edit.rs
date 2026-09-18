@@ -11,7 +11,8 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use splatmcp_bridge::protocol::ViewerStatus;
-use splatmcp_bridge::{LoadPlyRequest, Method};
+use splatmcp_bridge::{InspectResult, InspectionSummary, LoadPlyRequest, Method};
+use splatmcp_core::validation::IssueRecorder;
 use splatmcp_core::{
     Box3, EditOp, EditStep, Selection, Splat, apply_all, read_ply, write_ply,
 };
@@ -163,6 +164,12 @@ pub struct StepReport {
 pub struct InfoReply {
     #[serde(flatten)]
     pub summary: SplatSummary,
+    /// Bounded inspection: distributions, contract diagnostics and buffer sizes.
+    ///
+    /// A fixed-size object, so describing a 500 000 gaussian document costs no more than
+    /// describing three.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspection: Option<InspectionSummary>,
     /// Sampled points, when the call asked for them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample: Option<Vec<PointOut>>,
@@ -257,16 +264,24 @@ pub fn to_step(input: &EditOpInput, index: usize) -> Result<EditStep, String> {
             by: input.by.unwrap_or([0.0; 3]),
         },
         EditOpKind::Remove => EditOp::Remove,
-        EditOpKind::Merge => EditOp::Merge {
-            points: input
-                .points
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .copied()
-                .map(crate::tools::author::PointInput::to_point)
-                .collect(),
-        },
+        EditOpKind::Merge => {
+            // Merged points are caller input, so they are checked before anything is
+            // clamped: a silent repair here would edit a document differently from what
+            // the call asked for.
+            let points = input.points.as_deref().unwrap_or(&[]);
+            let mut recorder = IssueRecorder::new();
+            let mut built = Vec::with_capacity(points.len());
+            for (point_index, point) in points.iter().enumerate() {
+                match point.checked_point(point_index) {
+                    Ok(point) => built.push(point),
+                    Err(issue) => recorder.record(issue),
+                }
+            }
+            if let Some(error) = recorder.error(points.len()) {
+                return Err(format!("op {index} (merge) points: {error}"));
+            }
+            EditOp::Merge { points: built }
+        }
     };
 
     let selection = Selection {
@@ -480,8 +495,72 @@ pub fn info_reply_with_document(
     });
     InfoReply {
         summary: SplatSummary::of(splat),
+        inspection: Some(inspect_splat(splat)),
         sample,
         source: Some(source),
+        document,
+    }
+}
+
+/// Bounded inspection of a splat that is already in memory.
+pub fn inspect_splat(splat: &Splat) -> InspectionSummary {
+    InspectionSummary::from(&splat.inspection(splatmcp_core::ValidationLimits::default()))
+}
+
+/// True when `splat_info` can answer with bounded metadata instead of geometry.
+///
+/// Only the displayed document can be inspected where it lives, and only when no sample
+/// was asked for: a sample needs the gaussians themselves, so that call reads the PLY.
+pub fn wants_bounded_inspection(source: Option<&str>, points: Option<usize>) -> bool {
+    if points.is_some() {
+        return false;
+    }
+    match source.map(str::trim) {
+        None | Some("") => true,
+        Some(name) => name.eq_ignore_ascii_case(SOURCE_VIEWER),
+    }
+}
+
+/// What a bounded inspection of the displayed document produced.
+#[derive(Debug)]
+pub enum InspectOutcome {
+    /// The app answered with bounded metadata and the document's identity.
+    Summary(Box<InspectResult>),
+    /// Nothing is displayed; the message is the actionable one to show the caller.
+    NoDocument(String),
+    /// The app cannot serve this method, so the caller should read the PLY as before.
+    Unavailable,
+}
+
+/// Inspects the displayed document without transferring its geometry.
+pub fn inspect_displayed(link: &AppLink) -> InspectOutcome {
+    match link.request_typed::<InspectResult>(Method::DocumentInspect, Value::Null) {
+        Ok(result) => InspectOutcome::Summary(Box::new(result)),
+        Err(error) if error.contains("no splat") => InspectOutcome::NoDocument(
+            "no splat is displayed in the SplatMCP window; create one with create_splat, \
+             load one with load_splat, or pass source as a .ply path"
+                .to_owned(),
+        ),
+        // An older app has no `document.inspect`; the caller falls back to reading the
+        // PLY, which is what it did before this method existed.
+        Err(_) => InspectOutcome::Unavailable,
+    }
+}
+
+/// Reply of `splat_info` built from a bounded inspection.
+pub fn info_reply_from_inspect(result: InspectResult) -> InfoReply {
+    let document = match (&result.document_id, result.revision) {
+        (Some(document_id), Some(revision)) => Some(DocumentIdentity {
+            document_id: document_id.clone(),
+            revision,
+        }),
+        _ => None,
+    };
+    InfoReply {
+        summary: SplatSummary::of_inspection(&result.inspection),
+        inspection: Some(result.inspection),
+        sample: None,
+        source: Some(SOURCE_VIEWER.to_owned()),
         document,
     }
 }
@@ -879,5 +958,83 @@ mod tests {
             SplatPoint::new([1.0, 0.0, 0.0], [0.1; 3], [0.5; 3], 0.987_65, [1.0, 0.0, 0.0, 0.0]),
         ]);
         assert_eq!(opacity_range(&splat), [0.123, 0.988]);
+    }
+    #[test]
+    fn a_bounded_inspection_is_chosen_only_when_it_can_answer() {
+        assert!(wants_bounded_inspection(None, None));
+        assert!(wants_bounded_inspection(Some("viewer"), None));
+        assert!(wants_bounded_inspection(Some("VIEWER"), None));
+        // A sample needs the geometry, and a path is not the displayed document.
+        assert!(!wants_bounded_inspection(Some("viewer"), Some(10)));
+        assert!(!wants_bounded_inspection(Some("C:/tmp/a.ply"), None));
+        assert!(!wants_bounded_inspection(Some("new"), None));
+    }
+
+    #[test]
+    fn an_inspection_reply_keeps_the_summary_shape() {
+        let splat = grid(3);
+        let result = InspectResult {
+            inspection: inspect_splat(&splat),
+            file_name: Some("a.ply".to_owned()),
+            document_id: Some("doc-5".to_owned()),
+            revision: Some(2),
+        };
+        let reply = info_reply_from_inspect(result);
+        assert_eq!(reply.summary, SplatSummary::of(&splat));
+        assert_eq!(reply.source.as_deref(), Some("viewer"));
+        assert_eq!(reply.sample, None);
+        let document = reply
+            .document
+            .clone()
+            .expect("the identity travels with the summary");
+        assert_eq!(document.document_id, "doc-5");
+        assert_eq!(document.revision, 2);
+
+        let encoded = serde_json::to_string(&reply).unwrap();
+        assert!(encoded.starts_with("{\"point_count\":3"), "{encoded}");
+        assert!(encoded.contains("\"contract_version\""), "{encoded}");
+        assert!(encoded.contains("\"owned_bytes\""), "{encoded}");
+        assert!(encoded.len() < 1500, "{} bytes", encoded.len());
+    }
+
+    #[test]
+    fn an_app_that_cannot_answer_leaves_the_ply_path_to_the_caller() {
+        // No app is running here, so a bounded inspection is unavailable rather than
+        // fatal: the caller reads the PLY, exactly as it did before this method existed.
+        let link = AppLink::new(false);
+        assert!(matches!(
+            inspect_displayed(&link),
+            InspectOutcome::Unavailable
+        ));
+    }
+
+    #[test]
+    fn merged_points_are_checked_before_they_are_clamped() {
+        let merge = |scale: Factor| {
+            to_step(
+                &EditOpInput {
+                    op: EditOpKind::Merge,
+                    points: Some(vec![crate::tools::author::PointInput {
+                        position: [0.0; 3],
+                        color: None,
+                        opacity: None,
+                        scale: Some(scale),
+                        rotation: None,
+                    }]),
+                    ..step(EditOpKind::Merge)
+                },
+                2,
+            )
+        };
+        let error = merge(Factor::All(-1.0)).unwrap_err();
+        assert!(error.contains("op 2 (merge)"), "{error}");
+        assert!(error.contains("point 0 scale"), "{error}");
+        assert!(error.contains("positive radius"), "{error}");
+
+        let accepted = merge(Factor::All(0.05)).unwrap();
+        match accepted.op {
+            EditOp::Merge { points } => assert_eq!(points[0].scale, [0.05; 3]),
+            other => panic!("expected merge, got {other:?}"),
+        }
     }
 }

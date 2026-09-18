@@ -14,9 +14,12 @@ use serde_json::{json, Value};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
     BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest, Handler, LoadPlyRequest, Method,
-    PythonCancelRequest, PythonJobQuery, PythonRunRequest, ViewerStatus,
+    InspectRequest, InspectResult, InspectionSummary, PythonCancelRequest, PythonJobQuery,
+    PythonRunRequest, ViewerStatus,
 };
 use tauri::{AppHandle, Manager};
+
+use splatmcp_core::validation::ValidationLimits;
 
 use crate::document::{AppState, Document};
 use crate::python::PythonHost;
@@ -69,6 +72,7 @@ impl Handler for AppBridge {
             }
             Method::ViewerLoadPly => self.load_ply(params),
             Method::DocumentGetPly => self.document_ply(),
+            Method::DocumentInspect => self.document_inspect(params),
             Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
             Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
@@ -145,6 +149,34 @@ impl AppBridge {
         serde_json::to_value(view).map_err(|error| error.to_string())
     }
 
+    /// Bounded metadata of the displayed document.
+    ///
+    /// This is what keeps an inspection cheap: the app owns the document, so it answers
+    /// with counts, bounds and distributions instead of serialising a PLY that the MCP
+    /// server would immediately have to parse again.
+    fn document_inspect(&self, params: Value) -> Result<Value, String> {
+        let request: InspectRequest = if params.is_null() {
+            InspectRequest::default()
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid inspect request: {error}"))?
+        };
+        let state = self.app.state::<AppState>();
+        let inspection = state.with_document(|document| {
+            InspectionSummary::from(&document.splat.inspection(inspect_limits(&request)))
+        })?;
+        let identity = state.identity()?;
+        let result = InspectResult {
+            inspection,
+            file_name: identity.as_ref().map(|identity| identity.file_name.clone()),
+            document_id: identity
+                .as_ref()
+                .map(|identity| identity.document_id.clone()),
+            revision: identity.as_ref().map(|identity| identity.revision),
+        };
+        serde_json::to_value(result).map_err(|error| error.to_string())
+    }
+
     /// PLY bytes of the document the app displays.
     fn document_ply(&self) -> Result<Value, String> {
         let state = self.app.state::<AppState>();
@@ -161,6 +193,17 @@ impl AppBridge {
             "document_id": identity.as_ref().map(|identity| identity.document_id.clone()),
             "revision": identity.as_ref().map(|identity| identity.revision),
         }))
+    }
+}
+
+/// The limits an inspect request asks for.
+///
+/// Absent means the contract's own ceiling, and the limit that was applied is reported
+/// back in the summary rather than silently assumed.
+pub(crate) fn inspect_limits(request: &InspectRequest) -> ValidationLimits {
+    match request.max_points {
+        Some(limit) => ValidationLimits::with_max_points(limit),
+        None => ValidationLimits::default(),
     }
 }
 
@@ -257,5 +300,41 @@ mod tests {
         adjusted.point_count = 189;
         let encoded = serde_json::to_value(&adjusted).unwrap();
         assert_eq!(encoded["point_count"], 189);
+    }
+
+    #[test]
+    fn an_inspect_request_names_the_limit_it_applies() {
+        assert_eq!(
+            inspect_limits(&InspectRequest::default()).applied_max_points(),
+            Some(splatmcp_core::MAX_POINTS)
+        );
+        assert_eq!(
+            inspect_limits(&InspectRequest {
+                max_points: Some(4)
+            })
+            .applied_max_points(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn an_inspection_reports_the_document_it_describes() {
+        // The handler's own conversion, exercised without an app: the summary is bounded
+        // metadata and the identity travels beside it.
+        let splat = splatmcp_core::fixtures::axis_fixture();
+        let request = InspectRequest { max_points: Some(4) };
+        let inspection = InspectionSummary::from(&splat.inspection(inspect_limits(&request)));
+        let result = InspectResult {
+            inspection,
+            file_name: Some("axis.ply".to_owned()),
+            document_id: Some("doc-2".to_owned()),
+            revision: Some(7),
+        };
+        assert_eq!(result.inspection.point_count, splat.len());
+        assert_eq!(result.inspection.point_limit, Some(4));
+        assert!(!result.inspection.within_limits);
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(encoded.len() < 1400, "{} bytes", encoded.len());
+        assert!(encoded.contains("\"revision\":7"));
     }
 }

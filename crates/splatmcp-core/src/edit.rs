@@ -8,6 +8,7 @@
 //! Colour is fixed per gaussian - there are no spherical harmonics - so `set_color` is
 //! the only colour operation and it writes RGB directly.
 
+use crate::contract::{multiply_quaternions, rotate_vector};
 use crate::{Result, Splat, SplatError, SplatPoint, normalize_quat};
 
 /// Axis-aligned region used to select points.
@@ -247,7 +248,7 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
                     center[1] + rotated[1],
                     center[2] + rotated[2],
                 ];
-                point.rotation = normalize_quat(multiply_quaternion(rotation, point.rotation));
+                point.rotation = normalize_quat(multiply_quaternions(rotation, point.rotation));
             }
         }
         EditOp::Scale { center, factor } => {
@@ -443,6 +444,9 @@ fn validate_selection(selection: &Selection) -> Result<()> {
     Ok(())
 }
 
+/// Shared rotation math lives in [`crate::contract`]: the contract owns the meaning of a
+/// quaternion, so an edit and a renderer cannot disagree about which way a rotation turns.
+///
 /// Quaternion `(w, x, y, z)` for a rotation of `degrees` around `axis`.
 fn rotation_quaternion(axis: [f32; 3], degrees: f32) -> [f32; 4] {
     let norm = axis.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -450,40 +454,6 @@ fn rotation_quaternion(axis: [f32; 3], degrees: f32) -> [f32; 4] {
     let half = degrees.to_radians() * 0.5;
     let (sin, cos) = half.sin_cos();
     [cos, unit[0] * sin, unit[1] * sin, unit[2] * sin]
-}
-
-/// Rotates a vector by a unit quaternion.
-fn rotate_vector(vector: [f32; 3], quaternion: [f32; 4]) -> [f32; 3] {
-    let [w, x, y, z] = quaternion;
-    // v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + w * v)
-    let q = [x, y, z];
-    let cross_qv = [
-        q[1] * vector[2] - q[2] * vector[1],
-        q[2] * vector[0] - q[0] * vector[2],
-        q[0] * vector[1] - q[1] * vector[0],
-    ];
-    let t = [
-        cross_qv[0] + w * vector[0],
-        cross_qv[1] + w * vector[1],
-        cross_qv[2] + w * vector[2],
-    ];
-    [
-        vector[0] + 2.0 * (q[1] * t[2] - q[2] * t[1]),
-        vector[1] + 2.0 * (q[2] * t[0] - q[0] * t[2]),
-        vector[2] + 2.0 * (q[0] * t[1] - q[1] * t[0]),
-    ]
-}
-
-/// Hamilton product `a * b`, so `b` is applied in `a`'s frame.
-fn multiply_quaternion(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    let [aw, ax, ay, az] = a;
-    let [bw, bx, by, bz] = b;
-    [
-        aw * bw - ax * bx - ay * by - az * bz,
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-    ]
 }
 
 #[cfg(test)]

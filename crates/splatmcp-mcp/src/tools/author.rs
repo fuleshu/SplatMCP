@@ -9,7 +9,10 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 use splatmcp_bridge::protocol::ViewerStatus;
 use splatmcp_bridge::{LoadPlyRequest, Method};
-use splatmcp_core::{MAX_POINTS, Shape, Splat, SplatParams, SplatPoint, build, splat_from_points};
+use splatmcp_core::validation::{IssueRecorder, ValidationIssue};
+use splatmcp_core::{
+    MAX_POINTS, Shape, Splat, SplatParams, SplatPoint, build, splat_from_points,
+};
 use std::path::{Path, PathBuf};
 
 use crate::bridge::AppLink;
@@ -100,19 +103,42 @@ impl PointInput {
         }
     }
 
-    /// Model-side point.
+    /// The values this input stands for, with the documented defaults filled in.
     ///
     /// The defaults live here rather than in `#[serde(default)]` attributes: a `serde`
     /// default of an `f32` is re-emitted in the tool schema as a widened `f64`
     /// (`0.8500000238418579`), which is both misleading and wasteful.
-    pub fn to_point(self) -> SplatPoint {
-        SplatPoint::new(
+    fn resolved(&self) -> ([f32; 3], [f32; 3], [f32; 3], f32, [f32; 4]) {
+        (
             self.position,
             self.scale.unwrap_or(Factor::All(DEFAULT_POINT_RADIUS)).axes(),
             self.color.unwrap_or(DEFAULT_POINT_COLOR),
             self.opacity.unwrap_or(DEFAULT_POINT_OPACITY),
             self.rotation.unwrap_or([1.0, 0.0, 0.0, 0.0]),
         )
+    }
+
+    /// Model-side point, checked against the contract before anything is clamped.
+    ///
+    /// A tool call is a boundary, so a non-finite value, a zero radius, an out-of-range
+    /// colour or opacity or a degenerate quaternion is reported - with the index of the
+    /// gaussian - instead of being silently repaired into a different splat. The rotation
+    /// is normalised, which is the contract's documented policy and loses nothing.
+    pub fn checked_point(&self, index: usize) -> Result<SplatPoint, ValidationIssue> {
+        let (position, scale, color, opacity, rotation) = self.resolved();
+        if let Some(issue) =
+            splatmcp_core::validation::check_gaussian(index, position, scale, color, opacity, rotation)
+        {
+            return Err(issue);
+        }
+        Ok(SplatPoint {
+            position,
+            scale,
+            color,
+            opacity,
+            rotation: splatmcp_core::contract::normalized_quaternion(rotation)
+                .unwrap_or(splatmcp_core::contract::IDENTITY_QUATERNION),
+        })
     }
 }
 
@@ -177,8 +203,18 @@ pub fn build_splat(input: &CreateInput) -> Result<Splat, String> {
                     points.len()
                 ));
             }
-            splat_from_points(points.iter().copied().map(PointInput::to_point).collect())
-                .map_err(|error| error.to_string())
+            let mut recorder = IssueRecorder::new();
+            let mut built = Vec::with_capacity(points.len());
+            for (index, input) in points.iter().enumerate() {
+                match input.checked_point(index) {
+                    Ok(point) => built.push(point),
+                    Err(issue) => recorder.record(issue),
+                }
+            }
+            if let Some(error) = recorder.error(points.len()) {
+                return Err(format!("points: {error}"));
+            }
+            splat_from_points(built).map_err(|error| error.to_string())
         }
         None => build(&splat_params(input)?).map_err(|error| error.to_string()),
     }
@@ -314,15 +350,15 @@ mod tests {
             scale: Some(Factor::All(0.5)),
             ..PointInput::at([0.0; 3])
         };
-        assert_eq!(uniform.to_point().scale, [0.5; 3]);
+        assert_eq!(uniform.checked_point(0).unwrap().scale, [0.5; 3]);
 
         let per_axis: PointInput =
             serde_json::from_str(r#"{"position":[0,0,0],"scale":[0.01,0.02,0.03]}"#).unwrap();
-        assert_eq!(per_axis.to_point().scale, [0.01, 0.02, 0.03]);
+        assert_eq!(per_axis.checked_point(0).unwrap().scale, [0.01, 0.02, 0.03]);
 
         // Colour, opacity and rotation can be omitted entirely.
         let bare: PointInput = serde_json::from_str(r#"{"position":[1,2,3]}"#).unwrap();
-        let point = bare.to_point();
+        let point = bare.checked_point(0).unwrap();
         assert_eq!(point.position, [1.0, 2.0, 3.0]);
         assert_eq!(point.color, DEFAULT_POINT_COLOR);
     }
@@ -381,5 +417,42 @@ mod tests {
         assert!(!encoded.contains("path"), "{encoded}");
         assert!(encoded.contains("\"displayed\":false"));
         assert!(encoded.contains("\"max_opacity\":0.9"), "{encoded}");
+    }
+    #[test]
+    fn explicit_points_are_checked_before_they_are_clamped() {
+        let zero_radius = build_splat(&CreateInput {
+            points: Some(vec![
+                PointInput::at([0.0, 0.0, 0.0]),
+                PointInput {
+                    scale: Some(Factor::All(0.0)),
+                    ..PointInput::at([1.0, 0.0, 0.0])
+                },
+            ]),
+            ..CreateInput::default()
+        })
+        .unwrap_err();
+        assert!(zero_radius.contains("point 1 scale"), "{zero_radius}");
+        assert!(zero_radius.contains("positive radius"), "{zero_radius}");
+
+        let out_of_range = build_splat(&CreateInput {
+            points: Some(vec![PointInput {
+                color: Some([1.4, 0.0, 0.0]),
+                ..PointInput::at([0.0; 3])
+            }]),
+            ..CreateInput::default()
+        })
+        .unwrap_err();
+        assert!(out_of_range.contains("linear RGB"), "{out_of_range}");
+
+        // A usable, non-unit quaternion is normalised rather than refused.
+        let normalized = build_splat(&CreateInput {
+            points: Some(vec![PointInput {
+                rotation: Some([0.0, 4.0, 0.0, 0.0]),
+                ..PointInput::at([0.0; 3])
+            }]),
+            ..CreateInput::default()
+        })
+        .unwrap();
+        assert_eq!(normalized.points[0].rotation, [0.0, 1.0, 0.0, 0.0]);
     }
 }

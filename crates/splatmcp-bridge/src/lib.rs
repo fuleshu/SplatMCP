@@ -23,7 +23,8 @@ pub mod wire;
 pub use client::BridgeClient;
 pub use paths::{app_data_dir, bridge_descriptor_path, ensure_app_data_dir, settings_path};
 pub use protocol::{
-    BridgeDescriptor, CameraRequest, CameraState, CaptureRequest, CaptureResult, LoadPlyRequest,
+    BoundsSummary, BridgeDescriptor, CameraRequest, CameraState, CaptureRequest, CaptureResult,
+    DistributionSummary, InspectRequest, InspectResult, InspectionSummary, LoadPlyRequest,
     Method, PythonCancelRequest, PythonErrorReport, PythonJobQuery, PythonRunRequest, Request,
     Response, ViewerStatus, PROTOCOL_VERSION,
 };

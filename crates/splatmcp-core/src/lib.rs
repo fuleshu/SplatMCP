@@ -1,5 +1,9 @@
 //! SplatMCP core: an in-memory 3D Gaussian Splat model plus PLY import and export.
 //!
+//! The conventions this crate implements - axes, units, quaternion order, colour space and
+//! the activated-versus-serialized distinction - are stated once in [`contract`] and are
+//! versioned there.
+//!
 //! Colour is always a fixed RGB value - spherical harmonics bands above degree 0
 //! are never stored, so every file this crate writes is SH degree 0.
 //!
@@ -11,15 +15,24 @@
 //! - `opacity` is `0..=1` (PLY stores the sigmoid logit)
 //! - `rotation` is a unit quaternion `(w, x, y, z)` (PLY order `rot_0..rot_3`)
 
+pub mod contract;
+pub mod fixtures;
+pub mod inspection;
 mod authoring;
 mod edit;
 mod ply;
 mod splat;
+pub mod validation;
 
 pub use authoring::{MAX_POINTS, Rng, Shape, SplatParams, build, splat_from_points};
 pub use edit::{Box3, EditOp, EditStep, OpReport, Selection, apply, apply_all};
-pub use ply::{read_ply, write_ply};
+pub use inspection::{Distribution, InspectionReport, OwnedBuffers};
+pub use ply::{PlyReport, read_ply, read_ply_with_report, write_ply};
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
+pub use validation::{
+    MAX_REPORTED_ISSUES, ValidationError, ValidationIssue, ValidationLimits, ValidationReason,
+    ValidationReport,
+};
 
 pub(crate) use splat::normalize_quat;
 
@@ -33,6 +46,9 @@ pub enum SplatError {
     Unsupported(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// One or more gaussians failed the contract, with the located reasons.
+    #[error("{0}")]
+    Invalid(#[from] ValidationError),
 }
 
 pub type Result<T> = std::result::Result<T, SplatError>;

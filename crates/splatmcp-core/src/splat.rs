@@ -1,20 +1,26 @@
+use crate::contract;
+use crate::inspection::{self, InspectionReport};
+use crate::validation::{self, ValidationError, ValidationLimits, ValidationReport};
 use crate::{Result, SplatError, color_to_dc, dc_to_color, inv_sigmoid, sigmoid};
 
 /// One Gaussian: an anisotropic ellipsoid with a fixed RGB colour.
 ///
 /// Field units are chosen to be directly meaningful to a caller (an LLM writing
-/// JSON) rather than file-native; see the conversions in [`crate`]'s docs.
+/// JSON) rather than file-native; the contract that defines them - axes, quaternion
+/// order, colour space and the activated-versus-serialized distinction - is
+/// [`crate::contract`]. See the conversions in [`crate`]'s docs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SplatPoint {
     /// World-space centre in metres.
     pub position: [f32; 3],
-    /// Ellipsoid radius per axis in metres (the activated scale, always >= 0).
+    /// Ellipsoid radius per axis in metres (the activated scale, always > 0).
     pub scale: [f32; 3],
     /// Linear RGB in `0..=1`.
     pub color: [f32; 3],
     /// Opacity in `0..=1`.
     pub opacity: f32,
-    /// Unit quaternion in `(w, x, y, z)` order.
+    /// Unit quaternion in `(w, x, y, z)` order that rotates the local axes into document
+    /// space (an active rotation).
     pub rotation: [f32; 4],
 }
 
@@ -31,7 +37,11 @@ impl Default for SplatPoint {
 }
 
 impl SplatPoint {
-    /// Point with the identity rotation, normalised so file round trips stay stable.
+    /// Point with the identity rotation, **clamping** values into the contract ranges.
+    ///
+    /// This is the forgiving convenience constructor used inside the builders: it repairs
+    /// a value rather than reporting it, so a boundary that receives caller input uses
+    /// [`SplatPoint::try_new`] instead and reports what was wrong.
     pub fn new(
         position: [f32; 3],
         scale: [f32; 3],
@@ -46,6 +56,57 @@ impl SplatPoint {
             opacity: opacity.clamp(0.0, 1.0),
             rotation: normalize_quat(rotation),
         }
+    }
+
+    /// Strict constructor: validates the raw values and normalises the rotation.
+    ///
+    /// Nothing is clamped or defaulted. A non-finite value, a zero radius, an
+    /// out-of-range colour or opacity, or a degenerate quaternion is refused with the
+    /// contract reason, so a caller can report it instead of silently storing a repaired
+    /// gaussian.
+    pub fn try_new(
+        position: [f32; 3],
+        scale: [f32; 3],
+        color: [f32; 3],
+        opacity: f32,
+        rotation: [f32; 4],
+    ) -> std::result::Result<Self, ValidationError> {
+        if let Some(issue) = validation::check_values(position, scale, color, opacity, rotation) {
+            return Err(ValidationError::from_issue(issue));
+        }
+        Ok(Self {
+            position,
+            scale,
+            // A finite, non-degenerate quaternion is rescaled: its length carries no
+            // information, and the contract stores unit rotations.
+            rotation: contract::normalized_quaternion(rotation)
+                .expect("a usable quaternion was checked above"),
+            color,
+            opacity,
+        })
+    }
+
+    /// Strict constructor for one gaussian of a batch, with its index in the message.
+    pub fn try_new_at(
+        index: usize,
+        position: [f32; 3],
+        scale: [f32; 3],
+        color: [f32; 3],
+        opacity: f32,
+        rotation: [f32; 4],
+    ) -> std::result::Result<Self, ValidationError> {
+        if let Some(issue) = validation::check_gaussian(index, position, scale, color, opacity, rotation)
+        {
+            return Err(ValidationError::from_issue(issue));
+        }
+        Ok(Self {
+            position,
+            scale,
+            rotation: contract::normalized_quaternion(rotation)
+                .expect("a usable quaternion was checked above"),
+            color,
+            opacity,
+        })
     }
 
     /// PLY `ln(scale)`; PLY stores the log of the radius.
@@ -91,6 +152,9 @@ pub struct Bounds {
 }
 
 /// Cheap summary of a splat, returned by inspection tools.
+///
+/// The diagnostic version of the same information - distributions, contract issues,
+/// ownership - is [`Splat::inspection`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SplatStats {
     pub point_count: usize,
@@ -124,30 +188,43 @@ impl Splat {
     }
 
     /// Rejects values that would not survive a file round trip.
+    ///
+    /// This is the document invariant: it is checked before writing and after every edit,
+    /// and it reports the first problem as a plain message. A caller that receives
+    /// untrusted values wants [`Splat::check`] or [`Splat::inspection`], which report
+    /// *where* and *how many*.
     pub fn validate(&self) -> Result<()> {
-        if self.points.is_empty() {
-            return Err(SplatError::Format("splat has no points".to_owned()));
+        match self.check(ValidationLimits::MATHEMATICAL).first_issue() {
+            Some(issue) => Err(SplatError::Format(issue.to_string())),
+            None => Ok(()),
         }
-        for (index, point) in self.points.iter().enumerate() {
-            let finite = point
-                .position
-                .into_iter()
-                .chain(point.scale)
-                .chain(point.color)
-                .chain([point.opacity])
-                .all(|value| value.is_finite());
-            if !finite {
-                return Err(SplatError::Format(format!(
-                    "point {index} has a non-finite value"
-                )));
-            }
-            if point.scale.iter().any(|value| *value <= 0.0) {
-                return Err(SplatError::Format(format!(
-                    "point {index} has a non-positive scale"
-                )));
-            }
+    }
+
+    /// Contract report for this splat: bounded, indexed and explicit about limits.
+    ///
+    /// The point budget is policy rather than mathematics, so it is reported through
+    /// [`ValidationReport::within_limits`] and never mixed into the issues.
+    pub fn check(&self, limits: ValidationLimits) -> ValidationReport {
+        validation::check_splat(&self.points, limits)
+    }
+
+    /// Same check, as a structured error, or `Ok` when every gaussian is valid.
+    pub fn check_strict(
+        &self,
+        limits: ValidationLimits,
+    ) -> std::result::Result<(), ValidationError> {
+        match ValidationError::from_report(&self.check(limits)) {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Bounded inspection summary: count, bounds, distributions, diagnostics and cost.
+    ///
+    /// One pass over the gaussians, and a fixed-size result: inspecting a 500 000 point
+    /// splat returns the same shape of data as inspecting three.
+    pub fn inspection(&self, limits: ValidationLimits) -> InspectionReport {
+        inspection::inspect(self, limits)
     }
 
     /// Axis-aligned bounds, or `None` for an empty splat.
@@ -179,45 +256,29 @@ impl Splat {
         })
     }
 
+    /// Compact summary of a splat, returned by tool replies.
+    ///
+    /// Built from [`Splat::inspection`] so the two summaries can never disagree: it is the
+    /// same single pass, keeping only the fields a caller reads first.
     pub fn stats(&self) -> SplatStats {
-        let count = self.points.len();
-        if count == 0 {
-            return SplatStats {
-                point_count: 0,
-                bounds: None,
-                min_opacity: 0.0,
-                max_opacity: 0.0,
-                mean_color: [0.0, 0.0, 0.0],
-            };
-        }
-        let mut min_opacity = f32::MAX;
-        let mut max_opacity = f32::MIN;
-        let mut sum = [0.0f64; 3];
-        for point in &self.points {
-            min_opacity = min_opacity.min(point.opacity);
-            max_opacity = max_opacity.max(point.opacity);
-            for channel in 0..3 {
-                sum[channel] += f64::from(point.color[channel]);
-            }
-        }
-        let mean_color = sum.map(|value| (value / count as f64) as f32);
+        let report = self.inspection(ValidationLimits::MATHEMATICAL);
         SplatStats {
-            point_count: count,
-            bounds: self.bounds(),
-            min_opacity,
-            max_opacity,
-            mean_color,
+            point_count: report.point_count,
+            bounds: report.bounds,
+            min_opacity: report.opacity.min,
+            max_opacity: report.opacity.max,
+            mean_color: report.mean_color,
         }
     }
 }
 
-/// Rescales a quaternion, defaulting to identity for a zero-length input.
+/// Rescales a quaternion to unit length, defaulting to identity when it has no direction.
+///
+/// This is the forgiving form of the documented policy in [`crate::contract`]; the strict
+/// form is [`crate::contract::normalized_quaternion`], which returns `None` so a caller can
+/// refuse a degenerate value instead of inventing a rotation.
 pub(crate) fn normalize_quat(rotation: [f32; 4]) -> [f32; 4] {
-    let norm = rotation.into_iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm < 1e-9 || !norm.is_finite() {
-        return [1.0, 0.0, 0.0, 0.0];
-    }
-    rotation.map(|value| value / norm)
+    contract::normalized_quaternion(rotation).unwrap_or(contract::IDENTITY_QUATERNION)
 }
 
 #[cfg(test)]
@@ -269,5 +330,73 @@ mod tests {
         assert_eq!(point.color[0], 1.0);
         assert_eq!(point.color[1], 0.0);
         assert_eq!(point.opacity, 1.0);
+    }
+
+    #[test]
+    fn the_strict_constructor_refuses_what_the_forgiving_one_repairs() {
+        let repaired = SplatPoint::new([0.0; 3], [0.0, 0.1, 0.1], [2.0, 0.0, 0.0], 4.0, [0.0; 4]);
+        assert_eq!(repaired.scale[0], 0.0);
+        assert_eq!(repaired.color[0], 1.0);
+        assert_eq!(repaired.opacity, 1.0);
+        assert_eq!(repaired.rotation, [1.0, 0.0, 0.0, 0.0]);
+
+        let error = SplatPoint::try_new([0.0; 3], [0.0, 0.1, 0.1], [0.5; 3], 0.5, [1.0, 0.0, 0.0, 0.0])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("positive radius"), "{error}");
+        assert!(
+            SplatPoint::try_new([0.0; 3], [0.1; 3], [2.0, 0.0, 0.0], 0.5, [1.0, 0.0, 0.0, 0.0]).is_err()
+        );
+        assert!(
+            SplatPoint::try_new([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0; 4]).is_err(),
+            "a zero quaternion has no orientation to store"
+        );
+
+        // A usable quaternion is stored normalised, and the index shows up in the message.
+        let point = SplatPoint::try_new([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0, 4.0, 0.0, 0.0]).unwrap();
+        assert_eq!(point.rotation, [0.0, 1.0, 0.0, 0.0]);
+        let indexed = SplatPoint::try_new_at(5, [0.0; 3], [0.1; 3], [0.5; 3], 2.0, [1.0, 0.0, 0.0, 0.0])
+            .unwrap_err()
+            .to_string();
+        assert!(indexed.contains("point 5"), "{indexed}");
+    }
+
+    #[test]
+    fn check_reports_where_and_how_much_and_validate_reports_the_first_problem() {
+        let splat = Splat::from_points(vec![
+            point(0.0, 0.0, 0.5),
+            point(1.0, 0.0, 0.5),
+            point(2.0, 0.1, 0.5),
+        ]);
+        let report = splat.check(ValidationLimits::MATHEMATICAL);
+        assert_eq!(report.point_count, 3);
+        assert_eq!(report.offending_points, 2);
+        assert_eq!(report.total_issues, 2);
+        assert_eq!(report.contract_version, crate::contract::CONTRACT_VERSION);
+        assert_ne!(report.first_issue().unwrap().point, Some(2));
+
+        let error = splat
+            .check_strict(ValidationLimits::MATHEMATICAL)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 of 3 gaussians are invalid"), "{error}");
+
+        // `validate` keeps the terse message the write paths have always produced.
+        let text = splat.validate().unwrap_err().to_string();
+        assert!(text.contains("point 0"), "{text}");
+    }
+
+    #[test]
+    fn inspection_and_stats_describe_the_same_splat() {
+        let splat = Splat::from_points(vec![point(2.0, 0.5, 0.2), point(0.0, 0.0, 0.6)]);
+        let stats = splat.stats();
+        let report = splat.inspection(ValidationLimits::default());
+        assert_eq!(stats.point_count, report.point_count);
+        assert_eq!(stats.bounds, report.bounds);
+        assert_eq!(stats.min_opacity, report.opacity.min);
+        assert_eq!(stats.max_opacity, report.opacity.max);
+        assert_eq!(stats.mean_color, report.mean_color);
+        assert_eq!(report.attributes, crate::contract::ATTRIBUTES);
+        assert!(!report.validation.is_valid());
     }
 }

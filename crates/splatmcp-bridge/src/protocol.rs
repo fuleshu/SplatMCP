@@ -128,6 +128,8 @@ pub enum Method {
     ViewerLoadPly,
     /// The PLY bytes of the document the app currently displays.
     DocumentGetPly,
+    /// Bounded metadata of the displayed document, without transferring its geometry.
+    DocumentInspect,
     /// Readiness, versions and limits of the embedded Python runtime.
     PythonRuntimeInfo,
     /// Submit a Python generation job to the app's shared executor.
@@ -346,6 +348,167 @@ pub struct ViewerStatus {
     pub canvas_height: u32,
     #[serde(default)]
     pub camera: Option<CameraState>,
+}
+
+/// Distribution of one scalar over a document, for `document.inspect`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct DistributionSummary {
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    /// Number of finite values the distribution was built from.
+    pub finite_count: usize,
+}
+
+impl From<splatmcp_core::Distribution> for DistributionSummary {
+    fn from(distribution: splatmcp_core::Distribution) -> Self {
+        Self {
+            min: distribution.min,
+            max: distribution.max,
+            mean: distribution.mean,
+            finite_count: distribution.finite_count,
+        }
+    }
+}
+
+/// Bounds of an inspected document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BoundsSummary {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub center: [f32; 3],
+    pub radius: f32,
+}
+
+impl From<splatmcp_core::Bounds> for BoundsSummary {
+    fn from(bounds: splatmcp_core::Bounds) -> Self {
+        Self {
+            min: bounds.min,
+            max: bounds.max,
+            center: bounds.center,
+            radius: bounds.radius,
+        }
+    }
+}
+
+/// Bounded metadata of a document: counts, bounds, distributions and diagnostics.
+///
+/// Never the geometry. This is what `document.inspect` answers with, so describing a
+/// 500 000 gaussian document costs the same as describing three - no PLY is serialised
+/// and no point array crosses the bridge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InspectionSummary {
+    /// Version of the Gaussian contract the values were checked against.
+    pub contract_version: u32,
+    pub point_count: usize,
+    /// Attributes the model stores, from the contract.
+    pub attributes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<BoundsSummary>,
+    pub scale: [DistributionSummary; 3],
+    pub largest_radius: DistributionSummary,
+    pub opacity: DistributionSummary,
+    pub color: [DistributionSummary; 3],
+    pub mean_color: [f32; 3],
+    /// True when every stored value was finite.
+    pub all_finite: bool,
+    /// True when every value satisfied the contract.
+    pub valid: bool,
+    /// Rendered issues, bounded by the core's reported-issue cap.
+    pub issues: Vec<String>,
+    pub total_issues: usize,
+    pub offending_points: usize,
+    pub issues_truncated: bool,
+    /// Point limit actually applied, when one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_limit: Option<usize>,
+    pub within_limits: bool,
+    /// Bytes of gaussian data in use.
+    pub owned_bytes: usize,
+    /// Bytes the point buffer has allocated.
+    pub allocated_bytes: usize,
+}
+
+impl From<&splatmcp_core::InspectionReport> for InspectionSummary {
+    fn from(report: &splatmcp_core::InspectionReport) -> Self {
+        Self {
+            contract_version: report.contract_version,
+            point_count: report.point_count,
+            attributes: report
+                .attributes
+                .iter()
+                .map(|attribute| (*attribute).to_owned())
+                .collect(),
+            bounds: report.bounds.map(BoundsSummary::from),
+            scale: report.scale.map(DistributionSummary::from),
+            largest_radius: DistributionSummary::from(report.largest_radius),
+            opacity: DistributionSummary::from(report.opacity),
+            color: report.color.map(DistributionSummary::from),
+            mean_color: report.mean_color,
+            all_finite: report.all_finite,
+            valid: report.validation.is_valid(),
+            issues: report
+                .validation
+                .issues
+                .iter()
+                .map(|issue| issue.to_string())
+                .collect(),
+            total_issues: report.validation.total_issues,
+            offending_points: report.validation.offending_points,
+            issues_truncated: report.validation.truncated,
+            point_limit: report.validation.applied_limit(),
+            within_limits: report.validation.within_limits,
+            owned_bytes: report.owned.points,
+            allocated_bytes: report.owned.allocated,
+        }
+    }
+}
+
+impl Default for InspectionSummary {
+    fn default() -> Self {
+        Self {
+            contract_version: splatmcp_core::contract::CONTRACT_VERSION,
+            point_count: 0,
+            attributes: Vec::new(),
+            bounds: None,
+            scale: [DistributionSummary::default(); 3],
+            largest_radius: DistributionSummary::default(),
+            opacity: DistributionSummary::default(),
+            color: [DistributionSummary::default(); 3],
+            mean_color: [0.0; 3],
+            all_finite: true,
+            valid: true,
+            issues: Vec::new(),
+            total_issues: 0,
+            offending_points: 0,
+            issues_truncated: false,
+            point_limit: None,
+            within_limits: true,
+            owned_bytes: 0,
+            allocated_bytes: 0,
+        }
+    }
+}
+
+/// Parameters of `document.inspect`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectRequest {
+    /// Largest gaussian count to accept. Omitted applies the core's own ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_points: Option<usize>,
+}
+
+/// Result of `document.inspect`: the bounded summary plus where it came from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectResult {
+    #[serde(flatten)]
+    pub inspection: InspectionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 /// Parameters of the `hello` handshake.
@@ -674,5 +837,62 @@ mod tests {
             camera: None,
         };
         assert_eq!(capture.decoded_len(), 3);
+    }
+
+    #[test]
+    fn a_document_inspection_is_bounded_metadata_without_geometry() {
+        let splat = splatmcp_core::fixtures::axis_fixture();
+        let report = splat.inspection(splatmcp_core::ValidationLimits::with_max_points(4));
+        let summary = InspectionSummary::from(&report);
+        assert_eq!(summary.point_count, splat.len());
+        assert_eq!(summary.attributes.len(), 5);
+        assert!(summary.bounds.is_some());
+        assert!(summary.valid);
+        assert!(!summary.within_limits, "19 gaussians exceed a limit of 4");
+        assert_eq!(summary.point_limit, Some(4));
+        assert_eq!(summary.contract_version, splatmcp_core::contract::CONTRACT_VERSION);
+
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert!(
+            encoded.len() < 1200,
+            "an inspection reply must stay small: {} bytes",
+            encoded.len()
+        );
+        // A fixed shape: three axes of scale and colour, one opacity range - never a row
+        // per gaussian.
+        assert_eq!(summary.scale.len(), 3);
+        assert_eq!(summary.color.len(), 3);
+        assert!(summary.issues.is_empty(), "the fixture is valid");
+        let decoded: InspectionSummary = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, summary);
+
+        // The method is a document request: it needs no viewer and no PLY transfer.
+        assert_eq!(
+            serde_json::to_string(&Method::DocumentInspect).unwrap(),
+            "\"document_inspect\""
+        );
+        assert!(!Method::DocumentInspect.needs_viewer());
+        assert!(!Method::DocumentInspect.is_handshake());
+
+        let request: InspectRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(request.max_points, None);
+        let request = InspectRequest {
+            max_points: Some(1000),
+        };
+        let round_tripped: InspectRequest =
+            serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        assert_eq!(round_tripped.max_points, Some(1000));
+
+        // A result flattens the summary into one object, so a reply reads as one record.
+        let result = InspectResult {
+            inspection: summary.clone(),
+            file_name: Some("a.ply".to_owned()),
+            document_id: Some("doc-1".to_owned()),
+            revision: Some(3),
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["point_count"], summary.point_count);
+        assert_eq!(encoded["revision"], 3);
+        assert_eq!(encoded["file_name"], "a.ply");
     }
 }

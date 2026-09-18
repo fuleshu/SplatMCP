@@ -27,7 +27,11 @@ const REQUIRED_PLY_PROPERTIES = new Set([
   "rot_3",
 ]);
 
-// 3DGS PLYs are authored Y-down, so the first view flips X by 180 degrees.
+// 3DGS PLYs are authored Y-down, so the first view flips X by 180 degrees. This is the
+// only space change between the model and the screen: the document contract
+// (splatmcp-core::contract, version 1) declares up = -Y and forward = +Z, so the flip is
+// applied exactly once, when the PLY is attached below. Applying it twice would put the
+// +Y axis back down, which `fixtures::axis_fixture` exists to catch.
 const PLY_DEFAULT_X_FLIP_DEG = 180;
 
 export class SplatViewer {

@@ -5,7 +5,7 @@ A 3D Gaussian Splat (3DGS) editor with an MCP server attached.
 - **Viewer / editor shell** — a Tauri 2 desktop app that opens `.ply` Gaussian splats, renders them with PlayCanvas, and re-exports them.
 - **MCP server** — a standalone `stdio` binary (`splatmcp-mcp`) built on the official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`), so any MCP client / agent harness can create, edit, look at and capture splats.
 - **Bridge** — `splatmcp-bridge`, a loopback request/response service the app hosts and the MCP server calls. It is what lets a stdio server move the camera of a window it did not start.
-- **Core library** — `splatmcp-core`, the in-memory splat model, PLY import/export, splat authoring and edit operations (fixed colour, SH degree 0 only; higher SH bands are dropped, never stored).
+- **Core library** — `splatmcp-core`, the in-memory splat model, PLY import/export, splat authoring and edit operations (fixed colour, SH degree 0 only; higher SH bands are dropped, never stored). Its versioned [Gaussian data and coordinate contract](docs/design/gaussian-contract.md) defines the axes, units, quaternion order, colour space and validation every other part follows.
 - **Python generation** — `splatmcp-python`, an embedded CPython executor the app hosts. An agent or the desktop panel submits a compact NumPy recipe, the app builds the Gaussians locally and shows them as a new document revision. See [docs/design/python-generation.md](docs/design/python-generation.md).
 
 Everything is one Cargo workspace; there is no npm/Node build step (the frontend is plain ES modules with a vendored PlayCanvas build).
@@ -70,7 +70,7 @@ those bytes as binary data.
 | `create_splat` | build a splat from a shape (`sphere`, `cube`, `plane`, `line`, `shell`, `ring`, `grid`) or explicit points, optionally write a `.ply`, and show it |
 | `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) to the displayed splat, a `.ply`, or a new empty one, each with an optional box/attribute selection |
 | `load_splat` | display an existing `.ply` and frame it |
-| `splat_info` | point count, bounds, mean colour, opacity range, optionally the first *n* gaussians |
+| `splat_info` | point count, bounds, mean colour, opacity range, scale/colour distributions, contract diagnostics and buffer sizes; reads the displayed document as bounded metadata, and shows the first *n* gaussians when asked |
 | `set_camera` | move the camera: `fit`, an explicit position, or orbit values |
 | `get_camera` | report position, target and field of view |
 | `get_screenshot` | render the window and return the frame as an image, optionally after moving the camera |
@@ -85,7 +85,8 @@ context budget (`the_tool_listing_stays_within_its_context_budget`).
 
 The Python tools take a *recipe*, never geometry: a 500 000-Gaussian job is a few hundred
 bytes of request. See [docs/design/python-generation.md](docs/design/python-generation.md)
-for the array contract, coordinate conventions, job states and cancellation semantics.
+for the job states and cancellation semantics. The array contract and coordinate
+conventions it uses are the shared [Gaussian contract](docs/design/gaussian-contract.md).
 
 ## Prerequisites
 
@@ -263,6 +264,11 @@ Expected: `{"app":{"attached":false},...}` before an app is running, and
 Milestones 1-4 are done: the workspace builds, the viewer works, the bridge connects the
 MCP server to the live window, the eight M4 tools work end to end, and window geometry is
 persisted.
+
+The Gaussian contract is versioned and enforced: raw values are validated before any
+clamping constructor at every boundary, PLY import reports the attributes it dropped and the
+values it repaired, and inspecting a 500 000-Gaussian document returns bounded metadata
+without transferring geometry. See [docs/design/gaussian-contract.md](docs/design/gaussian-contract.md).
 
 The embedded Python generation milestone is implemented: the app hosts one CPython
 interpreter and one generation service, the four `python_*` tools and the desktop panel

@@ -205,16 +205,29 @@ impl SplatMcpServer {
     /// Describes a splat: count, bounds, colour and opacity.
     #[tool(
         description = "Describe a gaussian splat: point count, bounds, mean colour, opacity \
-                       range, and the displayed document's id and revision (quote it as \
+                       range, scale and colour distributions, contract diagnostics, buffer \
+                       sizes, and the displayed document's id and revision (quote it as \
                        expected_revision when a Python job edits that document). Reads the \
-                       displayed splat by default, or a .ply path; set points to inspect the \
-                       first n gaussians.",
+                       displayed document as bounded metadata by default, or a .ply path; set \
+                       points for the first n gaussians themselves.",
         annotations(title = "Splat info", read_only_hint = true, open_world_hint = false)
     )]
     async fn splat_info(
         &self,
         Parameters(input): Parameters<edit::InfoInput>,
     ) -> Result<CallToolResult, McpError> {
+        // The displayed document is inspected where it lives: no PLY is serialised and no
+        // point array crosses the bridge. A sample, or a file path, needs the gaussians
+        // and takes the read-the-PLY path as before.
+        if edit::wants_bounded_inspection(input.source.as_deref(), input.points) {
+            match edit::inspect_displayed(&self.link) {
+                edit::InspectOutcome::Summary(result) => {
+                    return tool_json(&edit::info_reply_from_inspect(*result));
+                }
+                edit::InspectOutcome::NoDocument(message) => return Err(tool_error(message)),
+                edit::InspectOutcome::Unavailable => {}
+            }
+        }
         let resolved = edit::resolve_source(&self.link, input.source.as_deref())
             .map_err(tool_error)?;
         tool_json(&edit::info_reply_with_document(
