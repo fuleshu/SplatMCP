@@ -23,16 +23,12 @@ mod viewer;
 use std::sync::Arc;
 
 use document::AppState;
+use serde::Serialize;
 use serde_json::{Value, json};
 use splatmcp_core::{Expected, PlyImportPolicy};
 use tauri::ipc::Response;
 use tauri::{Manager, State};
 use viewer::Viewer;
-
-/// Number of bytes an export wrote.
-fn outcome_bytes(outcome: &document::ExportOutcome) -> usize {
-    outcome.bytes
-}
 
 /// Picks a PLY file, imports it and makes it the displayed document.
 
@@ -90,12 +86,23 @@ fn current_splat_bytes(state: State<'_, AppState>) -> Result<Response, String> {
     Ok(Response::new(bytes))
 }
 
+/// What the Save action wrote: the PLY, and the authoring sidecar when there was one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SaveOutcome {
+    #[serde(flatten)]
+    pub export: document::ExportOutcome,
+    /// The versioned component record written beside the PLY, when the revision had components.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring: Option<document::SidecarOutcome>,
+}
+
 /// Exports the displayed revision as PLY. Returns `None` when the user cancels.
 ///
-/// The reply names the exact identity that was written and the checksum of those bytes: a hash
-/// identifies the artifact, never the document.
+/// The reply names the exact identity that was written, the checksum of those bytes, the gaussian
+/// count they hold and the sidecar that was written beside them: a hash identifies the artifact,
+/// never the document, and the count is geometry rather than file size.
 #[tauri::command]
-fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutcome>, String> {
+fn save_splat(state: State<'_, AppState>) -> Result<Option<SaveOutcome>, String> {
     let file_name = match state.metadata() {
         Some(metadata) => metadata.provenance.file_name,
         None => return Err("no splat is loaded".to_owned()),
@@ -110,29 +117,21 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutco
         return Ok(None);
     };
 
-    let outcome = state.export(Expected::Any, &path)?;
-
-    // A PLY carries geometry only: the versioned authoring sidecar records the components, their
-    // membership and their frames against this exact artifact, and a plain export keeps the
-    // documented "geometry only" guarantee. Failing to write either sidecar must not fail a
-    // successful save.
-    if let Ok((handle, layer)) = state.authoring_snapshot(Expected::Any)
-        && !layer.components().is_empty()
-    {
-        let record = authoring::record(
-            handle.document_id.as_str(),
-            handle.revision,
-            &outcome.checksum,
-            outcome_bytes(&outcome),
-            &layer,
-        );
-        match authoring::write(&path, &record) {
-            Ok(sidecar) => println!("splatmcp: wrote {}", sidecar.display()),
-            Err(error) => eprintln!("splatmcp: could not write the authoring sidecar: {error}"),
+    // One call writes both files from the same snapshot: the PLY, and the versioned authoring
+    // sidecar that records the components, membership and frames *of the exported revision* -
+    // including its gaussian count, which is what a reopen validates against.
+    let (outcome, sidecar) = state.export_with_authoring(&path)?;
+    if let Some(written) = &sidecar {
+        match &written.error {
+            None => println!(
+                "splatmcp: wrote {} ({} components, {} gaussians)",
+                written.path, written.components, written.point_count
+            ),
+            Some(error) => eprintln!("splatmcp: could not write the authoring sidecar: {error}"),
         }
     }
 
-    // A PLY cannot hold recipe or component metadata, so a generated document's provenance is
+    // A PLY cannot hold recipe metadata either, so a generated document's producer record is
     // written next to it. Losing it must not fail a successful save.
     if let Some(recipe) = state.recipe()
         && let Ok(record) = serde_json::from_str::<splatmcp_python::script::RecipeRecord>(&recipe)
@@ -142,7 +141,10 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutco
             Err(error) => eprintln!("splatmcp: could not write the recipe sidecar: {error}"),
         }
     }
-    Ok(Some(outcome))
+    Ok(Some(SaveOutcome {
+        export: outcome,
+        authoring: sidecar,
+    }))
 }
 
 /// Lists the components of the displayed document, with their stable ids.
@@ -394,7 +396,7 @@ fn main() {
             // panel-started job share one interpreter and one job registry. A missing
             // Python runtime only disables generation; the viewer keeps working.
             let python = Arc::new(python::PythonHost::start(&handle));
-            app.manage(python::PythonHostState(python.clone()));            // One asset registry for the whole process: the bridge and the window register
+            app.manage(python::PythonHostState(python.clone())); // One asset registry for the whole process: the bridge and the window register
             // and resolve the same ids, so a payload is never copied to be shared.
             let assets = Arc::new(assets::AssetHost::default());
             app.manage(assets::AssetHostState(assets.clone()));

@@ -320,9 +320,11 @@ Still open:
   so after a restart an old operation id is *unknown*: the tool says so instead of replaying a
   destructive edit.
 - **A commit says `published`, not `done`, until the window renders it.** The app announces the
-  exact revision over `splat://edit-revision` and the window fetches *those* bytes by document id
-  and revision, dropping a load that a newer one overtook; only its acknowledgement turns the
-  receipt's display outcome into `done`. A retry replays the recorded receipt - its document,
+  exact revision over `splat://edit-revision`, with a monotonic publication token, and the window
+  fetches *those* bytes by document id and revision. Order is decided by token rather than arrival,
+  so a slow fetch or slow stage for an older revision can neither replace newer geometry nor be
+  acknowledged or labelled as displayed; only the viewer's acknowledgement turns the receipt's
+  display outcome into `done`. A retry replays the recorded receipt - its document,
   revision, point count and side effects - rather than reporting whatever is displayed now, and a
   preview commit is retry-safe once it carries an `operation_id`.
 - **Component metadata and point identities are process local too.** `AuthoringSet` holds opaque
@@ -330,7 +332,10 @@ Still open:
   outside the transaction service (a file replace, a Python job) rebuilds that layer, which is
   reported as `rebuilt` so a caller learns why its ids changed. A save writes a versioned
   `.authoring.json` sidecar next to the PLY carrying document id, revision, the artifact checksum,
-  each component's frame and its members (as identities *and* rows). Reopening a file restores the
+  each component's frame, its members (as identities *and* rows) and the **exported revision's**
+  gaussian count - never the file size. Native Save writes both files from one snapshot, and a load
+  carries the absolute source path beside the display name, because a basename is a label and not a
+  location. Reopening a file restores the
   metadata whose checksum and gaussian count match those bytes, rebuilding every component with
   fresh ids at the recorded rows; a sidecar that does not match is refused **with a reason the
   reply carries**, never attached by file name. A plain PLY export keeps its "geometry only"

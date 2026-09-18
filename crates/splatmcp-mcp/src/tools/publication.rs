@@ -113,8 +113,8 @@ pub fn run(link: &AppLink, input: &PublicationInput) -> Result<Value, String> {
             let reply: PublicationStatusReply = link
                 .request_typed(Method::PublicationStatus, params)
                 .map_err(|error| format!("{error}"))?;
-            let encoded =
-                serde_json::to_value(PublicationReply::of(&reply)).map_err(|error| error.to_string())?;
+            let encoded = serde_json::to_value(PublicationReply::of(&reply))
+                .map_err(|error| error.to_string())?;
             Ok(encoded)
         }
         PublicationAction::Capabilities => {
@@ -175,7 +175,10 @@ mod tests {
         assert_eq!(encoded.committed_revision, Some(7));
         assert_eq!(encoded.displayed_revision, Some(5));
         assert!(encoded.display_lagging && !encoded.is_current);
-        assert_eq!(encoded.pending.as_ref().map(|pending| pending.token), Some(3));
+        assert_eq!(
+            encoded.pending.as_ref().map(|pending| pending.token),
+            Some(3)
+        );
         assert_eq!(encoded.skipped, vec![6]);
         assert!(encoded.failures[0].contains("parse failed"));
         let json = serde_json::to_string(&encoded).unwrap();

@@ -13,11 +13,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
-    BatchOpParams, BatchPointParams, BoundsInfo, BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest,
-    CommitPreviewRequest, ComponentSummary, ComponentsReply, ComponentsRequest, DocumentPlyReply,
-    DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest,
-    GetPlyRequest, Handler, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
-    InspectionSummary, LoadPlyRequest, Method, PlyImportSummary, PreviewSummary,
+    BatchOpParams, BatchPointParams, BoundsInfo, BridgeDescriptor, BridgeServer, BridgeService,
+    CaptureRequest, CommitPreviewRequest, ComponentSummary, ComponentsReply, ComponentsRequest,
+    DocumentPlyReply, DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply,
+    EditBatchRequest, GetPlyRequest, Handler, HistoryReply, HistoryStepSummary, InspectRequest,
+    InspectResult, InspectionSummary, LoadPlyRequest, Method, PlyImportSummary, PreviewSummary,
     PythonCancelRequest, PythonJobQuery, PythonRunRequest, ReloadRequest, RetentionSummary,
     SelectionParams, SelectionSummary, SetComponentRequest, SideEffectSummary, StepSummary,
     TransformSummary, ViewerStatus,
@@ -111,13 +111,15 @@ impl Handler for AppBridge {
             | Method::AssetUploadFinalize
             | Method::AssetUploadCancel => {
                 Err("this method is answered by the asset host".to_owned())
-            }            Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
+            }
+            Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
             Method::JobSubmit => self.job_submit(params),
             Method::JobStatus => self.job_status(params),
             Method::JobList => self.job_list(params),
             Method::JobCancel => self.job_cancel(params),
             Method::PublicationStatus => self.publication_status(params),
-            Method::PublicationCapabilities => self.publication_capabilities(params),            Method::PythonRunSplat => {
+            Method::PublicationCapabilities => self.publication_capabilities(params),
+            Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
                     .map_err(|error| format!("invalid python run request: {error}"))?;
                 let receipt = self.python.submit(request)?;
@@ -208,12 +210,7 @@ impl AppBridge {
         // Repair is opt-in: without it a file that would need repair is refused with indexed
         // diagnostics instead of being loaded as a quietly repaired document.
         let policy = PlyImportPolicy::from_repair_flag(request.repair);
-        // A load that names a real file can carry authoring metadata beside it; a buffer with
-        // only a display name cannot, and is not guessed at.
-        let source_path = asset_file
-            .clone()
-            .or_else(|| request.file_name.clone())
-            .filter(|name| std::path::Path::new(name).is_file());
+        let source_path = authoring_source(&request, asset_file.as_deref());
 
         let state = self.app.state::<AppState>();
         let opening = matches!(expected, Expected::Any);
@@ -229,14 +226,17 @@ impl AppBridge {
             )?,
         };
         let info = SplatInfo::of(&imported.metadata);
-        // Opening a *file* is where component metadata is restored: association is by content,
-        // and anything else is reported as a note on this reply rather than attached.
-        if opening
-            && let Some(note) = source_path.as_deref().and_then(|path| {
-                restore_note(&state, std::path::Path::new(path), &imported, &bytes)
-            })
+        // A *file* load is where component metadata is restored: association is by content, and
+        // anything else is reported as a note on this reply rather than attached. A refusal is
+        // reported even for a replacement, because "I did not attach your metadata" is something
+        // the caller needs to hear either way.
+        if let Some(note) = source_path
+            .as_deref()
+            .and_then(|path| restore_note(&state, std::path::Path::new(path), &imported, &bytes))
         {
-            state.set_authoring_note(&imported.metadata.handle, note);
+            if opening || note.status == "refused" {
+                state.set_authoring_note(&imported.metadata.handle, note);
+            }
         }
 
         let value = self.viewer.request(
@@ -481,7 +481,11 @@ impl AppBridge {
             serde_json::from_value(params)
                 .map_err(|error| format!("invalid publication.status request: {error}"))?
         };
-        let publications = self.app.state::<crate::publication::PublicationHostState>().0.clone();
+        let publications = self
+            .app
+            .state::<crate::publication::PublicationHostState>()
+            .0
+            .clone();
         let document_id = match request.document_id {
             Some(document_id) => document_id,
             // Absent means "the displayed document", which the app resolves once, here, and
@@ -491,7 +495,9 @@ impl AppBridge {
                 match state.active_handle() {
                     Some(handle) => handle.document_id.to_string(),
                     None => {
-                        return Err("no splat is loaded, so no publication can be described".to_owned());
+                        return Err(
+                            "no splat is loaded, so no publication can be described".to_owned()
+                        );
                     }
                 }
             }
@@ -509,7 +515,11 @@ impl AppBridge {
     /// What the renderer can do, with the viewer's own report of what it is showing.
     fn publication_capabilities(&self, params: Value) -> Result<Value, String> {
         let _ = params;
-        let publications = self.app.state::<crate::publication::PublicationHostState>().0.clone();
+        let publications = self
+            .app
+            .state::<crate::publication::PublicationHostState>()
+            .0
+            .clone();
         // The viewer's own status, so the capabilities describe the real renderer rather than
         // an assumption about it. A viewer that cannot answer is reported as not ready.
         let reported = self
@@ -760,20 +770,18 @@ fn plan_patch(
         .and_then(|selection| selection.first)
         .filter(|_| {
             // Only a prefix selection has a row count that does not depend on the document.
-            op.selection
-                .as_ref()
-                .is_some_and(|selection| {
-                    selection.within.is_none()
-                        && selection.outside.is_none()
-                        && selection.sphere.is_none()
-                        && selection.component.is_none()
-                        && selection.point_ids.is_empty()
-                        && selection.selection_handle.is_none()
-                        && selection.color_min.is_none()
-                        && selection.color_max.is_none()
-                        && selection.opacity_min.is_none()
-                        && selection.max_radius.is_none()
-                })
+            op.selection.as_ref().is_some_and(|selection| {
+                selection.within.is_none()
+                    && selection.outside.is_none()
+                    && selection.sphere.is_none()
+                    && selection.component.is_none()
+                    && selection.point_ids.is_empty()
+                    && selection.selection_handle.is_none()
+                    && selection.color_min.is_none()
+                    && selection.color_max.is_none()
+                    && selection.opacity_min.is_none()
+                    && selection.max_radius.is_none()
+            })
         });
     assets.plan_patch(params, rows)
 }
@@ -858,6 +866,31 @@ fn selection_summary(selection: &document::SelectionInfo) -> SelectionSummary {
 /// Turns a rejected transaction into a message a caller can act on.
 fn transaction_message(error: splatmcp_core::TransactionError) -> String {
     format!("{} ({})", error, error.code())
+}
+
+/// Where a load's authoring metadata may live, if anywhere.
+///
+/// The caller's explicit source path comes first: it is the file the bytes were read from, which
+/// need not be anywhere near the app's working directory - a basename is a label, not a location.
+/// A registered asset names the file it was snapshotted from. A bare display name is accepted only
+/// when it happens to be a real file, which is the legacy request shape; it is never a guess that
+/// some file with that name is the right neighbour.
+pub(crate) fn authoring_source(
+    request: &LoadPlyRequest,
+    asset_file: Option<&str>,
+) -> Option<String> {
+    request
+        .source_path
+        .clone()
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| asset_file.map(str::to_owned))
+        .or_else(|| {
+            request
+                .file_name
+                .clone()
+                .filter(|name| std::path::Path::new(name).is_file())
+        })
+        .filter(|path| std::path::Path::new(path).is_file())
 }
 
 /// A document summary carrying the one-shot authoring note the app has waiting for it.
@@ -1473,13 +1506,21 @@ mod tests {
             "steps": [{ "op": "remove", "selection": { "frame": "camera" } }]
         }))
         .unwrap();
-        assert!(to_batch(&bad_frame, &assets).unwrap_err().contains("unknown frame"));
+        assert!(
+            to_batch(&bad_frame, &assets)
+                .unwrap_err()
+                .contains("unknown frame")
+        );
 
         let bad_id: EditBatchRequest = serde_json::from_value(json!({
             "steps": [{ "op": "remove", "selection": { "point_ids": ["row-3"] } }]
         }))
         .unwrap();
-        assert!(to_batch(&bad_id, &assets).unwrap_err().contains("not a point id"));
+        assert!(
+            to_batch(&bad_id, &assets)
+                .unwrap_err()
+                .contains("not a point id")
+        );
 
         // A missing required field says which step and which field.
         let missing: EditBatchRequest = serde_json::from_value(json!({
@@ -1632,6 +1673,81 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// The fixtures the review produced, read the way the loader reads them.
+    ///
+    /// They live outside the repository, so the test reports that it could not check them rather
+    /// than passing silently when they are absent. The pair is exactly the defect: one sidecar
+    /// records the exported revision's 6 gaussians, the other the 864-byte file *size*, and the
+    /// same 6-point PLY must restore from the first and be refused by the second.
+    #[test]
+    fn the_reviewed_fixtures_restore_or_are_refused_by_their_count() {
+        let directory = std::path::Path::new(r"F:\_splat");
+        // Both PLY files hold the same six gaussians; only what the sidecar beside each one
+        // recorded differs. `authoring::read` derives the sidecar from the PLY path it is given.
+        let ply = directory.join("tasks13-14-fixes-1789741426569-correct-count.ply");
+        let native_ply = directory.join("tasks13-14-fixes-1789741426569-native-save-count.ply");
+        if !ply.is_file() || !native_ply.is_file() {
+            println!(
+                "reviewed fixtures are not present at {}; skipping",
+                directory.display()
+            );
+            return;
+        }
+
+        let bytes = std::fs::read(&ply).unwrap();
+        let checksum = document::ArtifactChecksum::of(&bytes);
+        let artifact = format!("{}:{}", checksum.algorithm, checksum.hex());
+        let fresh = AppState::default();
+        let imported = fresh
+            .open_ply(
+                &bytes,
+                Mutation::open(ply.to_string_lossy().to_string()),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap();
+        assert_eq!(
+            imported.metadata.point_count, 6,
+            "the PLY holds six gaussians"
+        );
+        assert_ne!(
+            imported.metadata.point_count,
+            bytes.len(),
+            "and that is not the file size, which is {}",
+            bytes.len()
+        );
+
+        // The corrected record describes these bytes: it restores three components of two.
+        let record = crate::authoring::read(&ply).unwrap().unwrap();
+        assert!(record.content_association(&artifact, 6).is_none());
+        let note =
+            restore_note(&fresh, &ply, &imported, &bytes).expect("a matching sidecar attaches");
+        assert_eq!(note.status, "restored", "{note:?}");
+        assert_eq!(note.components, 3);
+        assert_eq!(note.members, 6);
+        let names: Vec<String> = fresh
+            .components(Expected::Any)
+            .unwrap()
+            .components
+            .iter()
+            .map(|component| component.name.clone())
+            .collect();
+        assert_eq!(names, vec!["face", "hair", "sweater"]);
+
+        // The record a pre-fix Save wrote claims the file size: refused, with that as the reason.
+        let stale = crate::authoring::read(&native_ply).unwrap().unwrap();
+        let reason = stale
+            .content_association(&artifact, 6)
+            .expect("a count that is a file size does not describe six gaussians");
+        assert_eq!(
+            reason,
+            format!(
+                "authoring metadata describes {} gaussians but this file holds 6",
+                stale.point_count
+            )
+        );
+        assert_eq!(stale.point_count, bytes.len());
+    }
+
     #[test]
     fn a_sidecar_that_does_not_describe_these_bytes_is_reported_not_attached() {
         let directory = std::env::temp_dir().join(format!("splatmcp-stale-{}", std::process::id()));
@@ -1667,6 +1783,63 @@ mod tests {
             "nothing is attached by file name"
         );
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_load_keeps_the_source_path_so_metadata_beside_the_file_is_found() {
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-source-path-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let ply = directory.join("scene.ply");
+        std::fs::write(&ply, b"ply bytes").unwrap();
+
+        // A caller that read a file says where it read it: the path survives, and the display
+        // name is only a label beside it.
+        let request = LoadPlyRequest {
+            ply_base64: String::new(),
+            asset_id: None,
+            file_name: Some("scene.ply".to_owned()),
+            source_path: Some(ply.to_string_lossy().to_string()),
+            frame: None,
+            document_id: None,
+            expected_revision: None,
+            repair: None,
+        };
+        assert_eq!(
+            authoring_source(&request, None).as_deref(),
+            Some(ply.to_string_lossy().as_ref())
+        );
+
+        // A bare display name that is not a file here is not treated as one.
+        let mut bare = request.clone();
+        bare.source_path = None;
+        bare.file_name = Some("elsewhere.ply".to_owned());
+        assert_eq!(authoring_source(&bare, None), None);
+
+        // The legacy shape - a name that happens to be a real file - still works.
+        let mut named = plus_file(&directory);
+        named.source_path = None;
+        assert!(authoring_source(&named, None).is_some());
+
+        // A registered asset names the file it was snapshotted from.
+        assert_eq!(
+            authoring_source(
+                &LoadPlyRequest::default(),
+                Some(ply.to_string_lossy().as_ref())
+            )
+            .as_deref(),
+            Some(ply.to_string_lossy().as_ref())
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A request whose display name is a real file, for the legacy shape.
+    fn plus_file(directory: &std::path::Path) -> LoadPlyRequest {
+        let ply = directory.join("scene.ply");
+        LoadPlyRequest {
+            file_name: Some(ply.to_string_lossy().to_string()),
+            ..LoadPlyRequest::default()
+        }
     }
 
     #[test]

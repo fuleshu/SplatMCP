@@ -353,7 +353,11 @@ impl AppDocumentTarget {
             Some(document_id) => splatmcp_core::DocumentHandle::new(document_id, identity.revision),
             None => return Err(format!("'{}' is not a document id", identity.document_id)),
         };
-        let publications = self.app.state::<crate::publication::PublicationHostState>().0.clone();
+        let publications = self
+            .app
+            .state::<crate::publication::PublicationHostState>()
+            .0
+            .clone();
         let request = publications
             .begin(&handle, splatmcp_core::PublicationSource::Committed, frame)
             .map_err(|error| format!("{} ({})", error, error.code()))?;
@@ -527,7 +531,10 @@ pub fn python_note_rendered(
     host: tauri::State<'_, PythonHostState>,
 ) -> Result<Value, String> {
     let job = host.0.note_rendered(revision);
-    let publications = app.state::<crate::publication::PublicationHostState>().0.clone();
+    let publications = app
+        .state::<crate::publication::PublicationHostState>()
+        .0
+        .clone();
     let acknowledged = match (document_id, token) {
         (Some(document_id), Some(token)) => {
             match publications.acknowledge(&document_id, revision, token) {

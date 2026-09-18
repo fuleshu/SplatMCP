@@ -103,7 +103,10 @@ pub fn info(link: &AppLink, input: &AssetInfoInput) -> Result<Value, String> {
             return Err("releasing needs asset_id; omit release to list live assets".to_owned());
         };
         return link
-            .request(Method::AssetRelease, serde_json::json!({ "asset_id": asset_id }))
+            .request(
+                Method::AssetRelease,
+                serde_json::json!({ "asset_id": asset_id }),
+            )
             .map_err(|error| format!("{error}"));
     }
     match &input.asset_id {

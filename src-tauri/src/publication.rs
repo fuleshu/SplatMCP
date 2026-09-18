@@ -18,12 +18,12 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use tauri::Manager;
 use splatmcp_core::{
     DocumentHandle, PUBLICATION_CONTRACT_VERSION, PublicationError, PublicationOutcome,
     PublicationRequest, PublicationSource, PublicationStatus, PublicationTracker,
     RendererCapabilities, RevisionRecord,
 };
+use tauri::Manager;
 
 /// The process-wide publication tracker.
 pub struct PublicationHost {
@@ -83,12 +83,8 @@ impl PublicationHost {
     ) -> Result<PublicationRequest, PublicationError> {
         self.tracker
             .committed(handle.document_id.as_str(), handle.revision)?;
-        self.tracker.begin(
-            handle.document_id.as_str(),
-            handle.revision,
-            source,
-            frame,
-        )
+        self.tracker
+            .begin(handle.document_id.as_str(), handle.revision, source, frame)
     }
 
     /// Records a viewer acknowledgement and returns the resulting status.
@@ -120,10 +116,7 @@ impl PublicationHost {
     }
 
     /// One document's publication status, if anything is known about it.
-    pub fn status(
-        &self,
-        document_id: &str,
-    ) -> Result<Option<PublicationStatus>, PublicationError> {
+    pub fn status(&self, document_id: &str) -> Result<Option<PublicationStatus>, PublicationError> {
         self.tracker.status(document_id)
     }
 
@@ -133,7 +126,11 @@ impl PublicationHost {
         displayed_revision: Option<u64>,
         displayed_point_count: usize,
     ) -> RendererCapabilities {
-        RendererCapabilities::of(displayed_revision, displayed_point_count, self.ack_timeout_ms)
+        RendererCapabilities::of(
+            displayed_revision,
+            displayed_point_count,
+            self.ack_timeout_ms,
+        )
     }
 }
 
@@ -145,7 +142,11 @@ pub struct PublicationHostState(pub Arc<PublicationHost>);
 /// Small on purpose: identity, revision, token and the two switches. The geometry travels
 /// through the binary `splat_bytes_for_revision` response, so a 500 000 gaussian revision never
 /// becomes a JSON payload.
-pub fn request_payload(request: &PublicationRequest, file_name: &str, point_count: usize) -> serde_json::Value {
+pub fn request_payload(
+    request: &PublicationRequest,
+    file_name: &str,
+    point_count: usize,
+) -> serde_json::Value {
     json!({
         "contract_version": PUBLICATION_CONTRACT_VERSION,
         "document_id": request.document_id,
@@ -211,7 +212,9 @@ pub fn error_json(error: &PublicationError) -> serde_json::Value {
 pub fn needs_attention(outcome: &PublicationOutcome) -> bool {
     matches!(
         outcome,
-        PublicationOutcome::Failed(_) | PublicationOutcome::TimedOut | PublicationOutcome::Skipped { .. }
+        PublicationOutcome::Failed(_)
+            | PublicationOutcome::TimedOut
+            | PublicationOutcome::Skipped { .. }
     )
 }
 
@@ -231,11 +234,7 @@ pub fn publication_status(
             Err(error) => Ok(json!({ "error": error_json(&error) })),
         },
         None => {
-            let statuses = host
-                .0
-                .tracker()
-                .all()
-                .map_err(|error| error.to_string())?;
+            let statuses = host.0.tracker().all().map_err(|error| error.to_string())?;
             Ok(json!({
                 "documents": statuses.iter().map(status_json).collect::<Vec<_>>(),
             }))
@@ -263,10 +262,7 @@ pub fn renderer_capabilities(
         .and_then(|value| serde_json::from_value::<splatmpc_status::ViewerStatus>(value).ok());
     let (displayed_revision, point_count) = match status {
         Some(status) => (
-            status
-                .document
-                .as_ref()
-                .map(|document| document.revision),
+            status.document.as_ref().map(|document| document.revision),
             status.point_count,
         ),
         None => (None, 0),
@@ -319,7 +315,13 @@ mod tests {
         let encoded = status_json(&status);
         assert_eq!(encoded["is_current"], false);
         assert_eq!(encoded["display_lagging"], true);
-        assert!(encoded["summary"].as_str().unwrap().contains("committing nothing") == false);
+        assert!(
+            encoded["summary"]
+                .as_str()
+                .unwrap()
+                .contains("committing nothing")
+                == false
+        );
     }
 
     #[test]
@@ -338,9 +340,7 @@ mod tests {
         // Nothing large travels in the event: only identity and switches.
         assert!(payload.to_string().len() < 260, "{payload}");
 
-        let status = host
-            .acknowledge("doc-4f2a-1", 4, request.token)
-            .unwrap();
+        let status = host.acknowledge("doc-4f2a-1", 4, request.token).unwrap();
         assert!(status.is_current());
         assert_eq!(status.displayed_revision, Some(4));
         let encoded = status_json(&status);
@@ -358,14 +358,10 @@ mod tests {
             .tracker()
             .begin("doc-4f2a-1", 5, PublicationSource::Committed, false)
             .unwrap();
-        let error = host
-            .acknowledge("doc-4f2a-1", 4, first.token)
-            .unwrap_err();
+        let error = host.acknowledge("doc-4f2a-1", 4, first.token).unwrap_err();
         assert_eq!(error.code(), "stale_acknowledgement");
         assert!(needs_attention(&PublicationOutcome::TimedOut));
-        let status = host
-            .acknowledge("doc-4f2a-1", 5, second.token)
-            .unwrap();
+        let status = host.acknowledge("doc-4f2a-1", 5, second.token).unwrap();
         assert_eq!(status.displayed_revision, Some(5));
         assert!(status.skipped.contains(&4));
     }
@@ -387,7 +383,12 @@ mod tests {
         let encoded = status_json(&status);
         assert_eq!(encoded["failures"][0]["revision"], 5);
         assert_eq!(encoded["failures"][0]["reason"], "parse failed");
-        assert!(encoded["summary"].as_str().unwrap().contains("last request failed"));
+        assert!(
+            encoded["summary"]
+                .as_str()
+                .unwrap()
+                .contains("last request failed")
+        );
     }
 
     #[test]
@@ -399,7 +400,12 @@ mod tests {
         assert_eq!(encoded["revision_addressed"], true);
         assert_eq!(encoded["ack_timeout_ms"], 1_500);
         assert_eq!(encoded["displayed_revision"], 7);
-        assert!(encoded["summary"].as_str().unwrap().contains("200000 gaussians"));
+        assert!(
+            encoded["summary"]
+                .as_str()
+                .unwrap()
+                .contains("200000 gaussians")
+        );
     }
 
     #[test]

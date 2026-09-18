@@ -1,5 +1,6 @@
 import * as pc from "./vendor/playcanvas/playcanvas.min.mjs";
 import { CameraControls } from "./vendor/playcanvas/camera-controls.mjs";
+import { isSuperseded } from "./publication-order.js";
 
 const DEFAULT_FOV = 60;
 // Three-quarter, slightly elevated view direction used when framing a splat.
@@ -87,6 +88,12 @@ export class SplatViewer {
     this.ensureApp();
     if (!fileBytes || fileBytes.length === 0) {
       throw new Error("the app sent no bytes for this revision");
+    }
+    // A publication older than what is already on screen never replaces it, whatever order the
+    // two arrived in. Arrival order is not evidence: a slow fetch for revision 8 finishing after
+    // revision 9 was displayed must not put revision 8 back on screen.
+    if (request && isSuperseded(request.token, this.displayed?.token)) {
+      return null;
     }
     const token = ++this.loadToken;
     this.staged = request ? { ...request } : null;

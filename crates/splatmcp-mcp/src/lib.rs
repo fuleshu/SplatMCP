@@ -158,7 +158,8 @@ impl SplatMcpServer {
                 .to_owned();
             // A created splat is a new document: nothing was edited, so nothing is replaced.
             status = Some(
-                author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?,
+                author::display_splat(&self.link, &file_name, &bytes, None, None)
+                    .map_err(tool_error)?,
             );
             displayed = true;
         }
@@ -258,7 +259,9 @@ impl SplatMcpServer {
             return tool_json(&status);
         }
         let path = input.path.as_deref().ok_or_else(|| {
-            tool_error("load_splat needs path (.ply file) or asset_id (registered asset)".to_owned())
+            tool_error(
+                "load_splat needs path (.ply file) or asset_id (registered asset)".to_owned(),
+            )
         })?;
         // Strict by default: a file that needs repair is refused with indexed diagnostics,
         // and `repair: true` accepts it and reports every value that was changed.
@@ -268,17 +271,19 @@ impl SplatMcpServer {
         let splat = file.splat;
         let bytes =
             splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
-        let file_name = std::path::Path::new(path)
+        let source = std::path::Path::new(path);
+        let file_name = source
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("splat.ply")
             .to_owned();
-        // Loading a file opens a document: the file is provenance, not identity.
-        let status =
-            author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?;
+        // Loading a file opens a document: the file is provenance, not identity. The *path* goes
+        // with the request, because component metadata lives beside that file - the app cannot
+        // find it from a display name, and the file need not be anywhere near the app.
+        let status = author::display_splat(&self.link, &file_name, &bytes, Some(source), None)
+            .map_err(tool_error)?;
         tool_json(
-            &author::splat_reply(&splat, Some(std::path::Path::new(path)), true, Some(&status))
-                .with_import(import),
+            &author::splat_reply(&splat, Some(source), true, Some(&status)).with_import(import),
         )
     }
 
@@ -540,7 +545,11 @@ impl SplatMcpServer {
                        new log lines (pass log_after back); list returns recent jobs and the real \
                        limits; cancel is cooperative and honest. A dropped connection never \
                        cancels or resubmits the work.",
-        annotations(title = "Document job", read_only_hint = false, open_world_hint = false)
+        annotations(
+            title = "Document job",
+            read_only_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn document_job(
         &self,

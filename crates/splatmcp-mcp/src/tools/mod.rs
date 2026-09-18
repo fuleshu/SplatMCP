@@ -130,6 +130,10 @@ pub struct SplatReply {
     /// What the import of a file this call read did, when it was not lossless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<PlyImportSummary>,
+    /// What happened to the component metadata beside the file this call loaded: a restore, or
+    /// the reason nothing was attached. Present only when the app had something to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring: Option<splatmcp_bridge::AuthoringNote>,
     /// File the splat was written to, when the call asked for one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -143,6 +147,7 @@ impl SplatReply {
             summary: SplatSummary::of(splat),
             document: None,
             import: None,
+            authoring: None,
             path: path.map(|path| path.to_string_lossy().to_string()),
             displayed,
         }
@@ -157,6 +162,12 @@ impl SplatReply {
     /// Same reply, reporting the identity the app resolved.
     pub fn with_document(mut self, document: Option<DocumentIdentity>) -> Self {
         self.document = document;
+        self
+    }
+
+    /// Same reply, reporting what happened to the component metadata beside the file.
+    pub fn with_authoring(mut self, authoring: Option<splatmcp_bridge::AuthoringNote>) -> Self {
+        self.authoring = authoring;
         self
     }
 }

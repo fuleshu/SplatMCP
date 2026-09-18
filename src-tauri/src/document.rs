@@ -34,6 +34,27 @@ pub use splatmcp_core::document::{
 };
 pub use splatmcp_core::{Bounds, Component, PointId, SelectionHandle};
 
+/// What writing an authoring sidecar produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SidecarOutcome {
+    /// Path the record was written to, or would have been.
+    pub path: String,
+    pub components: usize,
+    pub members: usize,
+    /// Gaussians the record describes, which is the exported revision's count.
+    pub point_count: usize,
+    /// Why the record could not be written, when it could not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SidecarOutcome {
+    /// True when the record reached the disk.
+    pub fn written(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
 /// Colour of a selection marker: unmistakably not scene geometry.
 pub const HIGHLIGHT_COLOR: [f32; 3] = [1.0, 0.05, 0.6];
 /// Opacity of a selection marker: fully opaque, so it is visible inside a dense cloud.
@@ -114,6 +135,20 @@ impl From<SplatError> for ServiceError {
 impl From<ServiceError> for String {
     fn from(error: ServiceError) -> Self {
         error.to_string()
+    }
+}
+
+impl From<TransactionError> for ServiceError {
+    /// Keeps an *identity* failure an identity failure.
+    ///
+    /// A transaction can fail for reasons the service also has a code for - a stale revision, an
+    /// evicted snapshot, an unknown document - and collapsing those into "invalid request" would
+    /// lose the current handle a caller needs to reconcile.
+    fn from(error: TransactionError) -> Self {
+        match error {
+            TransactionError::Document(document) => Self::Document(document),
+            other => Self::Invalid(other.to_string()),
+        }
     }
 }
 
@@ -211,7 +246,14 @@ pub struct ExportOutcome {
     pub revision: u64,
     /// `algorithm:hex` of the written bytes, so a caller can tell one encoding from another.
     pub checksum: String,
+    /// Size of the written file, in bytes.
     pub bytes: usize,
+    /// Gaussians the exported revision holds.
+    ///
+    /// Reported separately from [`ExportOutcome::bytes`] on purpose: a sidecar describes geometry,
+    /// and confusing a file size for a gaussian count silently makes every saved record
+    /// unloadable.
+    pub point_count: usize,
 }
 
 /// Application state: the one authoritative document store this process owns, plus the one
@@ -416,6 +458,7 @@ impl AppState {
             revision: metadata.handle.revision,
             checksum: format!("{}:{}", checksum.algorithm, checksum.hex()),
             bytes: checksum.bytes,
+            point_count: snapshot.len(),
         })
     }
 
@@ -833,6 +876,67 @@ impl AppState {
         side: SideEffect,
     ) -> bool {
         self.transactions.note_side_effect(handle, slot, side)
+    }
+
+    /// Exports the displayed revision **and** writes its authoring sidecar, from one place.
+    ///
+    /// This is what the native Save action calls, so the two files are always produced from the
+    /// same snapshot: the record's gaussian count, checksum and membership all come from the
+    /// revision that was actually written. Taking those as arguments - as an earlier version did -
+    /// is how a file *size* ended up recorded where a point count belonged.
+    ///
+    /// A sidecar is written only when the revision has components; a plain export keeps its
+    /// documented "geometry only" guarantee. A failure to write the sidecar is reported but does
+    /// not undo the export.
+    pub fn export_with_authoring(
+        &self,
+        path: &Path,
+    ) -> Result<(ExportOutcome, Option<SidecarOutcome>), ServiceError> {
+        let outcome = self.export(Expected::Any, path)?;
+        let handle =
+            handle_of(&outcome.document_id, outcome.revision).map_err(ServiceError::Invalid)?;
+        let (_, layer) = self
+            .transactions
+            .authoring_layer(Expected::Handle(handle))
+            .map_err(ServiceError::from)?;
+        if layer.components().is_empty() {
+            return Ok((outcome, None));
+        }
+        let record = crate::authoring::record(
+            &outcome.document_id,
+            outcome.revision,
+            &outcome.checksum,
+            // The exported revision's own gaussian count, never the file size.
+            outcome.point_count,
+            &layer,
+        );
+        let sidecar = match crate::authoring::write(path, &record) {
+            Ok(path) => SidecarOutcome {
+                path: path.to_string_lossy().to_string(),
+                components: record.components.len(),
+                members: record
+                    .components
+                    .iter()
+                    .map(|component| component.point_rows.len())
+                    .sum(),
+                point_count: record.point_count,
+                error: None,
+            },
+            Err(error) => SidecarOutcome {
+                path: crate::authoring::sidecar_path(path)
+                    .to_string_lossy()
+                    .to_string(),
+                components: record.components.len(),
+                members: record
+                    .components
+                    .iter()
+                    .map(|component| component.point_rows.len())
+                    .sum(),
+                point_count: record.point_count,
+                error: Some(error),
+            },
+        };
+        Ok((outcome, Some(sidecar)))
     }
 
     /// Writes a revision to `path` and records the export against its receipt.
@@ -1736,6 +1840,85 @@ mod tests {
             2,
             "a replayed commit does not commit again"
         );
+    }
+
+    #[test]
+    fn save_records_the_exported_revisions_gaussian_count_and_can_be_reopened() {
+        // This is the Save path the window uses, not a hand-built record: the point count, the
+        // checksum and the membership all come from the revision that was written.
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-save-count-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("scene.ply");
+
+        let state = scene_state();
+        let created = state.create_component(Expected::Any, "hair").unwrap();
+        let component = splatmcp_core::ComponentId::parse(&created.component_id).unwrap();
+        state
+            .set_component_members(
+                Expected::Any,
+                &component,
+                &splatmcp_core::SelectionQuery {
+                    first: Some(2),
+                    ..splatmcp_core::SelectionQuery::all()
+                },
+            )
+            .unwrap();
+
+        let (export, sidecar) = state.export_with_authoring(&path).unwrap();
+        assert_eq!(export.point_count, 4, "four gaussians were exported");
+        assert_ne!(
+            export.point_count, export.bytes,
+            "a file size is not a gaussian count"
+        );
+        let sidecar = sidecar.expect("a revision with components writes one");
+        assert!(sidecar.written(), "{sidecar:?}");
+        assert_eq!(sidecar.point_count, export.point_count);
+        assert_eq!(sidecar.components, 1);
+        assert_eq!(sidecar.members, 2);
+
+        // The record on disk agrees, and describes these bytes.
+        let record = crate::authoring::read(&path).unwrap().unwrap();
+        assert_eq!(record.point_count, 4);
+        assert_eq!(record.artifact, export.checksum);
+        assert_eq!(record.components[0].point_rows, vec![0, 1]);
+
+        // Reopening the file the Save action wrote restores the components: the count a record
+        // carries is the one a reopen validates against, so getting it wrong here would make
+        // every native save unloadable.
+        let bytes = std::fs::read(&path).unwrap();
+        let fresh = AppState::default();
+        let imported = fresh
+            .open_ply(
+                &bytes,
+                Mutation::open(path.to_string_lossy().to_string()),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap();
+        let note = crate::bridge::restore_note(&fresh, &path, &imported, &bytes)
+            .expect("a matching sidecar attaches");
+        assert_eq!(note.status, "restored", "{note:?}");
+        assert_eq!(note.components, 1);
+        assert_eq!(note.members, 2);
+        assert_eq!(
+            fresh.components(Expected::Any).unwrap().components[0].point_count,
+            2
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_revision_without_components_writes_no_sidecar() {
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-save-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("plain.ply");
+        let state = scene_state();
+        let (export, sidecar) = state.export_with_authoring(&path).unwrap();
+        assert_eq!(export.point_count, 4);
+        assert!(sidecar.is_none(), "a plain export stays geometry only");
+        assert!(crate::authoring::read(&path).unwrap().is_none());
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

@@ -252,10 +252,15 @@ pub fn write_splat_file(path: &str, bytes: &[u8]) -> Result<PathBuf, String> {
 /// a file means. With a `target` the load is an explicit replacement of that document at that
 /// revision, which is how an edit keeps the identity it edited - and how a stale edit is
 /// refused instead of overwriting newer work.
+///
+/// `source_path` is the file the bytes were read from, when they came from one. It travels
+/// separately from `file_name` because it is what lets the app find the component metadata that
+/// sits beside that file: a display name is a label, not a location.
 pub fn display_splat(
     link: &AppLink,
     file_name: &str,
     bytes: &[u8],
+    source_path: Option<&Path>,
     target: Option<&DocumentIdentity>,
 ) -> Result<ViewerStatus, String> {
     let encoded = BASE64.encode(bytes);
@@ -263,7 +268,11 @@ pub fn display_splat(
         Some(target) => {
             replace_ply_params(encoded, &target.document_id, target.revision, Some(false))
         }
-        None => load_ply_params(encoded, Some(file_name.to_owned())),
+        None => load_ply_params(
+            encoded,
+            Some(file_name.to_owned()),
+            source_path.map(|path| path.to_string_lossy().to_string()),
+        ),
     };
     link.request_typed(Method::ViewerLoadPly, params)
 }
@@ -278,7 +287,14 @@ pub fn splat_reply(
     let document = status
         .and_then(|status| status.document.as_ref())
         .and_then(|summary| DocumentIdentity::of_summary(Some(summary)));
-    SplatReply::new(splat, path, displayed).with_document(document)
+    // What happened to the component metadata beside the loaded file: a restore, or the reason
+    // nothing was attached. Carried through, because a warning nobody can read is not a warning.
+    let authoring = status
+        .and_then(|status| status.document.as_ref())
+        .and_then(|summary| summary.authoring.clone());
+    SplatReply::new(splat, path, displayed)
+        .with_document(document)
+        .with_authoring(authoring)
 }
 
 #[cfg(test)]
@@ -299,6 +315,72 @@ mod tests {
         header.push_str("0 0 0 0 0 0 0 -8 -8 -8 0 0 0 0\n");
         header.push_str("1 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
         header.into_bytes()
+    }
+
+    #[test]
+    fn a_load_request_names_the_file_it_read_and_the_display_label() {
+        // The reviewer's finding: reducing a path to its basename left the app unable to find the
+        // sidecar beside the file, because a name is not a location.
+        let params = load_ply_params(
+            "AAAA",
+            Some("scene.ply".to_owned()),
+            Some(r"F:\_splat\scene.ply".to_owned()),
+        );
+        assert_eq!(params["file_name"], "scene.ply");
+        assert_eq!(params["source_path"], r"F:\_splat\scene.ply");
+        assert_eq!(params["document_id"], serde_json::Value::Null);
+
+        // A load that has no file behind it says so rather than inventing a location.
+        let inline = load_ply_params("AAAA", Some("generated.ply".to_owned()), None);
+        assert_eq!(inline["file_name"], "generated.ply");
+        assert!(inline["source_path"].is_null());
+    }
+
+    #[test]
+    fn a_reply_carries_what_happened_to_the_metadata_beside_the_file() {
+        let splat = build_splat(&CreateInput::default()).unwrap();
+        let mut status = ViewerStatus {
+            viewer_ready: true,
+            loaded: true,
+            point_count: splat.len(),
+            canvas_width: 100,
+            canvas_height: 100,
+            camera: None,
+            document: Some(splatmcp_bridge::DocumentSummary {
+                document_id: "doc-1-1".to_owned(),
+                revision: 1,
+                point_count: splat.len(),
+                file_name: "scene.ply".to_owned(),
+                authoring: Some(splatmcp_bridge::AuthoringNote {
+                    status: "restored".to_owned(),
+                    message: "restored 3 components (ids re-minted)".to_owned(),
+                    components: 3,
+                    members: 6,
+                }),
+                ..splatmcp_bridge::DocumentSummary::default()
+            }),
+            import: None,
+        };
+        let reply = splat_reply(&splat, None, true, Some(&status));
+        let note = reply
+            .authoring
+            .as_ref()
+            .expect("the note travels with the reply");
+        assert_eq!(note.components, 3);
+        let encoded = serde_json::to_string(&reply).unwrap();
+        assert!(encoded.contains("ids re-minted"), "{encoded}");
+
+        // A load with nothing to report says nothing, rather than claiming a restore.
+        status.document = Some(splatmcp_bridge::DocumentSummary {
+            document_id: "doc-1-1".to_owned(),
+            revision: 1,
+            point_count: splat.len(),
+            file_name: "scene.ply".to_owned(),
+            ..splatmcp_bridge::DocumentSummary::default()
+        });
+        let quiet = splat_reply(&splat, None, true, Some(&status));
+        assert!(quiet.authoring.is_none());
+        assert!(!serde_json::to_string(&quiet).unwrap().contains("authoring"));
     }
 
     #[test]

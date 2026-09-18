@@ -45,8 +45,7 @@ impl AssetHost {
     pub fn new(budgets: AssetBudgets) -> Self {
         Self {
             registry: Arc::new(AssetRegistry::with_session(
-                splatmcp_core::document::now_ms()
-                    ^ (std::process::id() as u64).rotate_left(19),
+                splatmcp_core::document::now_ms() ^ (std::process::id() as u64).rotate_left(19),
                 budgets,
             )),
         }
@@ -84,11 +83,10 @@ impl AssetHost {
             .map_err(|error| format!("invalid asset.register request: {error}"))?;
         let kind = kind_of(&request.kind)?;
         let info = match (&request.path, &request.bytes_base64) {
-            (Some(path), None) => self.registry.register_file_with(
-                kind,
-                std::path::Path::new(path),
-                request.checksum,
-            ),
+            (Some(path), None) => {
+                self.registry
+                    .register_file_with(kind, std::path::Path::new(path), request.checksum)
+            }
             (None, Some(encoded)) => {
                 let bytes = BASE64
                     .decode(encoded.as_bytes())
@@ -107,13 +105,18 @@ impl AssetHost {
                 );
             }
             (None, None) => {
-                return Err("give path (a local file) or bytes_base64 (a small inline payload)".to_owned());
+                return Err(
+                    "give path (a local file) or bytes_base64 (a small inline payload)".to_owned(),
+                );
             }
         }
         .map_err(describe_asset_error)?;
         let stats = self.stats()?;
-        serde_json::to_value(AssetRegisterReply { asset: AssetSummary::from(&info), stats })
-            .map_err(|error| error.to_string())
+        serde_json::to_value(AssetRegisterReply {
+            asset: AssetSummary::from(&info),
+            stats,
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// One asset's bounded description, or every live asset.
@@ -126,8 +129,8 @@ impl AssetHost {
         };
         let reply = match request.asset_id {
             Some(text) => {
-                let id = AssetId::parse(&text)
-                    .ok_or_else(|| format!("'{text}' is not an asset id"))?;
+                let id =
+                    AssetId::parse(&text).ok_or_else(|| format!("'{text}' is not an asset id"))?;
                 let info = self.registry.info(&id).map_err(describe_asset_error)?;
                 AssetInfoReply {
                     asset: Some(AssetSummary::from(&info)),
@@ -245,7 +248,8 @@ impl AssetHost {
     /// Returns the handle as well, so the caller holds the snapshot while it works: an
     /// eviction or a release in the meantime cannot change what it is reading.
     pub fn resolve(&self, asset_id: &str) -> Result<splatmcp_core::AssetHandle, String> {
-        let id = AssetId::parse(asset_id).ok_or_else(|| format!("'{asset_id}' is not an asset id"))?;
+        let id =
+            AssetId::parse(asset_id).ok_or_else(|| format!("'{asset_id}' is not an asset id"))?;
         self.registry.resolve(&id).map_err(describe_asset_error)
     }
 
@@ -255,8 +259,7 @@ impl AssetHost {
         asset_id: &str,
     ) -> Result<splatmcp_core::asset::GaussianAsset, String> {
         let handle = self.resolve(asset_id)?;
-        splatmcp_core::asset::decode_points(&handle, &self.budgets())
-            .map_err(describe_asset_error)
+        splatmcp_core::asset::decode_points(&handle, &self.budgets()).map_err(describe_asset_error)
     }
 
     /// Plans a typed binary attribute patch, or explains what is wrong with it.
@@ -271,13 +274,13 @@ impl AssetHost {
         let attribute = PatchAttribute::parse(&params.attribute)
             .ok_or_else(|| patch_message(&params.attribute))?;
         let dtype = match &params.dtype {
-            Some(text) => PatchDtype::parse(text)
-                .ok_or_else(|| format!("unknown dtype '{text}'; use f32, f64, i32, i16, u16 or u8"))?,
+            Some(text) => PatchDtype::parse(text).ok_or_else(|| {
+                format!("unknown dtype '{text}'; use f32, f64, i32, i16, u16 or u8")
+            })?,
             None => PatchDtype::F32,
         };
         let shape = match &params.shape {
-            Some(shape) => PatchShape::parse(shape)
-                .map_err(|error| error.to_string())?,
+            Some(shape) => PatchShape::parse(shape).map_err(|error| error.to_string())?,
             None => PatchShape::of(attribute),
         };
         let shape = match rows {
@@ -289,7 +292,9 @@ impl AssetHost {
         };
         let layout = match &params.layout {
             Some(text) => PatchLayout::parse(text).ok_or_else(|| {
-                format!("unknown layout '{text}'; only 'scalar' (tightly packed scalars) is defined")
+                format!(
+                    "unknown layout '{text}'; only 'scalar' (tightly packed scalars) is defined"
+                )
             })?,
             None => PatchLayout::Scalar,
         };
@@ -373,7 +378,10 @@ pub fn asset_register(
 
 /// Tauri command: one asset's description, or every live asset.
 #[tauri::command]
-pub fn asset_info(host: tauri::State<'_, AssetHostState>, request: Option<Value>) -> Result<Value, String> {
+pub fn asset_info(
+    host: tauri::State<'_, AssetHostState>,
+    request: Option<Value>,
+) -> Result<Value, String> {
     host.0
         .handle(Method::AssetInfo, request.unwrap_or(Value::Null))
         .unwrap()
@@ -631,7 +639,8 @@ mod tests {
             "kind": "ply"
         }))
         .unwrap();
-        let reply: AssetInfoReply = serde_json::from_value(host.info(Value::Null).unwrap()).unwrap();
+        let reply: AssetInfoReply =
+            serde_json::from_value(host.info(Value::Null).unwrap()).unwrap();
         assert_eq!(reply.assets.len(), 1);
         assert_eq!(reply.stats.assets, 1);
         assert!(reply.stats.budgets.contains("expanded_points<="));

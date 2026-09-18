@@ -682,12 +682,15 @@ impl From<&splatmcp_core::PublicationStatus> for PublicationStatusReply {
             displayed_revision: status.displayed_revision,
             is_current: status.is_current(),
             display_lagging: status.display_lagging,
-            pending: status.pending.as_ref().map(|request| PublicationRequestSummary {
-                revision: request.revision,
-                token: request.token,
-                source: request.source.as_str().to_owned(),
-                frame: request.frame,
-            }),
+            pending: status
+                .pending
+                .as_ref()
+                .map(|request| PublicationRequestSummary {
+                    revision: request.revision,
+                    token: request.token,
+                    source: request.source.as_str().to_owned(),
+                    frame: request.frame,
+                }),
             last: status
                 .last
                 .as_ref()
@@ -743,6 +746,14 @@ pub struct LoadPlyRequest {
     pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+    /// Absolute path the bytes were read from, when they came from a file.
+    ///
+    /// Separate from `file_name` on purpose: a name is a label for the document, and a path is
+    /// where its neighbours are. Component metadata lives *beside the file*, so a load that keeps
+    /// only the basename cannot find it - and a basename is not enough to look for it, because
+    /// the file need not be in the app's working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     /// Re-frame the camera on the new splat; defaults to true in the viewer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<bool>,
@@ -1946,11 +1957,16 @@ pub fn camera_param(value: Option<CameraRequest>) -> Value {
 }
 
 /// Builds the params for `viewer.load_ply` from already encoded bytes, as a new document.
-pub fn load_ply_params(ply_base64: impl Into<String>, file_name: Option<String>) -> Value {
+pub fn load_ply_params(
+    ply_base64: impl Into<String>,
+    file_name: Option<String>,
+    source_path: Option<String>,
+) -> Value {
     json!(LoadPlyRequest {
         ply_base64: ply_base64.into(),
         asset_id: None,
         file_name,
+        source_path,
         frame: Some(true),
         document_id: None,
         expected_revision: None,
@@ -1971,6 +1987,7 @@ pub fn asset_load_params(
         ply_base64: String::new(),
         asset_id: Some(asset_id.into()),
         file_name,
+        source_path: None,
         frame,
         document_id: None,
         expected_revision: None,
@@ -1992,6 +2009,7 @@ pub fn replace_ply_params(
         ply_base64: ply_base64.into(),
         asset_id: None,
         file_name: None,
+        source_path: None,
         frame,
         document_id: Some(document_id.into()),
         expected_revision: Some(expected_revision),

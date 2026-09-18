@@ -100,10 +100,9 @@ impl SubmitReply {
 pub fn run(link: &AppLink, input: &JobInput) -> Result<Value, String> {
     match input.action {
         JobAction::Submit => {
-            let operation = input
-                .operation
-                .clone()
-                .ok_or_else(|| "action submit needs operation: import, export or inspect".to_owned())?;
+            let operation = input.operation.clone().ok_or_else(|| {
+                "action submit needs operation: import, export or inspect".to_owned()
+            })?;
             let request = JobSubmitRequest {
                 operation: operation.clone(),
                 asset_id: input.asset_id.clone(),

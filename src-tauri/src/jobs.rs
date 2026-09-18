@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use splatmcp_core::{
-    AssetHandle, AssetKind, DocumentHandle, Expected, JobAdmission, JobBody, JobCounts,
-    JobError, JobFailure, JobId, JobKind, JobLimits, JobPhase, JobReceipt, JobRequest,
-    JobResult, JobService, JobState, JobView, LogLevel, Mutation, PlyImportPolicy, SideEffectState,
+    AssetHandle, AssetKind, DocumentHandle, Expected, JobAdmission, JobBody, JobCounts, JobError,
+    JobFailure, JobId, JobKind, JobLimits, JobPhase, JobReceipt, JobRequest, JobResult, JobService,
+    JobState, JobView, LogLevel, Mutation, PlyImportPolicy, SideEffectState,
 };
 use tauri::{AppHandle, Manager};
 
@@ -62,7 +62,12 @@ impl JobHost {
         self.service.submit(request, body)
     }
 
-    pub fn view(&self, job_id: &JobId, log_after: u64, log_limit: usize) -> Result<JobView, JobError> {
+    pub fn view(
+        &self,
+        job_id: &JobId,
+        log_after: u64,
+        log_limit: usize,
+    ) -> Result<JobView, JobError> {
         self.service.view(job_id, log_after, log_limit)
     }
 
@@ -110,7 +115,11 @@ impl ImportJob {
         Box::new(move |context| {
             context.log(
                 LogLevel::Info,
-                format!("importing {} ({} bytes)", asset.source(), asset.bytes().len()),
+                format!(
+                    "importing {} ({} bytes)",
+                    asset.source(),
+                    asset.bytes().len()
+                ),
             );
             context.progress(JobPhase::Reading, 0, Some(asset.bytes().len() as u64), None);
             let _ = context.check()?;
@@ -158,7 +167,12 @@ impl ImportJob {
                 context.log(LogLevel::Warning, imported.report.summary());
             }
             if display {
-                context.progress(JobPhase::Publishing, 1, Some(1), Some("announcing".to_owned()));
+                context.progress(
+                    JobPhase::Publishing,
+                    1,
+                    Some(1),
+                    Some("announcing".to_owned()),
+                );
                 let announced = app
                     .state::<crate::bridge::ViewerState>()
                     .0
@@ -303,7 +317,10 @@ impl JobHost {
             expected,
             PlyImportPolicy::Strict,
             true,
-        );        self.service.submit(request, body).map_err(|e| e.to_string())
+        );
+        self.service
+            .submit(request, body)
+            .map_err(|e| e.to_string())
     }
 
     /// Submits an export of one revision to `path`.
@@ -322,7 +339,9 @@ impl JobHost {
             None => request,
         };
         let body = ExportJob::body(app.clone(), expected, path);
-        self.service.submit(request, body).map_err(|e| e.to_string())
+        self.service
+            .submit(request, body)
+            .map_err(|e| e.to_string())
     }
 
     /// Submits a read-only inspection of one revision.
@@ -332,14 +351,16 @@ impl JobHost {
         expected: Expected,
         operation_id: Option<String>,
     ) -> Result<JobAdmission, String> {
-        let request = JobRequest::new(JobKind::Inspect, "inspect_document")
-            .with_target(expected.describe());
+        let request =
+            JobRequest::new(JobKind::Inspect, "inspect_document").with_target(expected.describe());
         let request = match operation_id {
             Some(operation_id) => request.with_operation_id(operation_id),
             None => request,
         };
         let body = InspectJob::body(app.clone(), expected);
-        self.service.submit(request, body).map_err(|e| e.to_string())
+        self.service
+            .submit(request, body)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -446,10 +467,7 @@ pub fn admission_json(admission: &JobAdmission) -> Value {
 
 /// Tauri command: submit an import of a registered PLY asset.
 #[tauri::command]
-pub fn job_import(
-    app: AppHandle,
-    request: Value,
-) -> Result<Value, String> {
+pub fn job_import(app: AppHandle, request: Value) -> Result<Value, String> {
     let assets = app.state::<crate::assets::AssetHostState>().0.clone();
     let jobs = app.state::<JobHostState>().0.clone();
     let asset_id = request
@@ -522,7 +540,10 @@ pub fn job_status(host: tauri::State<'_, JobHostState>, request: Value) -> Resul
         .and_then(Value::as_str)
         .ok_or_else(|| "job_status needs job_id".to_owned())
         .and_then(parse_job_id)?;
-    let log_after = request.get("log_after").and_then(Value::as_u64).unwrap_or(0);
+    let log_after = request
+        .get("log_after")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let log_limit = request
         .get("log_limit")
         .and_then(Value::as_u64)
@@ -538,12 +559,7 @@ pub fn job_status(host: tauri::State<'_, JobHostState>, request: Value) -> Resul
 #[tauri::command]
 pub fn job_list(host: tauri::State<'_, JobHostState>, limit: Option<usize>) -> Value {
     let limit = limit.unwrap_or(10).min(64);
-    let jobs: Vec<Value> = host
-        .0
-        .recent(limit)
-        .iter()
-        .map(receipt_json)
-        .collect();
+    let jobs: Vec<Value> = host.0.recent(limit).iter().map(receipt_json).collect();
     json!({ "jobs": jobs, "stats": stats_json(&host.0) })
 }
 
@@ -566,7 +582,11 @@ pub fn job_stats(host: tauri::State<'_, JobHostState>) -> Value {
 /// Tauri command: wait for a job for a bounded time, so the window can offer a "wait" button
 /// without holding its own thread open forever.
 #[tauri::command]
-pub fn job_wait(host: tauri::State<'_, JobHostState>, job_id: String, timeout_ms: Option<u64>) -> Result<Value, String> {
+pub fn job_wait(
+    host: tauri::State<'_, JobHostState>,
+    job_id: String,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
     let job_id = parse_job_id(&job_id)?;
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(2000).min(30_000));
     match host.0.service().wait(&job_id, timeout) {
@@ -642,7 +662,11 @@ mod tests {
     #[test]
     fn a_job_id_must_be_a_job_id() {
         assert!(parse_job_id("job-4f2a-1").is_ok());
-        assert!(parse_job_id("asset-4f2a-1").unwrap_err().contains("not a job id"));
+        assert!(
+            parse_job_id("asset-4f2a-1")
+                .unwrap_err()
+                .contains("not a job id")
+        );
         assert!(parse_job_id("job-1").is_err());
     }
 
@@ -728,6 +752,11 @@ mod tests {
         let encoded = stats_json(&host);
         assert_eq!(encoded["queued"], 0);
         assert!(encoded["limits"].as_str().unwrap().contains("queued<=3"));
-        assert!(encoded["memory_note"].as_str().unwrap().contains("not hard-limited"));
+        assert!(
+            encoded["memory_note"]
+                .as_str()
+                .unwrap()
+                .contains("not hard-limited")
+        );
     }
 }

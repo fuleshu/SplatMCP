@@ -6,6 +6,8 @@
 // emits only a revision identity, the panel fetches exactly those bytes as binary data and
 // acknowledges the render - so a committed revision is never reported as displayed.
 
+import { PublicationOrder } from "./publication-order.js";
+
 /** Event the app emits when a revision should be displayed. */
 export const REVISION_EVENT = "splat://revision";
 /** Poll interval while a job is active. */
@@ -51,6 +53,9 @@ export class PythonPanel {
     // The revision currently being loaded, so an acknowledgement cannot be attributed to
     // the wrong job when two commits arrive close together.
     this.pendingRevision = null;
+    // Which publication is newest and which is on screen: a slow fetch for an older revision
+    // must not replace a newer picture, and arrival order is not evidence.
+    this.order = new PublicationOrder();
   }
 
   /** Wires the controls and subscribes to revision publications. */
@@ -232,11 +237,33 @@ export class PythonPanel {
     }
     this.pendingRevision = payload.revision;
     const token = typeof payload.token === "number" ? payload.token : null;
+    if (this.order.stale(token)) {
+      // A newer publication already won; this one is history.
+      return;
+    }
+    this.order.observe(token);
+    // The newest publication this panel knows about, so it can put it back on screen if a
+    // superseded load manages to replace it.
+    this.latest = {
+      documentId: payload.document_id,
+      revision: payload.revision,
+      token,
+      fileName: payload.file_name || "generated.ply",
+      frame: payload.frame !== false,
+      pointCount: payload.point_count,
+    };
     let bytes;
     try {
       bytes = await this.fetchRevision(payload.document_id, payload.revision);
     } catch (error) {
+      if (this.order.stale(token)) {
+        return;
+      }
       await this.failDisplay(payload.revision, error?.message || String(error));
+      return;
+    }
+    if (this.order.stale(token)) {
+      // Overtaken while fetching: showing these bytes would put an older revision on screen.
       return;
     }
     let displayed = null;
@@ -262,6 +289,19 @@ export class PythonPanel {
       this.pendingRevision = null;
       return;
     }
+    if (this.order.stale(token)) {
+      // The swap landed after a newer publication won: only a viewer without the ordering rule
+      // can do that. Say so, and put the newest revision back rather than leaving an older one
+      // on screen in silence.
+      this.pendingRevision = null;
+      this.setStatus(
+        `revision ${payload.revision} finished loading after revision ${this.order.newest} ` +
+          "and was replaced again",
+      );
+      await this.redisplayNewest();
+      return;
+    }
+    this.order.markDisplayed(token);
     await this.invoke("python_note_rendered", {
       revision: payload.revision,
       documentId: payload.document_id,
@@ -272,6 +312,53 @@ export class PythonPanel {
       `${payload.file_name || "generated.ply"} - ${payload.point_count} gaussians ` +
         `(revision ${payload.revision})`,
     );
+  }
+
+  /**
+   * Puts the newest known publication back on screen.
+   *
+   * Only reachable when a superseded load replaced newer geometry, which needs a viewer without
+   * the ordering rule; one attempt is made, and a failure to re-display is reported.
+   */
+  async redisplayNewest() {
+    const latest = this.latest;
+    if (!latest) {
+      return;
+    }
+    try {
+      const bytes = await this.fetchRevision(latest.documentId, latest.revision);
+      const instance = await this.viewer();
+      const displayed = await instance.publish({
+        fileBytes: bytes,
+        fileName: latest.fileName,
+        frame: latest.frame,
+        request: {
+          documentId: latest.documentId,
+          revision: latest.revision,
+          token: latest.token,
+        },
+      });
+      if (!displayed) {
+        return;
+      }
+      // A revision is reported as rendered once.
+      const alreadyRecorded = this.order.displayed === latest.token;
+      this.order.markDisplayed(latest.token);
+      if (!alreadyRecorded) {
+        await this.invoke("python_note_rendered", {
+          revision: latest.revision,
+          documentId: latest.documentId,
+          token: latest.token,
+        });
+      }
+      this.setStatus(
+        `${latest.fileName} - ${latest.pointCount} gaussians (revision ${latest.revision})`,
+      );
+    } catch (error) {
+      this.setStatus(
+        `revision ${latest.revision} could not be restored on screen: ${error?.message || error}`,
+      );
+    }
   }
 
   /**

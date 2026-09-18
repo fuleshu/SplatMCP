@@ -492,7 +492,11 @@ pub fn asset_step_params(
 ) -> Result<Option<BatchOpParams>, String> {
     match (&input.op, &input.asset_id, &input.patch) {
         (EditOpKind::Merge, Some(asset_id), None) => {
-            if input.points.as_ref().is_some_and(|points| !points.is_empty()) {
+            if input
+                .points
+                .as_ref()
+                .is_some_and(|points| !points.is_empty())
+            {
                 return Err(format!(
                     "step {index} (merge): give asset_id or points, not both"
                 ));
@@ -956,7 +960,8 @@ pub fn display_asset(
 
 /// The policy only applies to a file source: the displayed document is served by the app as
 /// bytes this crate wrote, which already satisfy the contract.
-pub fn resolve_source(    link: &AppLink,
+pub fn resolve_source(
+    link: &AppLink,
     source: Option<&str>,
     policy: PlyImportPolicy,
 ) -> Result<ResolvedSource, String> {
@@ -1148,7 +1153,7 @@ pub fn save_and_display(
             Some(target) => {
                 replace_ply_params(encoded, &target.document_id, target.revision, Some(false))
             }
-            None => load_ply_params(encoded, Some(file_name)),
+            None => load_ply_params(encoded, Some(file_name), None),
         };
         // Editing keeps the current camera, so the caller's view is not thrown away.
         let status: ViewerStatus = link.request_typed(Method::ViewerLoadPly, params)?;

@@ -11,6 +11,8 @@
 //! - it re-reads the revision the app published instead of trusting local state, so an edit
 //!   made by an MCP client shows up here too.
 
+import { PublicationOrder } from "./publication-order.js";
+
 export const EDIT_REVISION_EVENT = "splat://edit-revision";
 /** Event the app emits when a selection is resolved, including one made over MCP. */
 export const SELECTION_EVENT = "splat://selection";
@@ -58,10 +60,11 @@ export class ComponentsPanel {
     this.selected = null;
     this.lastSelection = null;
     this.unlisten = null;
-    // The newest revision this panel has been asked to display. A slower load for an older
-    // revision must never replace a newer view, so every load carries the token it started with.
+    // Which publication is newest, and which one is on screen. A slower load for an older
+    // revision must never replace a newer view, and arrival order is not evidence, so the app's
+    // own publication tokens decide.
+    this.order = new PublicationOrder();
     this.wantedRevision = 0;
-    this.loadToken = 0;
     // The selection handle currently highlighted in the viewport, and the revision it was
     // resolved against: a highlight belongs to one revision, so a newer one clears it rather
     // than leaving markers where nothing is selected any more.
@@ -399,12 +402,36 @@ export class ComponentsPanel {
     // A publication from an older app build carries no token: the viewer still displays it, but
     // it reports the display without a request identity, which the app records as such.
     const token = typeof payload.token === "number" ? payload.token : null;
+    if (this.order.stale(token)) {
+      // A newer publication is already in flight or on screen: this one is history.
+      return;
+    }
+    this.order.observe(token);
+    // The newest publication this panel knows about, so it can put it back on screen if a
+    // superseded load manages to replace it.
+    this.latest = {
+      documentId,
+      revision: payload.revision,
+      token,
+      fileName: payload.file_name || "edit.ply",
+      frame: payload.frame === true,
+      pointCount: payload.point_count,
+    };
     this.wantedRevision = payload.revision;
     let bytes;
     try {
       bytes = await this.fetchRevision(documentId, payload.revision);
     } catch (error) {
+      // A late failure for a superseded publication is not this revision's failure to report.
+      if (this.order.stale(token)) {
+        return;
+      }
       await this.failDisplay(documentId, payload.revision, error);
+      return;
+    }
+    if (this.order.stale(token)) {
+      // Overtaken while fetching: displaying these bytes would show an older revision than the
+      // app has already published.
       return;
     }
     let displayed = null;
@@ -427,6 +454,18 @@ export class ComponentsPanel {
       // Superseded before the swap: report nothing, because nothing changed on screen.
       return;
     }
+    if (this.order.stale(token)) {
+      // A newer publication arrived while this one was staged, and the swap landed anyway: that
+      // can only happen with a viewer old enough to lack the ordering rule. Say what happened and
+      // put the newest revision back, rather than leaving an older one displayed in silence.
+      this.setStatus(
+        `revision ${payload.revision} finished loading after revision ${this.order.newest} ` +
+          "and was replaced again",
+      );
+      await this.redisplayNewest();
+      return;
+    }
+    this.order.markDisplayed(token);
     if (this.highlightHandle && this.highlightRevision !== payload.revision) {
       // The highlighted gaussians belonged to another revision; their markers would point at
       // geometry that is no longer displayed.
@@ -450,6 +489,56 @@ export class ComponentsPanel {
       `${payload.file_name || "edit.ply"} - ${payload.point_count} gaussians (revision ${payload.revision})`,
     );
     await this.refresh();
+  }
+
+  /**
+   * Puts the newest known publication back on screen.
+   *
+   * Only reachable when a superseded load replaced newer geometry, which needs a viewer without
+   * the ordering rule; one attempt is made, and a failure to re-display is reported instead of
+   * retried forever.
+   */
+  async redisplayNewest() {
+    const latest = this.latest;
+    if (!latest || !this.viewer) {
+      return;
+    }
+    try {
+      const bytes = await this.fetchRevision(latest.documentId, latest.revision);
+      const instance = await this.viewer();
+      const displayed = await instance.publish({
+        fileBytes: bytes,
+        fileName: latest.fileName,
+        frame: latest.frame,
+        request: {
+          documentId: latest.documentId,
+          revision: latest.revision,
+          token: latest.token,
+        },
+      });
+      if (!displayed) {
+        return;
+      }
+      // The app is told a revision is displayed once: re-displaying the newest revision is not
+      // news if it was already acknowledged.
+      const alreadyRecorded = this.order.displayed === latest.token;
+      this.order.markDisplayed(latest.token);
+      if (!alreadyRecorded) {
+        await this.invoke("edit_note_displayed", {
+          documentId: latest.documentId,
+          revision: latest.revision,
+          token: latest.token,
+        });
+      }
+      this.setStatus(
+        `${latest.fileName} - ${latest.pointCount} gaussians (revision ${latest.revision})`,
+      );
+      await this.refresh();
+    } catch (error) {
+      this.setStatus(
+        `revision ${latest.revision} could not be restored on screen: ${error?.message || error}`,
+      );
+    }
   }
 
   /** Fetches one exact revision of one document, as bytes. */

@@ -115,7 +115,16 @@ transforms and degenerate quaternions are refused with `unsupported_transform`, 
 
 **Persistence and reopen.** Component metadata is written to a versioned `<file>.authoring.json`
 sidecar carrying the document id, the revision, the artifact checksum of the PLY it belongs to,
-each component's frame, and its members as *both* identities and the rows they occupy. Opening a
+each component's frame, and its members as *both* identities and the rows they occupy. The record's
+gaussian count is taken from the **exported revision**, never from the file size: both are known to
+the same call, and confusing them makes every saved record unloadable. `AppState::export_with_authoring`
+is the one Save entry point, so the PLY and the record are always produced from the same snapshot.
+
+**Finding the sidecar.** A load carries the *absolute path* it read beside the display name
+(`LoadPlyRequest::source_path`). A basename is a label, not a location: component metadata lives
+beside the file, and the file need not be anywhere near the app's working directory. The path is
+used only to look for the record; the bytes that are loaded are always the ones the caller sent, and
+the association is still verified against their checksum and gaussian count. Opening a
 file always mints a new identity, so the association used on open is the content the record claims
 to describe: the artifact checksum plus the gaussian count. A record that matches is **restored**
 - every component rebuilt with fresh identities at the recorded rows - and a record that does not
@@ -130,6 +139,15 @@ those point ids (a bounded PLY of bright markers, authored in document space) an
 second layer over the document. The sidebar and a tool call therefore describe the same gaussians,
 and a highlight that belongs to another revision is cleared rather than left pointing at geometry
 that is no longer displayed.
+
+**Order is decided by the app's tokens, not by arrival.** A publication carries a monotonic token.
+The viewer refuses to swap in a load whose token is not newer than what it already displays, and
+each panel drops a publication it already knows is superseded before it fetches, before it stages
+and before it acknowledges - so a slow fetch or a slow stage for an older revision can neither
+become the picture nor be reported as displayed, and a late failure of a superseded load is not
+reported against the revision that is on screen. If a load that is already superseded does manage
+to reach a viewer old enough to lack the ordering rule, the panel says so and re-displays the
+newest known publication once, rather than leaving an older revision on screen in silence.
 
 ## Surfaces
 
