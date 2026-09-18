@@ -18,14 +18,14 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use splatmcp_python::arrays::{BatchMetadata, BoundsOut, GaussianBatch};
 use splatmcp_python::executor::{ExecutorConfig, SourceSnapshot};
+use splatmcp_python::executor::{RunnerInfo, ScriptRunner};
 use splatmcp_python::runtime::{Limits, PythonRuntime, RuntimeRoots};
 use splatmcp_python::script::ScriptSnapshot;
 use splatmcp_python::{
     CommitOutcome, CommitRequest, DocumentIdentity, DocumentTarget, GenerationRequest,
-    GenerationService, JobReceipt, JobSummary, JobView, PublishOptions, PythonError,
-    RuntimeReport, ServiceConfig, TargetSpec,
+    GenerationService, JobReceipt, JobSummary, JobView, PublishOptions, PythonError, RuntimeReport,
+    ServiceConfig, TargetSpec,
 };
-use splatmcp_python::executor::{RunnerInfo, ScriptRunner};
 use tauri::{AppHandle, Emitter, Manager};
 
 use splatmcp_core::Mutation;
@@ -92,7 +92,10 @@ impl PythonHost {
                         Arc::new(UnavailableRunner {
                             message: error.to_string(),
                         }),
-                        RuntimeReport::unavailable(error.to_string(), &Limits::of(&config.executor)),
+                        RuntimeReport::unavailable(
+                            error.to_string(),
+                            &Limits::of(&config.executor),
+                        ),
                     )
                 }
             };
@@ -127,9 +130,13 @@ impl PythonHost {
         request.validate().map_err(|error| error.to_string())?;
         let entry_point = request.entry_point();
         let snapshot = match (&request.code, &request.script_path) {
-            (Some(code), None) => {
-                ScriptSnapshot::inline(&request.request_id, code, entry_point, request.params.clone(), request.seed)
-            }
+            (Some(code), None) => ScriptSnapshot::inline(
+                &request.request_id,
+                code,
+                entry_point,
+                request.params.clone(),
+                request.seed,
+            ),
             (None, Some(path)) => ScriptSnapshot::from_file(
                 &request.request_id,
                 std::path::Path::new(path),
@@ -173,11 +180,11 @@ impl PythonHost {
             // always wants, and preserving the camera is the exception an agent asks for.
             frame: request.frame.unwrap_or(true),
             export_path: request.export_path.as_deref().map(PathBuf::from),
-            deadline: request
-                .deadline_seconds
-                .map(std::time::Duration::from_secs),
+            deadline: request.deadline_seconds.map(std::time::Duration::from_secs),
         };
-        self.service.submit(generation).map_err(|error| error.to_string())
+        self.service
+            .submit(generation)
+            .map_err(|error| error.to_string())
     }
 
     /// Status of one job.
@@ -194,7 +201,9 @@ impl PythonHost {
 
     /// Asks a job to stop.
     pub fn cancel(&self, job_id: u64) -> Result<splatmcp_python::CancelView, String> {
-        self.service.cancel(job_id).map_err(|error| error.to_string())
+        self.service
+            .cancel(job_id)
+            .map_err(|error| error.to_string())
     }
 
     /// Records that the viewer rendered a revision.
@@ -211,7 +220,6 @@ impl PythonHost {
     pub fn shutdown(&self) {
         self.service.shutdown();
     }
-
 }
 
 /// Strips a Windows verbatim prefix so a reported path reads like the one a user sees.
@@ -226,7 +234,10 @@ fn readable_path(path: &str) -> String {
 fn bundled_runtime_dir(app: &AppHandle) -> Option<PathBuf> {
     let resources = app.path().resource_dir().ok()?;
     let candidate = resources.join("python-runtime");
-    candidate.join("runtime-manifest.json").is_file().then_some(candidate)
+    candidate
+        .join("runtime-manifest.json")
+        .is_file()
+        .then_some(candidate)
 }
 
 /// The document owner: it reads and commits the app's displayed splat.
@@ -335,7 +346,12 @@ impl AppDocumentTarget {
         };
         self.app
             .emit_to(VIEWER_WINDOW, REVISION_EVENT, payload)
-            .map_err(|error| format!("could not tell the viewer about revision {}: {error}", identity.revision))
+            .map_err(|error| {
+                format!(
+                    "could not tell the viewer about revision {}: {error}",
+                    identity.revision
+                )
+            })
     }
 }
 
@@ -410,7 +426,10 @@ impl ScriptRunner for UnavailableRunner {
         }
     }
 
-    fn run(&self, _context: &Arc<splatmcp_python::RunContext>) -> splatmcp_python::Result<GaussianBatch> {
+    fn run(
+        &self,
+        _context: &Arc<splatmcp_python::RunContext>,
+    ) -> splatmcp_python::Result<GaussianBatch> {
         Err(PythonError::RuntimeUnavailable(self.message.clone()))
     }
 }
@@ -432,7 +451,10 @@ pub fn python_submit(
 
 /// Tauri command: read a job, or the job history when `job_id` is zero.
 #[tauri::command]
-pub fn python_job(query: splatmcp_bridge::PythonJobQuery, host: tauri::State<'_, PythonHostState>) -> Result<Value, String> {
+pub fn python_job(
+    query: splatmcp_bridge::PythonJobQuery,
+    host: tauri::State<'_, PythonHostState>,
+) -> Result<Value, String> {
     if query.job_id == 0 {
         let recent = host.0.recent(query.log_limit.unwrap_or(20).min(100));
         return Ok(json!({ "recent": recent }));
@@ -525,8 +547,7 @@ pub fn python_read_script(path: String) -> Result<String, String> {
 /// Tauri command: write the panel's editor content back to a script file.
 #[tauri::command]
 pub fn python_write_script(path: String, text: String) -> Result<String, String> {
-    std::fs::write(&path, text)
-        .map_err(|error| format!("could not write {path}: {error}"))?;
+    std::fs::write(&path, text).map_err(|error| format!("could not write {path}: {error}"))?;
     Ok(path)
 }
 
@@ -546,5 +567,4 @@ mod tests {
         assert!(!info.ready);
         assert!(info.error.unwrap().contains("no interpreter"));
     }
-
 }

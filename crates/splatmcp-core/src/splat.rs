@@ -95,7 +95,8 @@ impl SplatPoint {
         opacity: f32,
         rotation: [f32; 4],
     ) -> std::result::Result<Self, ValidationError> {
-        if let Some(issue) = validation::check_gaussian(index, position, scale, color, opacity, rotation)
+        if let Some(issue) =
+            validation::check_gaussian(index, position, scale, color, opacity, rotation)
         {
             return Err(ValidationError::from_issue(issue));
         }
@@ -111,8 +112,7 @@ impl SplatPoint {
 
     /// PLY `ln(scale)`; PLY stores the log of the radius.
     pub(crate) fn log_scale(&self) -> [f32; 3] {
-        self.scale
-            .map(|value| value.max(f32::MIN_POSITIVE).ln())
+        self.scale.map(|value| value.max(f32::MIN_POSITIVE).ln())
     }
 
     /// Sets the radius from `ln(scale)`.
@@ -244,10 +244,7 @@ impl Splat {
             (min[1] + max[1]) * 0.5,
             (min[2] + max[2]) * 0.5,
         ];
-        let radius = (max[0] - min[0])
-            .max(max[1] - min[1])
-            .max(max[2] - min[2])
-            * 0.5;
+        let radius = (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2]) * 0.5;
         Some(Bounds {
             min,
             max,
@@ -303,7 +300,11 @@ mod tests {
                 .validate()
                 .is_err()
         );
-        assert!(Splat::from_points(vec![point(0.0, 0.1, 0.5)]).validate().is_ok());
+        assert!(
+            Splat::from_points(vec![point(0.0, 0.1, 0.5)])
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -325,7 +326,13 @@ mod tests {
 
     #[test]
     fn clamps_into_representable_ranges() {
-        let point = SplatPoint::new([0.0; 3], [-1.0, 2.0, 1.0], [2.0, -3.0, 0.5], 9.0, [1.0, 0.0, 0.0, 0.0]);
+        let point = SplatPoint::new(
+            [0.0; 3],
+            [-1.0, 2.0, 1.0],
+            [2.0, -3.0, 0.5],
+            9.0,
+            [1.0, 0.0, 0.0, 0.0],
+        );
         assert_eq!(point.scale[0], 0.0);
         assert_eq!(point.color[0], 1.0);
         assert_eq!(point.color[1], 0.0);
@@ -340,12 +347,25 @@ mod tests {
         assert_eq!(repaired.opacity, 1.0);
         assert_eq!(repaired.rotation, [1.0, 0.0, 0.0, 0.0]);
 
-        let error = SplatPoint::try_new([0.0; 3], [0.0, 0.1, 0.1], [0.5; 3], 0.5, [1.0, 0.0, 0.0, 0.0])
-            .unwrap_err()
-            .to_string();
+        let error = SplatPoint::try_new(
+            [0.0; 3],
+            [0.0, 0.1, 0.1],
+            [0.5; 3],
+            0.5,
+            [1.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("positive radius"), "{error}");
         assert!(
-            SplatPoint::try_new([0.0; 3], [0.1; 3], [2.0, 0.0, 0.0], 0.5, [1.0, 0.0, 0.0, 0.0]).is_err()
+            SplatPoint::try_new(
+                [0.0; 3],
+                [0.1; 3],
+                [2.0, 0.0, 0.0],
+                0.5,
+                [1.0, 0.0, 0.0, 0.0]
+            )
+            .is_err()
         );
         assert!(
             SplatPoint::try_new([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0; 4]).is_err(),
@@ -353,11 +373,13 @@ mod tests {
         );
 
         // A usable quaternion is stored normalised, and the index shows up in the message.
-        let point = SplatPoint::try_new([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0, 4.0, 0.0, 0.0]).unwrap();
+        let point =
+            SplatPoint::try_new([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0, 4.0, 0.0, 0.0]).unwrap();
         assert_eq!(point.rotation, [0.0, 1.0, 0.0, 0.0]);
-        let indexed = SplatPoint::try_new_at(5, [0.0; 3], [0.1; 3], [0.5; 3], 2.0, [1.0, 0.0, 0.0, 0.0])
-            .unwrap_err()
-            .to_string();
+        let indexed =
+            SplatPoint::try_new_at(5, [0.0; 3], [0.1; 3], [0.5; 3], 2.0, [1.0, 0.0, 0.0, 0.0])
+                .unwrap_err()
+                .to_string();
         assert!(indexed.contains("point 5"), "{indexed}");
     }
 

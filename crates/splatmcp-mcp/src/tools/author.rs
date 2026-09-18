@@ -10,9 +10,7 @@ use serde::Deserialize;
 use splatmcp_bridge::protocol::ViewerStatus;
 use splatmcp_bridge::{Method, load_ply_params, replace_ply_params};
 use splatmcp_core::validation::{IssueRecorder, ValidationIssue};
-use splatmcp_core::{
-    MAX_POINTS, Shape, Splat, SplatParams, SplatPoint, build, splat_from_points,
-};
+use splatmcp_core::{MAX_POINTS, Shape, Splat, SplatParams, SplatPoint, build, splat_from_points};
 use std::path::{Path, PathBuf};
 
 use crate::bridge::AppLink;
@@ -112,7 +110,9 @@ impl PointInput {
     fn resolved(&self) -> ([f32; 3], [f32; 3], [f32; 3], f32, [f32; 4]) {
         (
             self.position,
-            self.scale.unwrap_or(Factor::All(DEFAULT_POINT_RADIUS)).axes(),
+            self.scale
+                .unwrap_or(Factor::All(DEFAULT_POINT_RADIUS))
+                .axes(),
             self.color.unwrap_or(DEFAULT_POINT_COLOR),
             self.opacity.unwrap_or(DEFAULT_POINT_OPACITY),
             self.rotation.unwrap_or([1.0, 0.0, 0.0, 0.0]),
@@ -127,9 +127,9 @@ impl PointInput {
     /// is normalised, which is the contract's documented policy and loses nothing.
     pub fn checked_point(&self, index: usize) -> Result<SplatPoint, ValidationIssue> {
         let (position, scale, color, opacity, rotation) = self.resolved();
-        if let Some(issue) =
-            splatmcp_core::validation::check_gaussian(index, position, scale, color, opacity, rotation)
-        {
+        if let Some(issue) = splatmcp_core::validation::check_gaussian(
+            index, position, scale, color, opacity, rotation,
+        ) {
             return Err(issue);
         }
         Ok(SplatPoint {
@@ -234,7 +234,10 @@ pub fn write_splat_file(path: &str, bytes: &[u8]) -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     }
@@ -257,7 +260,9 @@ pub fn display_splat(
 ) -> Result<ViewerStatus, String> {
     let encoded = BASE64.encode(bytes);
     let params = match target {
-        Some(target) => replace_ply_params(encoded, &target.document_id, target.revision, Some(false)),
+        Some(target) => {
+            replace_ply_params(encoded, &target.document_id, target.revision, Some(false))
+        }
         None => load_ply_params(encoded, Some(file_name.to_owned())),
     };
     link.request_typed(Method::ViewerLoadPly, params)
@@ -425,7 +430,10 @@ mod tests {
 
         // The reply is flattened into one object and keeps short float forms.
         let encoded = serde_json::to_string(&reply).unwrap();
-        assert!(encoded.starts_with("{\"point_count\":1000,\"center\":["), "{encoded}");
+        assert!(
+            encoded.starts_with("{\"point_count\":1000,\"center\":["),
+            "{encoded}"
+        );
         assert!(encoded.contains("\"displayed\":true"));
         assert!(!encoded.contains("0.8999999"), "{encoded}");
 

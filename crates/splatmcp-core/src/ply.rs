@@ -32,20 +32,8 @@ use crate::{Result, Splat, SplatError, SplatPoint, normalize_quat};
 
 /// Properties required to interpret a Gaussian.
 const REQUIRED: [&str; 14] = [
-    "x",
-    "y",
-    "z",
-    "f_dc_0",
-    "f_dc_1",
-    "f_dc_2",
-    "opacity",
-    "scale_0",
-    "scale_1",
-    "scale_2",
-    "rot_0",
-    "rot_1",
-    "rot_2",
-    "rot_3",
+    "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2",
+    "rot_0", "rot_1", "rot_2", "rot_3",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,8 +285,9 @@ fn parse_header(bytes: &[u8]) -> Result<(Header, usize)> {
                     .elements
                     .last_mut()
                     .ok_or_else(|| format_error("PLY property appears before any element"))?;
-                let first =
-                    fields.next().ok_or_else(|| format_error("PLY property has no type"))?;
+                let first = fields
+                    .next()
+                    .ok_or_else(|| format_error("PLY property has no type"))?;
                 let property = if first == "list" {
                     let value = ScalarType::parse(
                         fields
@@ -503,7 +492,11 @@ pub fn read_ply_with_report(bytes: &[u8]) -> Result<(Splat, PlyReport)> {
         .ok_or_else(|| format_error("PLY has no vertex element"))?;
 
     for name in REQUIRED {
-        if !vertex.properties.iter().any(|property| property.name == name) {
+        if !vertex
+            .properties
+            .iter()
+            .any(|property| property.name == name)
+        {
             return Err(SplatError::Unsupported(format!(
                 "PLY is missing required property {name}"
             )));
@@ -583,9 +576,10 @@ pub fn read_ply_with_report(bytes: &[u8]) -> Result<(Splat, PlyReport)> {
         let total = stride
             .checked_mul(element.count)
             .ok_or_else(|| format_error("PLY vertex data size overflows"))?;
-        if cursor.checked_add(total).ok_or_else(|| {
-            format_error("PLY vertex data size overflows")
-        })? > bytes.len()
+        if cursor
+            .checked_add(total)
+            .ok_or_else(|| format_error("PLY vertex data size overflows"))?
+            > bytes.len()
         {
             return Err(format_error("PLY data is truncated"));
         }
@@ -613,23 +607,8 @@ pub fn read_ply_with_report(bytes: &[u8]) -> Result<(Splat, PlyReport)> {
 
 /// Canonical 3DGS property order written by [`write_ply`].
 const WRITTEN_PROPERTIES: [&str; 17] = [
-    "x",
-    "y",
-    "z",
-    "nx",
-    "ny",
-    "nz",
-    "f_dc_0",
-    "f_dc_1",
-    "f_dc_2",
-    "opacity",
-    "scale_0",
-    "scale_1",
-    "scale_2",
-    "rot_0",
-    "rot_1",
-    "rot_2",
-    "rot_3",
+    "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+    "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
 ];
 
 /// Writes a binary little-endian PLY at SH degree 0 (fixed colour only).
@@ -912,10 +891,18 @@ mod tests {
         assert!(point.color[1] < 0.05, "{:?}", point.color);
         assert_eq!(point.scale, [f32::MIN_POSITIVE; 3]);
         assert_eq!(point.rotation, [1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(report.total_repairs, 5, "one colour, three radii, one rotation");
+        assert_eq!(
+            report.total_repairs, 5,
+            "one colour, three radii, one rotation"
+        );
         assert!(!report.repairs_truncated());
         assert!(report.repairs.iter().any(|repair| repair.field == "scale"));
-        assert!(report.repairs.iter().any(|repair| repair.field == "rotation"));
+        assert!(
+            report
+                .repairs
+                .iter()
+                .any(|repair| repair.field == "rotation")
+        );
         assert!(report.summary().contains("5 value(s) repaired"));
         // The repaired gaussians are still a readable document.
         splat.validate().unwrap();

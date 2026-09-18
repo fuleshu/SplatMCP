@@ -7,16 +7,14 @@
 
 use std::io::BufReader;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::protocol::{
-    BridgeDescriptor, HelloRequest, Method, Request, Response,
-};
+use crate::protocol::{BridgeDescriptor, HelloRequest, Method, Request, Response};
 use crate::wire::{read_message, write_message};
 use crate::{BridgeError, Result};
 
@@ -93,7 +91,11 @@ impl BridgeServer {
     }
 
     /// Serves connections on background threads and returns a handle for shutdown.
-    pub fn serve(self, handler: Arc<dyn Handler>, request_timeout: Duration) -> Result<BridgeService> {
+    pub fn serve(
+        self,
+        handler: Arc<dyn Handler>,
+        request_timeout: Duration,
+    ) -> Result<BridgeService> {
         let shutdown = self.shutdown.clone();
         let port = self.port;
         let thread = std::thread::Builder::new()

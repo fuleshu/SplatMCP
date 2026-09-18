@@ -201,11 +201,7 @@ impl SplatParams {
         if self.grid == 0 {
             return Err(SplatError::Format("grid must be at least 1".to_owned()));
         }
-        if self
-            .center
-            .iter()
-            .any(|value| !value.is_finite())
-        {
+        if self.center.iter().any(|value| !value.is_finite()) {
             return Err(SplatError::Format(
                 "center must be three finite numbers".to_owned(),
             ));
@@ -247,11 +243,19 @@ impl SplatParams {
                 // uniform and needs exactly three samples.
                 let direction = unit_vector(&mut rng);
                 let radius = size * rng.unit().cbrt();
-                [direction[0] * radius, direction[1] * radius, direction[2] * radius]
+                [
+                    direction[0] * radius,
+                    direction[1] * radius,
+                    direction[2] * radius,
+                ]
             }
             Shape::Shell => {
                 let direction = unit_vector(&mut rng);
-                [direction[0] * size, direction[1] * size, direction[2] * size]
+                [
+                    direction[0] * size,
+                    direction[1] * size,
+                    direction[2] * size,
+                ]
             }
             Shape::Cube => [
                 rng.range(-size, size),
@@ -265,7 +269,11 @@ impl SplatParams {
                 } else {
                     index as f32 / (count - 1) as f32
                 };
-                [rng.range(-size, size) * 0.0 + (t * 2.0 - 1.0) * size, 0.0, 0.0]
+                [
+                    rng.range(-size, size) * 0.0 + (t * 2.0 - 1.0) * size,
+                    0.0,
+                    0.0,
+                ]
             }
             Shape::Ring => {
                 let angle = std::f32::consts::TAU * (index as f32 / count as f32);
@@ -313,9 +321,8 @@ impl SplatParams {
             base
         };
         let color = if self.color_variation > 0.0 {
-            self.color.map(|channel| {
-                (channel + rng.jitter(self.color_variation)).clamp(0.0, 1.0)
-            })
+            self.color
+                .map(|channel| (channel + rng.jitter(self.color_variation)).clamp(0.0, 1.0))
         } else {
             self.color
         };
@@ -410,8 +417,16 @@ mod tests {
         let bounds = splat.bounds().unwrap();
         // Bounds include the gaussian radius and must not exceed it beyond the shape.
         for axis in 0..3 {
-            assert!(bounds.min[axis] >= -2.0 - 0.05 - 1e-3, "axis {axis}: {:?}", bounds.min);
-            assert!(bounds.max[axis] <= 2.0 + 0.05 + 1e-3, "axis {axis}: {:?}", bounds.max);
+            assert!(
+                bounds.min[axis] >= -2.0 - 0.05 - 1e-3,
+                "axis {axis}: {:?}",
+                bounds.min
+            );
+            assert!(
+                bounds.max[axis] <= 2.0 + 0.05 + 1e-3,
+                "axis {axis}: {:?}",
+                bounds.max
+            );
         }
         // A filled ball reaches close to its radius on every axis.
         assert!(bounds.max[0] > 1.5 && bounds.max[1] > 1.5 && bounds.max[2] > 1.5);
@@ -428,10 +443,12 @@ mod tests {
         })
         .unwrap();
         // Every point sits on the surface, so none is near the centre.
-        assert!(splat
-            .points
-            .iter()
-            .all(|point| distance(point.position, [0.0; 3]) > 0.9));
+        assert!(
+            splat
+                .points
+                .iter()
+                .all(|point| distance(point.position, [0.0; 3]) > 0.9)
+        );
     }
 
     #[test]
@@ -531,11 +548,16 @@ mod tests {
             ..SplatParams::default()
         })
         .unwrap();
-        assert!(flat
-            .points
-            .iter()
-            .all(|point| point.rotation == [1.0, 0.0, 0.0, 0.0]));
-        assert!(flat.points.iter().all(|point| point.color == [0.85, 0.25, 0.2]));
+        assert!(
+            flat.points
+                .iter()
+                .all(|point| point.rotation == [1.0, 0.0, 0.0, 0.0])
+        );
+        assert!(
+            flat.points
+                .iter()
+                .all(|point| point.color == [0.85, 0.25, 0.2])
+        );
 
         let varied = build(&SplatParams {
             shape: Shape::Sphere,
@@ -545,16 +567,24 @@ mod tests {
             ..SplatParams::default()
         })
         .unwrap();
-        assert!(varied
-            .points
-            .iter()
-            .any(|point| point.color != [0.85, 0.25, 0.2]));
-        assert!(varied
-            .points
-            .iter()
-            .all(|point| point.color.iter().all(|channel| (0.0..=1.0).contains(channel))));
+        assert!(
+            varied
+                .points
+                .iter()
+                .any(|point| point.color != [0.85, 0.25, 0.2])
+        );
+        assert!(varied.points.iter().all(|point| {
+            point
+                .color
+                .iter()
+                .all(|channel| (0.0..=1.0).contains(channel))
+        }));
         for point in &varied.points {
-            let norm = point.rotation.iter().map(|value| value * value).sum::<f32>();
+            let norm = point
+                .rotation
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>();
             assert!((norm - 1.0).abs() < 1e-4, "rotation not unit: {norm}");
         }
     }
@@ -578,49 +608,65 @@ mod tests {
         let error = build(&too_many).unwrap_err().to_string();
         assert!(error.contains("point limit"), "{error}");
 
-        assert!(build(&SplatParams {
-            count: 0,
-            ..SplatParams::default()
-        })
-        .is_err());
-        assert!(build(&SplatParams {
-            radius: 0.0,
-            ..SplatParams::default()
-        })
-        .unwrap_err()
-        .to_string()
-        .contains("radius"));
-        assert!(build(&SplatParams {
-            size: -1.0,
-            ..SplatParams::default()
-        })
-        .is_err());
-        assert!(build(&SplatParams {
-            opacity: 1.5,
-            ..SplatParams::default()
-        })
-        .is_err());
-        assert!(build(&SplatParams {
-            grid: 0,
-            shape: Shape::Grid,
-            ..SplatParams::default()
-        })
-        .is_err());
-        assert!(build(&SplatParams {
-            jitter: -0.5,
-            ..SplatParams::default()
-        })
-        .is_err());
-        assert!(build(&SplatParams {
-            color_variation: 2.0,
-            ..SplatParams::default()
-        })
-        .is_err());
-        assert!(build(&SplatParams {
-            center: [f32::NAN, 0.0, 0.0],
-            ..SplatParams::default()
-        })
-        .is_err());
+        assert!(
+            build(&SplatParams {
+                count: 0,
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            build(&SplatParams {
+                radius: 0.0,
+                ..SplatParams::default()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("radius")
+        );
+        assert!(
+            build(&SplatParams {
+                size: -1.0,
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            build(&SplatParams {
+                opacity: 1.5,
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            build(&SplatParams {
+                grid: 0,
+                shape: Shape::Grid,
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            build(&SplatParams {
+                jitter: -0.5,
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            build(&SplatParams {
+                color_variation: 2.0,
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            build(&SplatParams {
+                center: [f32::NAN, 0.0, 0.0],
+                ..SplatParams::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

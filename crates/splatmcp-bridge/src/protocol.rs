@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{BridgeError, Result};
 
@@ -57,8 +57,9 @@ impl BridgeDescriptor {
             return Ok(None);
         }
         let text = fs::read_to_string(path)?;
-        let descriptor: Self = serde_json::from_str(&text)
-            .map_err(|error| BridgeError::Protocol(format!("{} is not valid: {error}", path.display())))?;
+        let descriptor: Self = serde_json::from_str(&text).map_err(|error| {
+            BridgeError::Protocol(format!("{} is not valid: {error}", path.display()))
+        })?;
         Ok(Some(descriptor))
     }
 
@@ -73,8 +74,9 @@ impl BridgeDescriptor {
             fs::create_dir_all(parent)?;
         }
         let temporary = path.with_extension("json.tmp");
-        let encoded = serde_json::to_string_pretty(self)
-            .map_err(|error| BridgeError::Protocol(format!("could not encode descriptor: {error}")))?;
+        let encoded = serde_json::to_string_pretty(self).map_err(|error| {
+            BridgeError::Protocol(format!("could not encode descriptor: {error}"))
+        })?;
         fs::write(&temporary, encoded)?;
         fs::rename(&temporary, path)?;
         Ok(())
@@ -134,6 +136,18 @@ pub enum Method {
     DocumentReload,
     /// Changes the named component of the displayed document.
     DocumentSetComponent,
+    /// Runs an edit batch as one atomic transaction, or dry-runs it.
+    DocumentEditBatch,
+    /// Commits the candidate a previous dry run retained.
+    DocumentCommitPreview,
+    /// Undo/redo availability and the retained steps of a document.
+    DocumentHistory,
+    /// Undoes the newest step of a document, as a new revision.
+    DocumentUndo,
+    /// Redoes the newest undone step of a document, as a new revision.
+    DocumentRedo,
+    /// Lists, creates, renames, removes or reframes components, and resolves selections.
+    DocumentComponents,
     /// Readiness, versions and limits of the embedded Python runtime.
     PythonRuntimeInfo,
     /// Submit a Python generation job to the app's shared executor.
@@ -232,7 +246,8 @@ impl Response {
             Ok(self.result)
         } else {
             Err(BridgeError::Remote(
-                self.error.unwrap_or_else(|| "no detail provided".to_owned()),
+                self.error
+                    .unwrap_or_else(|| "no detail provided".to_owned()),
             ))
         }
     }
@@ -712,6 +727,297 @@ pub struct DocumentReply {
     pub retention: RetentionSummary,
 }
 
+/// One point to append, in a batch's `merge` operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchPointParams {
+    pub position: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<[f32; 4]>,
+}
+
+/// A selection as it travels over the wire.
+///
+/// One shape serves both a batch step's targets and a standalone selection query, so a caller
+/// learns the composition rules once. `point_ids` are stable identity strings (`pt-7`) and
+/// `frame` is `local` or `world`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SelectionParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside: Option<Vec<f32>>,
+    /// `[cx, cy, cz, radius]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sphere: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_radius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_min: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_max: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub point_ids: Vec<String>,
+    /// Restrict to a saved selection handle resolved by the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_handle: Option<u64>,
+}
+
+/// One operation of an edit batch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchOpParams {
+    /// `translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`,
+    /// `set_opacity`, `duplicate`, `remove` or `merge`.
+    pub op: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrees: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center: Option<[f32; 3]>,
+    /// Per-axis factors; a uniform factor travels as the same value three times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factor: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<BatchPointParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionParams>,
+}
+
+/// Parameters of `document.edit_batch`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EditBatchRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Caller-supplied identity that makes an identical retry safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// `stable` (default) or `sequential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// True to dry-run: nothing is committed and a preview handle comes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// True to show the committed revision in the viewer. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
+    pub steps: Vec<BatchOpParams>,
+}
+
+/// Parameters of `document.commit_preview`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CommitPreviewRequest {
+    pub preview_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
+}
+
+/// Parameters of the document history and undo/redo methods.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTargetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
+}
+
+/// Parameters of `document.components`: one action plus its arguments.
+///
+/// Actions: `list`, `create`, `rename`, `remove`, `transform`, `members`, `apply_transform` and
+/// `select`. One method with an action keeps the surface small instead of a tool per scalar.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ComponentsRequest {
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `transform` action: the explicit frame to declare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<[f32; 3]>,
+    /// `transform` action: clear the frame instead of setting one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_transform: Option<bool>,
+    /// `members` and `select` actions: what to resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionParams>,
+    /// `members` action: transform those members through the frame straight afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_transform: Option<bool>,
+}
+
+/// One step's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepSummary {
+    pub op_index: usize,
+    pub affected: usize,
+    pub remaining: usize,
+}
+
+/// Axis-aligned bounds of a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BoundsInfo {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub center: [f32; 3],
+    pub radius: f32,
+}
+
+/// Outcome of an optional side effect, never folded into the commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideEffectSummary {
+    /// `not_requested`, `done` or `failed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Dry-run result of an edit batch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviewSummary {
+    pub preview_id: u64,
+    pub source_revision: u64,
+    pub points_before: usize,
+    pub points_after: usize,
+    pub steps: Vec<StepSummary>,
+    pub warnings: Vec<String>,
+    pub memory_estimate_bytes: usize,
+    pub point_ids: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds_before: Option<BoundsInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds_after: Option<BoundsInfo>,
+}
+
+/// Reply of `document.edit_batch` and `document.commit_preview`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditBatchReply {
+    pub document: DocumentSummary,
+    pub retention: RetentionSummary,
+    pub committed: bool,
+    pub replayed: bool,
+    pub point_count: usize,
+    pub steps: Vec<StepSummary>,
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewSummary>,
+    pub undo_available: bool,
+    pub redo_available: bool,
+    pub export: SideEffectSummary,
+    pub display: SideEffectSummary,
+}
+
+/// One undoable step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryStepSummary {
+    pub id: u64,
+    pub label: String,
+    pub revision: u64,
+    pub point_count: usize,
+    pub at_ms: u64,
+}
+
+/// Reply of `document.history`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryReply {
+    pub document: DocumentSummary,
+    pub retention: RetentionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo: Option<HistoryStepSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo: Option<HistoryStepSummary>,
+    pub entries: Vec<HistoryStepSummary>,
+    pub retained_bytes: usize,
+    pub max_bytes: usize,
+}
+
+/// Explicit local frame of a component.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TransformSummary {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+/// One component.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentSummary {
+    pub component_id: String,
+    pub name: String,
+    pub point_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<TransformSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+}
+
+/// A resolved, revision-bound selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectionSummary {
+    pub handle_id: u64,
+    pub revision: u64,
+    pub count: usize,
+    pub sample: Vec<String>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<BoundsInfo>,
+}
+
+/// Reply of `document.components`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentsReply {
+    pub document: DocumentSummary,
+    pub retention: RetentionSummary,
+    pub components: Vec<ComponentSummary>,
+    pub rebuilt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionSummary>,
+    /// Steps of an `apply_transform` action, when it committed geometry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepSummary>,
+}
+
 /// Parameters of the `hello` handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloRequest {
@@ -823,9 +1129,7 @@ impl PythonRunRequest {
             (Some(_), Some(_)) => Err(BridgeError::Protocol(
                 "pass either code or script_path, not both".to_owned(),
             )),
-            (None, None) => Err(BridgeError::Protocol(
-                "pass code or script_path".to_owned(),
-            )),
+            (None, None) => Err(BridgeError::Protocol("pass code or script_path".to_owned())),
             _ => Ok(()),
         }
     }
@@ -974,7 +1278,12 @@ mod tests {
         let camera: CameraRequest = empty.params_as().unwrap();
         assert!(camera.is_empty());
 
-        let broken = Request::new(3, "t", Method::ViewerSetCamera, serde_json::json!({"fov": "wide"}));
+        let broken = Request::new(
+            3,
+            "t",
+            Method::ViewerSetCamera,
+            serde_json::json!({"fov": "wide"}),
+        );
         assert!(broken.params_as::<CameraRequest>().is_err());
     }
 
@@ -1046,7 +1355,10 @@ mod tests {
             "code": "x = 1"
         }))
         .unwrap();
-        assert!(unnamed.validate().is_err(), "a job needs an id to be deduplicated");
+        assert!(
+            unnamed.validate().is_err(),
+            "a job needs an id to be deduplicated"
+        );
     }
 
     #[test]
@@ -1072,7 +1384,10 @@ mod tests {
         assert!(summary.valid);
         assert!(!summary.within_limits, "19 gaussians exceed a limit of 4");
         assert_eq!(summary.point_limit, Some(4));
-        assert_eq!(summary.contract_version, splatmcp_core::contract::CONTRACT_VERSION);
+        assert_eq!(
+            summary.contract_version,
+            splatmcp_core::contract::CONTRACT_VERSION
+        );
 
         let encoded = serde_json::to_string(&summary).unwrap();
         assert!(
@@ -1193,6 +1508,12 @@ mod tests {
             (Method::DocumentInspect, "\"document_inspect\""),
             (Method::DocumentReload, "\"document_reload\""),
             (Method::DocumentSetComponent, "\"document_set_component\""),
+            (Method::DocumentEditBatch, "\"document_edit_batch\""),
+            (Method::DocumentCommitPreview, "\"document_commit_preview\""),
+            (Method::DocumentHistory, "\"document_history\""),
+            (Method::DocumentUndo, "\"document_undo\""),
+            (Method::DocumentRedo, "\"document_redo\""),
+            (Method::DocumentComponents, "\"document_components\""),
         ] {
             assert_eq!(serde_json::to_string(&method).unwrap(), name);
             assert!(!method.needs_viewer(), "{name} is served by the app");

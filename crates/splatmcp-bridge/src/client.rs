@@ -37,9 +37,10 @@ impl BridgeClient {
     /// directory when `None` is passed.
     pub fn connect_default(timeout: Duration) -> Result<Self> {
         let path = crate::paths::bridge_descriptor_path()?;
-        let descriptor = BridgeDescriptor::read(&path)?.ok_or_else(|| BridgeError::AppNotRunning {
-            path: path.to_string_lossy().to_string(),
-        })?;
+        let descriptor =
+            BridgeDescriptor::read(&path)?.ok_or_else(|| BridgeError::AppNotRunning {
+                path: path.to_string_lossy().to_string(),
+            })?;
         Self::connect(&descriptor, timeout)
     }
 
@@ -51,11 +52,9 @@ impl BridgeClient {
                 expected: crate::protocol::PROTOCOL_VERSION,
             });
         }
-        let stream = TcpStream::connect_timeout(
-            &(Ipv4Addr::LOCALHOST, descriptor.port).into(),
-            timeout,
-        )
-        .map_err(|error| BridgeError::from_io(error, timeout))?;
+        let stream =
+            TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, descriptor.port).into(), timeout)
+                .map_err(|error| BridgeError::from_io(error, timeout))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -95,9 +94,11 @@ impl BridgeClient {
         let request = Request::new(id, self.token.clone(), method, params);
         write_message(&mut self.stream, &request)?;
 
-        let response: Option<Response> =
-            read_message(&mut BufReader::new(&mut self.stream)).map_err(|error| match error {
-                BridgeError::Io(io) if io.kind() == ErrorKind::WouldBlock || io.kind() == ErrorKind::TimedOut => {
+        let response: Option<Response> = read_message(&mut BufReader::new(&mut self.stream))
+            .map_err(|error| match error {
+                BridgeError::Io(io)
+                    if io.kind() == ErrorKind::WouldBlock || io.kind() == ErrorKind::TimedOut =>
+                {
                     BridgeError::Timeout {
                         timeout_ms: self.timeout.as_millis() as u64,
                     }
@@ -130,9 +131,12 @@ impl BridgeClient {
         method: Method,
         params: &P,
     ) -> Result<T> {
-        let value = self.call(method, serde_json::to_value(params).map_err(|error| {
-            BridgeError::Protocol(format!("could not encode params: {error}"))
-        })?)?;
+        let value = self.call(
+            method,
+            serde_json::to_value(params).map_err(|error| {
+                BridgeError::Protocol(format!("could not encode params: {error}"))
+            })?,
+        )?;
         serde_json::from_value(value)
             .map_err(|error| BridgeError::Protocol(format!("unexpected response shape: {error}")))
     }

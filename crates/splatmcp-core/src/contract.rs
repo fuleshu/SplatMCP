@@ -166,7 +166,11 @@ pub fn from_scipy_quaternion(rotation: [f32; 4]) -> [f32; 4] {
 
 /// Length of a quaternion.
 pub fn quaternion_norm(rotation: [f32; 4]) -> f32 {
-    rotation.iter().map(|value| value * value).sum::<f32>().sqrt()
+    rotation
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt()
 }
 
 /// True when the quaternion is finite and long enough to carry a direction.
@@ -265,7 +269,11 @@ pub fn dominant_axis(scale: [f32; 3], rotation: [f32; 4]) -> Option<[f32; 3]> {
     let mut local = [0.0f32; 3];
     local[longest] = 1.0;
     let direction = rotate_vector(local, unit);
-    let norm = direction.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
     if norm <= 0.0 {
         return None;
     }
@@ -404,7 +412,10 @@ mod tests {
     fn colour_helpers_are_inverse_and_do_not_change_the_model() {
         for linear in [0.0_f32, 0.02, 0.25, 0.5, 1.0] {
             let round_trip = srgb_to_linear(linear_to_srgb(linear));
-            assert!((round_trip - linear).abs() < 1e-4, "{linear} -> {round_trip}");
+            assert!(
+                (round_trip - linear).abs() < 1e-4,
+                "{linear} -> {round_trip}"
+            );
         }
         // Linear 0.5 is sRGB ~0.735: the two spaces are not interchangeable.
         assert!((linear_to_srgb(0.5) - 0.735_36).abs() < 1e-4);
@@ -414,8 +425,14 @@ mod tests {
 
     #[test]
     fn ply_attributes_are_classified_with_a_reason() {
-        assert_eq!(ply_attribute_use("x"), PlyAttributeUse::Interpreted("position"));
-        assert_eq!(ply_attribute_use("rot_3"), PlyAttributeUse::Interpreted("rotation"));
+        assert_eq!(
+            ply_attribute_use("x"),
+            PlyAttributeUse::Interpreted("position")
+        );
+        assert_eq!(
+            ply_attribute_use("rot_3"),
+            PlyAttributeUse::Interpreted("rotation")
+        );
         assert!(matches!(
             ply_attribute_use("f_rest_17"),
             PlyAttributeUse::Discarded(reason) if reason.contains("degree 0")

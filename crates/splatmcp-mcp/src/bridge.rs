@@ -109,8 +109,9 @@ impl AppLink {
 
     /// Connects to a running app, starting one when the descriptor is missing or stale.
     fn attach(&self, timeout: Duration) -> Result<BridgeClient, LinkError> {
-        let path = splatmcp_bridge::bridge_descriptor_path()
-            .map_err(|error| LinkError::Message(format!("could not locate the app data: {error}")))?;
+        let path = splatmcp_bridge::bridge_descriptor_path().map_err(|error| {
+            LinkError::Message(format!("could not locate the app data: {error}"))
+        })?;
 
         if let Some(descriptor) = BridgeDescriptor::read(&path).map_err(LinkError::from)? {
             match BridgeClient::connect(&descriptor, timeout) {
@@ -252,7 +253,8 @@ impl LinkError {
                 error.is_app_missing()
                     || matches!(
                         error,
-                        splatmcp_bridge::BridgeError::Io(_) | splatmcp_bridge::BridgeError::Protocol(_)
+                        splatmcp_bridge::BridgeError::Io(_)
+                            | splatmcp_bridge::BridgeError::Protocol(_)
                     )
             }
             LinkError::Message(_) => false,
@@ -268,38 +270,46 @@ mod tests {
     fn messages_are_written_for_the_caller() {
         use splatmcp_bridge::BridgeError;
         let link = AppLink::new(false);
-        assert!(link
-            .explain(&BridgeError::AppNotRunning {
+        assert!(
+            link.explain(&BridgeError::AppNotRunning {
                 path: "C:/x/bridge.json".to_owned()
             })
-            .contains("Start SplatMCP"));
-        assert!(link
-            .explain(&BridgeError::Unauthorized)
-            .contains("retry")
-            || link.explain(&BridgeError::Unauthorized).contains("Retry"));
-        assert!(link
-            .explain(&BridgeError::Timeout { timeout_ms: 15000 })
-            .contains("15000"));
-        assert!(link
-            .explain(&BridgeError::UnsupportedProtocol {
+            .contains("Start SplatMCP")
+        );
+        assert!(
+            link.explain(&BridgeError::Unauthorized).contains("retry")
+                || link.explain(&BridgeError::Unauthorized).contains("Retry")
+        );
+        assert!(
+            link.explain(&BridgeError::Timeout { timeout_ms: 15000 })
+                .contains("15000")
+        );
+        assert!(
+            link.explain(&BridgeError::UnsupportedProtocol {
                 found: 2,
                 expected: 1
             })
-            .contains("same revision"));
-        assert!(link
-            .explain(&BridgeError::Remote("no splat is loaded".to_owned()))
-            .contains("no splat is loaded"));
+            .contains("same revision")
+        );
+        assert!(
+            link.explain(&BridgeError::Remote("no splat is loaded".to_owned()))
+                .contains("no splat is loaded")
+        );
     }
 
     #[test]
     fn a_stale_connection_is_retried_and_a_refusal_is_not() {
         assert!(LinkError::Bridge(splatmcp_bridge::BridgeError::Unauthorized).is_retryable());
-        assert!(LinkError::Bridge(splatmcp_bridge::BridgeError::AppNotRunning {
-            path: "x".to_owned()
-        })
-        .is_retryable());
-        assert!(!LinkError::Bridge(splatmcp_bridge::BridgeError::Remote("nope".to_owned()))
-            .is_retryable());
+        assert!(
+            LinkError::Bridge(splatmcp_bridge::BridgeError::AppNotRunning {
+                path: "x".to_owned()
+            })
+            .is_retryable()
+        );
+        assert!(
+            !LinkError::Bridge(splatmcp_bridge::BridgeError::Remote("nope".to_owned()))
+                .is_retryable()
+        );
         assert!(!LinkError::Message("a validated input error".to_owned()).is_retryable());
     }
 

@@ -24,6 +24,7 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use bridge::AppLink;
+use splatmcp_bridge::Method;
 use tools::{author, edit, python, viewer};
 
 /// Shared state of the MCP service: the link to the desktop app.
@@ -64,7 +65,11 @@ impl SplatMcpServer {
     /// Server status plus whether the desktop app is reachable.
     #[tool(
         description = "Report SplatMCP status: server version and whether the desktop app is attached.",
-        annotations(title = "Server status", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Server status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn splatmcp_status(&self) -> Result<CallToolResult, McpError> {
         let attached = self.link.attached();
@@ -121,14 +126,19 @@ impl SplatMcpServer {
         description = "Create a gaussian splat from a shape (sphere, cube, plane, line, shell, \
                        ring, grid) or explicit points, in fixed RGB colour. Optionally writes a .ply \
                        and shows it in the SplatMCP window. Returns the point count and bounds.",
-        annotations(title = "Create splat", read_only_hint = false, open_world_hint = false)
+        annotations(
+            title = "Create splat",
+            read_only_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_splat(
         &self,
         Parameters(input): Parameters<author::CreateInput>,
     ) -> Result<CallToolResult, McpError> {
         let splat = author::build_splat(&input).map_err(tool_error)?;
-        let bytes = splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
+        let bytes =
+            splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
 
         let path = match input.path.as_deref() {
             Some(path) => Some(author::write_splat_file(path, &bytes).map_err(tool_error)?),
@@ -172,8 +182,8 @@ impl SplatMcpServer {
         &self,
         Parameters(input): Parameters<edit::EditInput>,
     ) -> Result<CallToolResult, McpError> {
-        let resolved = edit::resolve_source(&self.link, input.source.as_deref())
-            .map_err(tool_error)?;
+        let resolved =
+            edit::resolve_source(&self.link, input.source.as_deref()).map_err(tool_error)?;
         let mut splat = resolved.splat;
         // The identity the edit started from: when the source was the displayed document the
         // result replaces exactly that revision, so the edit keeps its identity and a stale
@@ -212,20 +222,117 @@ impl SplatMcpServer {
         Parameters(input): Parameters<edit::LoadInput>,
     ) -> Result<CallToolResult, McpError> {
         let splat = edit::read_splat_file(&input.path).map_err(tool_error)?;
-        let bytes = splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
+        let bytes =
+            splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
         let file_name = std::path::Path::new(&input.path)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("splat.ply")
             .to_owned();
         // Loading a file opens a document: the file is provenance, not identity.
-        let status = author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?;
+        let status =
+            author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?;
         tool_json(&author::splat_reply(
             &splat,
             Some(std::path::Path::new(&input.path)),
             true,
             Some(&status),
         ))
+    }
+
+    /// Applies an edit batch as one atomic, previewable and retry-safe transaction.
+    #[tool(
+        description = "Apply several edit steps as ONE transaction: all of them commit as one new \
+                       revision or nothing changes. dry_run reports a preview without committing; \
+                       commit that candidate later with preview_id (refused if the document moved \
+                       on). operation_id makes a retry after a lost response safe. Undo/redo and \
+                       the history are shared with the window.",
+        annotations(title = "Edit batch", read_only_hint = false, open_world_hint = false)
+    )]
+    async fn edit_batch(
+        &self,
+        Parameters(input): Parameters<edit::EditBatchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match edit::batch_call(&input).map_err(tool_error)? {
+            edit::BatchCall::Batch(request) => {
+                let params = serde_json::to_value(&request)
+                    .map_err(|error| tool_error(error.to_string()))?;
+                let reply = self
+                    .link
+                    .request(Method::DocumentEditBatch, params)
+                    .map_err(tool_error)?;
+                Ok(tool_text(reply))
+            }
+            edit::BatchCall::CommitPreview(request) => {
+                let params = serde_json::to_value(&request)
+                    .map_err(|error| tool_error(error.to_string()))?;
+                let reply = self
+                    .link
+                    .request(Method::DocumentCommitPreview, params)
+                    .map_err(tool_error)?;
+                Ok(tool_text(reply))
+            }
+        }
+    }
+
+    /// Reports, undoes or redoes the newest edit step of the displayed document.
+    #[tool(
+        description = "Edit history of the displayed document: action 'status' reports undo and \
+                       redo availability plus the retained steps, 'undo' restores the previous \
+                       state and 'redo' re-applies it. Each commits a NEW revision and a new edit \
+                       clears the redo stack.",
+        annotations(
+            title = "Edit history",
+            read_only_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn edit_history(
+        &self,
+        Parameters(input): Parameters<edit::HistoryInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = input.action.clone().unwrap_or_else(|| "status".to_owned());
+        let method = match action.as_str() {
+            "status" => Method::DocumentHistory,
+            "undo" => Method::DocumentUndo,
+            "redo" => Method::DocumentRedo,
+            other => {
+                return Err(tool_error(format!(
+                    "unknown action '{other}'; use status, undo or redo"
+                )));
+            }
+        };
+        let params = serde_json::to_value(edit::history_target(&input))
+            .map_err(|error| tool_error(error.to_string()))?;
+        let reply = self.link.request(method, params).map_err(tool_error)?;
+        Ok(tool_text(reply))
+    }
+
+    /// Lists, creates, renames, removes or reframes named components, and resolves selections.
+    #[tool(
+        description = "Named components and stable selections of the displayed document. Actions: \
+                       list, create, rename, remove, transform (declares an explicit local frame; \
+                       anisotropic gaussians are transformed through their covariance and singular \
+                       or reflecting frames are refused), members, apply_transform and select \
+                       (count, bounds and a bounded sample). These ids are the window's ids.",
+        annotations(
+            title = "Splat components",
+            read_only_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn splat_components(
+        &self,
+        Parameters(input): Parameters<edit::ComponentsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let request = edit::components_request(&input).map_err(tool_error)?;
+        let params =
+            serde_json::to_value(&request).map_err(|error| tool_error(error.to_string()))?;
+        let reply = self
+            .link
+            .request(Method::DocumentComponents, params)
+            .map_err(tool_error)?;
+        Ok(tool_text(reply))
     }
 
     /// Describes a splat: count, bounds, colour and opacity.
@@ -254,8 +361,8 @@ impl SplatMcpServer {
                 edit::InspectOutcome::Unavailable => {}
             }
         }
-        let resolved = edit::resolve_source(&self.link, input.source.as_deref())
-            .map_err(tool_error)?;
+        let resolved =
+            edit::resolve_source(&self.link, input.source.as_deref()).map_err(tool_error)?;
         tool_json(&edit::info_reply_with_document(
             &resolved.splat,
             resolved.source,
@@ -268,7 +375,11 @@ impl SplatMcpServer {
     #[tool(
         description = "Report the SplatMCP Python runtime: readiness, interpreter and package \
                        versions, and the budgets jobs are held to.",
-        annotations(title = "Python runtime info", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Python runtime info",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn python_runtime_info(&self) -> Result<CallToolResult, McpError> {
         let info = python::runtime_info(&self.link).map_err(tool_error)?;
@@ -283,7 +394,11 @@ impl SplatMcpServer {
                        display:false to commit without changing what is displayed, and \
                        frame:false to keep the current camera. Scripts are local code execution, \
                        not a sandbox.",
-        annotations(title = "Run Python splat", read_only_hint = false, open_world_hint = true)
+        annotations(
+            title = "Run Python splat",
+            read_only_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn run_python_splat(
         &self,
@@ -299,7 +414,11 @@ impl SplatMcpServer {
                        count, bounds, export, structured error and logs. Pass log_after from the \
                        previous reply for only new lines. A committed job is not proof the viewer \\
                        rendered it: check display.",
-        annotations(title = "Get Python job", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Get Python job",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_python_job(
         &self,
@@ -377,8 +496,9 @@ pub(crate) fn tool_text(value: Value) -> CallToolResult {
 /// Passing a struct instead of a `Value` keeps `f32` fields at their shortest form:
 /// widening through `serde_json::Value` would turn `0.01` into `0.009999999776482582`.
 pub(crate) fn tool_json<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string(value)
-        .map_err(|error| McpError::internal_error(format!("could not encode the reply: {error}"), None))?;
+    let text = serde_json::to_string(value).map_err(|error| {
+        McpError::internal_error(format!("could not encode the reply: {error}"), None)
+    })?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
@@ -426,11 +546,15 @@ mod tests {
     /// A listing is sent to the model with every session, so its size is a real cost. The
     /// budget is per tool rather than absolute, so adding a tool does not need a new magic
     /// number, while a tool that is an order of magnitude larger than its peers - a schema
-    /// that grew a point array, say - still fails the test. The value is set from the
-    /// largest schema the surface actually needs, which is `run_python_splat`: a job has
-    /// genuinely more independent options (source, target, revision, display, export,
-    /// deadline) than a camera request does.
-    const LISTING_BUDGET_BYTES_PER_TOOL: usize = 1600;
+    /// that grew a point array, say - still fails the test.
+    ///
+    /// The value tracks the largest schema the surface actually needs. It was raised from 1600
+    /// to 2100 when `edit_batch` and `splat_components` arrived: a batch carries a *nested* step
+    /// schema (operation plus selection) and the component tool carries a nested selection
+    /// filter, which no amount of flattened wording makes smaller - the measured listing is
+    /// 30 KB for fifteen tools, about 2 KB per tool. Trimming descriptions and field names was
+    /// done first; raising the number is the last resort, not the first.
+    const LISTING_BUDGET_BYTES_PER_TOOL: usize = 2100;
 
     #[test]
     fn the_tool_listing_stays_within_its_context_budget() {
@@ -438,7 +562,11 @@ mod tests {
         let tools = router.list_all();
         let listing = serde_json::to_string(&tools).unwrap();
 
-        assert_eq!(tools.len(), 12, "the surface is expected to hold twelve tools");
+        assert_eq!(
+            tools.len(),
+            15,
+            "the surface is expected to hold fifteen tools"
+        );
         let budget = tools.len() * LISTING_BUDGET_BYTES_PER_TOOL;
         assert!(
             listing.len() <= budget,
@@ -452,15 +580,13 @@ mod tests {
         // cheap to mention in a conversation.
         for tool in &tools {
             assert!(
-                tool.description.as_ref().is_some_and(|text| !text.is_empty()),
+                tool.description
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty()),
                 "{} has no description",
                 tool.name
             );
-            assert!(
-                tool.name.len() <= 24,
-                "{} has a long name",
-                tool.name
-            );
+            assert!(tool.name.len() <= 24, "{} has a long name", tool.name);
             let schema = serde_json::to_string(&tool.input_schema).unwrap();
             assert!(!schema.is_empty(), "{} has no schema", tool.name);
         }

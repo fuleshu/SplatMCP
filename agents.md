@@ -89,7 +89,7 @@ Agents reach for the codebase by grepping it. Adashi is addressable the same way
 Do not treat a grep result as the artifact. Drill into the locator before acting on it; the line is a window around the match, not the stored text.
 
 <!-- adashi:architecture:begin -->
-<!-- adashi:generated revision=95 -->
+<!-- adashi:generated revision=98 -->
 # Architecture (generated)
 Generated from the Adashi design model; do not edit, change the model.
 Top layer: 1 of 1 elements, 0 of 0 relationships. Deeper detail: the adashi_design get_scope and get_bindings operations.

@@ -11,11 +11,13 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use splatmcp_bridge::protocol::ViewerStatus;
-use splatmcp_bridge::{InspectResult, InspectionSummary, Method, load_ply_params, replace_ply_params};
-use splatmcp_core::validation::IssueRecorder;
-use splatmcp_core::{
-    Box3, EditOp, EditStep, Selection, Splat, apply_all, read_ply, write_ply,
+use splatmcp_bridge::{
+    BatchOpParams, BatchPointParams, CommitPreviewRequest, ComponentsRequest,
+    DocumentTargetRequest, EditBatchRequest, InspectResult, InspectionSummary, Method,
+    SelectionParams, load_ply_params, replace_ply_params,
 };
+use splatmcp_core::validation::IssueRecorder;
+use splatmcp_core::{Box3, EditOp, EditStep, Selection, Splat, apply_all, read_ply, write_ply};
 
 use crate::bridge::AppLink;
 use crate::tools::{Factor, PointOut, SplatSummary, round3};
@@ -119,6 +121,373 @@ pub struct EditOpInput {
     /// Act only on the first N points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first: Option<usize>,
+    /// Minimum mean colour per channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_min: Option<[f32; 3]>,
+    /// Maximum mean colour per channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_max: Option<[f32; 3]>,
+    /// Component whose members are targeted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// Exact point ids (`pt-7`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_ids: Option<Vec<String>>,
+    /// Saved selection handle id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_handle: Option<u64>,
+    /// `world` (default) or `local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+    /// `[cx, cy, cz, radius]` sphere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sphere: Option<[f32; 4]>,
+}
+
+/// A selection filter for `splat_components`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
+pub struct SelectionInput {
+    /// Box to keep points inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<Vec<f32>>,
+    /// Box to keep points outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside: Option<Vec<f32>>,
+    /// `[cx, cy, cz, radius]` sphere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sphere: Option<[f32; 4]>,
+    /// `world` (default) or `local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+    /// Minimum opacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity_min: Option<f32>,
+    /// Maximum largest radius.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_radius: Option<f32>,
+    /// Keep the first N rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<usize>,
+    /// Minimum mean colour per channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_min: Option<[f32; 3]>,
+    /// Maximum mean colour per channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_max: Option<[f32; 3]>,
+    /// Component whose members are targeted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// Exact point ids (`pt-7`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub point_ids: Vec<String>,
+    /// Saved selection handle id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_handle: Option<u64>,
+}
+
+/// Parameters of `edit_batch`: one atomic, previewable edit transaction.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
+pub struct EditBatchInput {
+    /// Steps applied in order by one transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<EditOpInput>>,
+    /// Commit this dry run's candidate instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_id: Option<u64>,
+    /// Report a dry run and commit nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// Retry-safe request identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// `stable` (default) or `sequential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Document to edit; default displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    /// Required with `document_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Show the result. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
+}
+
+/// Parameters of `edit_history`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
+pub struct HistoryInput {
+    /// `status` (default), `undo` or `redo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Document to act on; default displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    /// Required with `document_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Show the result. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
+}
+
+/// Parameters of `splat_components`: one component or selection action.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
+pub struct ComponentsInput {
+    /// `list` (default), `create`, `rename`, `remove`, `transform`, `members`,
+    /// `apply_transform` or `select`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Document to act on; default displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    /// Required with `document_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Target component id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    /// Display name; names are not identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Frame translation, in metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<[f32; 3]>,
+    /// Frame rotation `(w, x, y, z)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<[f32; 4]>,
+    /// Frame scale, positive per axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<[f32; 3]>,
+    /// Clear the frame instead of setting one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_transform: Option<bool>,
+    /// What `members` or `select` resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionInput>,
+    /// Transform members through the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_transform: Option<bool>,
+}
+
+/// Which app call a batch input maps to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchCall {
+    /// Run (or dry-run) a batch.
+    Batch(EditBatchRequest),
+    /// Commit a retained preview candidate.
+    CommitPreview(CommitPreviewRequest),
+}
+
+/// The selection a step targets, or `None` when it targets everything.
+fn selection_params(input: &EditOpInput) -> Result<Option<SelectionParams>, String> {
+    let present = input.within.is_some()
+        || input.outside.is_some()
+        || input.sphere.is_some()
+        || input.frame.is_some()
+        || input.opacity_min.is_some()
+        || input.max_radius.is_some()
+        || input.first.is_some()
+        || input.color_min.is_some()
+        || input.color_max.is_some()
+        || input.component.is_some()
+        || input.point_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        || input.selection_handle.is_some();
+    if !present {
+        return Ok(None);
+    }
+    // The box shapes are checked here as well as in the app, so a malformed request is refused
+    // before it costs a round trip.
+    if let Some(values) = &input.within {
+        parse_box(values, "within")?;
+    }
+    if let Some(values) = &input.outside {
+        parse_box(values, "outside")?;
+    }
+    Ok(Some(SelectionParams {
+        within: input.within.clone(),
+        outside: input.outside.clone(),
+        sphere: input.sphere,
+        frame: input.frame.clone(),
+        opacity_min: input.opacity_min,
+        max_radius: input.max_radius,
+        first: input.first,
+        color_min: input.color_min,
+        color_max: input.color_max,
+        component: input.component.clone(),
+        point_ids: input.point_ids.clone().unwrap_or_default(),
+        selection_handle: input.selection_handle,
+    }))
+}
+
+/// Projects a validated core operation onto the wire shape the app runs.
+fn op_params(op: &EditOp) -> BatchOpParams {
+    let mut params = BatchOpParams {
+        op: String::new(),
+        by: None,
+        axis: None,
+        degrees: None,
+        center: None,
+        factor: None,
+        delta: None,
+        color: None,
+        mix: None,
+        points: Vec::new(),
+        selection: None,
+    };
+    match op {
+        EditOp::Translate { by } => {
+            params.op = "translate".to_owned();
+            params.by = Some(*by);
+        }
+        EditOp::Rotate {
+            axis,
+            degrees,
+            center,
+        } => {
+            params.op = "rotate".to_owned();
+            params.axis = Some(*axis);
+            params.degrees = Some(*degrees);
+            params.center = Some(*center);
+        }
+        EditOp::Scale { center, factor } => {
+            params.op = "scale".to_owned();
+            params.center = Some(*center);
+            params.factor = Some(*factor);
+        }
+        EditOp::SetRadius { factor } => {
+            params.op = "set_radius".to_owned();
+            params.factor = Some([*factor; 3]);
+        }
+        EditOp::AdjustColor { delta } => {
+            params.op = "adjust_color".to_owned();
+            params.delta = Some(*delta);
+        }
+        EditOp::SetColor { color, mix } => {
+            params.op = "set_color".to_owned();
+            params.color = Some(*color);
+            params.mix = Some(*mix);
+        }
+        EditOp::SetOpacity { factor } => {
+            params.op = "set_opacity".to_owned();
+            params.factor = Some([*factor; 3]);
+        }
+        EditOp::Duplicate { by } => {
+            params.op = "duplicate".to_owned();
+            params.by = Some(*by);
+        }
+        EditOp::Remove => params.op = "remove".to_owned(),
+        EditOp::Merge { points } => {
+            params.op = "merge".to_owned();
+            params.points = points
+                .iter()
+                .map(|point| BatchPointParams {
+                    position: point.position,
+                    color: Some(point.color),
+                    opacity: Some(point.opacity),
+                    scale: Some(point.scale),
+                    rotation: Some(point.rotation),
+                })
+                .collect();
+        }
+    }
+    params
+}
+
+/// Translates one tool step into the wire shape, validating it on the way.
+pub fn step_params(input: &EditOpInput, index: usize) -> Result<BatchOpParams, String> {
+    let step = to_step(input, index)?;
+    let mut params = op_params(&step.op);
+    params.selection = selection_params(input)?;
+    Ok(params)
+}
+
+/// Turns the tool input into the app call it describes.
+pub fn batch_call(input: &EditBatchInput) -> Result<BatchCall, String> {
+    if let Some(preview_id) = input.preview_id {
+        if input.steps.as_ref().is_some_and(|steps| !steps.is_empty()) {
+            return Err(
+                "pass either steps or preview_id, not both: committing a preview applies exactly                  the candidate the dry run reported"
+                    .to_owned(),
+            );
+        }
+        return Ok(BatchCall::CommitPreview(CommitPreviewRequest {
+            preview_id,
+            document_id: input.document_id.clone(),
+            expected_revision: input.expected_revision,
+            display: input.display,
+        }));
+    }
+    let steps = input.steps.as_deref().unwrap_or(&[]);
+    if steps.is_empty() {
+        return Err("steps is empty; pass at least one edit step or a preview_id".to_owned());
+    }
+    let steps = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| step_params(step, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BatchCall::Batch(EditBatchRequest {
+        document_id: input.document_id.clone(),
+        expected_revision: input.expected_revision,
+        operation_id: input.operation_id.clone(),
+        resolution: input.resolution.clone(),
+        dry_run: input.dry_run,
+        display: input.display,
+        steps,
+    }))
+}
+
+/// Turns the component tool input into the app request it describes.
+pub fn components_request(input: &ComponentsInput) -> Result<ComponentsRequest, String> {
+    let action = input.action.clone().unwrap_or_else(|| "list".to_owned());
+    let selection = match &input.selection {
+        Some(filter) => {
+            if let Some(values) = &filter.within {
+                parse_box(values, "within")?;
+            }
+            if let Some(values) = &filter.outside {
+                parse_box(values, "outside")?;
+            }
+            Some(SelectionParams {
+                within: filter.within.clone(),
+                outside: filter.outside.clone(),
+                sphere: filter.sphere,
+                frame: filter.frame.clone(),
+                opacity_min: filter.opacity_min,
+                max_radius: filter.max_radius,
+                first: filter.first,
+                color_min: filter.color_min,
+                color_max: filter.color_max,
+                component: filter.component.clone(),
+                point_ids: filter.point_ids.clone(),
+                selection_handle: filter.selection_handle,
+            })
+        }
+        None => None,
+    };
+    Ok(ComponentsRequest {
+        action,
+        document_id: input.document_id.clone(),
+        expected_revision: input.expected_revision,
+        component_id: input.component_id.clone(),
+        name: input.name.clone(),
+        translation: input.translation,
+        rotation: input.rotation,
+        scale: input.scale,
+        clear_transform: input.clear_transform,
+        selection,
+        apply_transform: input.apply_transform,
+    })
+}
+
+/// The target a history call names.
+pub fn history_target(input: &HistoryInput) -> DocumentTargetRequest {
+    DocumentTargetRequest {
+        document_id: input.document_id.clone(),
+        expected_revision: input.expected_revision,
+        display: input.display,
+    }
 }
 
 /// Parameters of `load_splat`.
@@ -219,10 +588,7 @@ fn parse_box(values: &[f32], name: &str) -> Result<Box3, String> {
             [values[0], values[1], values[2]],
             [values[3], values[4], values[5]],
         ),
-        2 => (
-            [values[0], 0.0, 0.0],
-            [values[1], 0.0, 0.0],
-        ),
+        2 => ([values[0], 0.0, 0.0], [values[1], 0.0, 0.0]),
         other => {
             return Err(format!(
                 "{name} needs 6 numbers [min_x, min_y, min_z, max_x, max_y, max_z], got {other}"
@@ -413,7 +779,9 @@ fn document_ply(link: &AppLink) -> Result<(Option<DocumentIdentity>, Vec<u8>), S
     // a reply that names no document is not turned into an invented identity.
     let document = value
         .get("document")
-        .and_then(|document| serde_json::from_value::<splatmcp_bridge::DocumentSummary>(document.clone()).ok())
+        .and_then(|document| {
+            serde_json::from_value::<splatmcp_bridge::DocumentSummary>(document.clone()).ok()
+        })
         .and_then(|summary| DocumentIdentity::of_summary(Some(&summary)));
     Ok((document, bytes))
 }
@@ -646,6 +1014,13 @@ mod tests {
             opacity_min: None,
             max_radius: None,
             first: None,
+            color_min: None,
+            color_max: None,
+            component: None,
+            point_ids: None,
+            selection_handle: None,
+            frame: None,
+            sphere: None,
         }
     }
 
@@ -746,10 +1121,12 @@ mod tests {
         assert_eq!(three.single(), 1.0);
 
         // A scalar factor is what a single-number operation expects, without an array.
-        let op: EditOpInput =
-            serde_json::from_str(r#"{"op":"set_opacity","factor":0.5}"#).unwrap();
+        let op: EditOpInput = serde_json::from_str(r#"{"op":"set_opacity","factor":0.5}"#).unwrap();
         assert_eq!(op.factor, Some(Factor::All(0.5)));
-        assert_eq!(to_step(&op, 0).unwrap().op, EditOp::SetOpacity { factor: 0.5 });
+        assert_eq!(
+            to_step(&op, 0).unwrap().op,
+            EditOp::SetOpacity { factor: 0.5 }
+        );
     }
 
     #[test]
@@ -765,10 +1142,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             six.selection.within,
-            Some(Box3::from_corners(
-                [-1.0, -1.0, -1.0],
-                [1.0, 1.0, 1.0]
-            ))
+            Some(Box3::from_corners([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]))
         );
 
         let two = to_step(
@@ -902,7 +1276,10 @@ mod tests {
         assert!(resolved.splat.is_empty());
         assert_eq!(resolved.source, "new");
         assert_eq!(resolved.path, None);
-        assert!(resolved.document.is_none(), "a new splat has no document identity");
+        assert!(
+            resolved.document.is_none(),
+            "a new splat has no document identity"
+        );
 
         let error = resolve_source(&link, Some("C:/nowhere/missing.ply")).unwrap_err();
         assert!(error.contains("could not read"), "{error}");
@@ -953,7 +1330,10 @@ mod tests {
         // The sample is serialised with short float forms, which matters because a
         // reply can carry many points.
         let encoded = serde_json::to_string(&sample).unwrap();
-        assert!(encoded.starts_with("[{\"position\":[0.0,0.0,0.0]"), "{encoded}");
+        assert!(
+            encoded.starts_with("[{\"position\":[0.0,0.0,0.0]"),
+            "{encoded}"
+        );
         assert!(encoded.contains("\"opacity\":0.8"), "{encoded}");
         assert!(!encoded.contains("0.80000001"), "{encoded}");
 
@@ -987,7 +1367,10 @@ mod tests {
         assert!(encoded.contains("\"steps\":[{\"op_index\":0,\"affected\":3,\"remaining\":3}]"));
         assert!(encoded.contains("\"displayed\":true"));
         assert!(!encoded.contains("0.80000001"), "{encoded}");
-        assert!(!encoded.contains("\"document\""), "no identity is invented: {encoded}");
+        assert!(
+            !encoded.contains("\"document\""),
+            "no identity is invented: {encoded}"
+        );
 
         // With an identity it is reported, so a caller can quote the revision back.
         let named = edit_reply(
@@ -1010,8 +1393,20 @@ mod tests {
     #[test]
     fn the_opacity_range_helper_rounds() {
         let splat = CoreSplat::from_points(vec![
-            SplatPoint::new([0.0; 3], [0.1; 3], [0.5; 3], 0.123_456, [1.0, 0.0, 0.0, 0.0]),
-            SplatPoint::new([1.0, 0.0, 0.0], [0.1; 3], [0.5; 3], 0.987_65, [1.0, 0.0, 0.0, 0.0]),
+            SplatPoint::new(
+                [0.0; 3],
+                [0.1; 3],
+                [0.5; 3],
+                0.123_456,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            SplatPoint::new(
+                [1.0, 0.0, 0.0],
+                [0.1; 3],
+                [0.5; 3],
+                0.987_65,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
         ]);
         assert_eq!(opacity_range(&splat), [0.123, 0.988]);
     }

@@ -9,6 +9,7 @@
 //! used. The MCP server is a separate process spawned by the MCP client; it finds this app
 //! through `bridge.json` in the app data directory; see `docs/design/milestone-4.md`.
 
+mod authoring;
 mod bridge;
 mod document;
 mod paths;
@@ -19,13 +20,51 @@ mod viewer;
 use std::sync::Arc;
 
 use document::AppState;
-use serde_json::Value;
+use serde_json::{Value, json};
 use splatmcp_core::Expected;
 use tauri::ipc::Response;
 use tauri::{Manager, State};
 use viewer::Viewer;
 
+/// Number of bytes an export wrote.
+fn outcome_bytes(outcome: &document::ExportOutcome) -> usize {
+    outcome.bytes
+}
+
+/// Reports authoring metadata that exists next to a just-opened file but does not describe it.
+///
+/// Opening always mints a **new** document identity, so a sidecar written for an earlier session
+/// can never match by accident; when one is present the reason is printed rather than silently
+/// attaching ids that would mean something else.
+fn warn_about_sidecar(path: &std::path::Path, metadata: &document::DocumentMetadata, bytes: &[u8]) {
+    let artifact = document::ArtifactChecksum::of(bytes);
+    let artifact = format!("{}:{}", artifact.algorithm, artifact.hex());
+    match authoring::lookup(
+        path,
+        metadata.handle.document_id.as_str(),
+        metadata.handle.revision,
+        &artifact,
+        metadata.point_count,
+    ) {
+        authoring::SidecarLookup::Absent => {}
+        authoring::SidecarLookup::Attached(_) => {
+            println!(
+                "splatmcp: authoring metadata attached to {}",
+                path.display()
+            );
+        }
+        authoring::SidecarLookup::Refused(reason) => {
+            eprintln!(
+                "splatmcp: ignoring the authoring sidecar of {}: {reason}",
+                path.display()
+            );
+            eprintln!("splatmcp: component metadata is not attached by file name");
+        }
+    }
+}
+
 /// Picks a PLY file, imports it and makes it the displayed document.
+
 ///
 /// Opening always creates a **new** document identity; the path is recorded as provenance.
 /// Returns `None` when the user cancels the dialog.
@@ -39,8 +78,10 @@ fn open_splat(state: State<'_, AppState>) -> Result<Option<document::SplatInfo>,
         return Ok(None);
     };
 
-    let bytes = std::fs::read(&path).map_err(|error| format!("could not read {path:?}: {error}"))?;
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("could not read {path:?}: {error}"))?;
     let metadata = state.open_ply(&bytes, document::open_mutation(&path))?;
+    warn_about_sidecar(&path, &metadata, &bytes);
     Ok(Some(document::SplatInfo::of(&metadata)))
 }
 
@@ -83,6 +124,26 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutco
 
     let outcome = state.export(Expected::Any, &path)?;
 
+    // A PLY carries geometry only: the versioned authoring sidecar records the components, their
+    // membership and their frames against this exact artifact, and a plain export keeps the
+    // documented "geometry only" guarantee. Failing to write either sidecar must not fail a
+    // successful save.
+    if let Ok((handle, components)) = state.authoring_snapshot(Expected::Any)
+        && !components.is_empty()
+    {
+        let record = authoring::record(
+            handle.document_id.as_str(),
+            handle.revision,
+            &outcome.checksum,
+            outcome_bytes(&outcome),
+            &components,
+        );
+        match authoring::write(&path, &record) {
+            Ok(sidecar) => println!("splatmcp: wrote {}", sidecar.display()),
+            Err(error) => eprintln!("splatmcp: could not write the authoring sidecar: {error}"),
+        }
+    }
+
     // A PLY cannot hold recipe or component metadata, so a generated document's provenance is
     // written next to it. Losing it must not fail a successful save.
     if let Some(recipe) = state.recipe()
@@ -96,7 +157,69 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutco
     Ok(Some(outcome))
 }
 
+/// Lists the components of the displayed document, with their stable ids.
+#[tauri::command]
+fn component_list(app: tauri::AppHandle) -> Result<Value, String> {
+    let request = json!({ "action": "list" });
+    bridge::AppBridge::for_commands(&app).document_components(request)
+}
+
+/// Runs a component or selection action: create, rename, remove, transform, members,
+/// apply_transform or select.
+#[tauri::command]
+fn component_action(app: tauri::AppHandle, request: Value) -> Result<Value, String> {
+    bridge::AppBridge::for_commands(&app).document_components(request)
+}
+
+/// Dry-runs an edit batch: nothing is committed and a bounded preview handle comes back.
+#[tauri::command]
+fn edit_preview(app: tauri::AppHandle, request: Value) -> Result<Value, String> {
+    let mut request = request;
+    if let Some(object) = request.as_object_mut() {
+        object.insert("dry_run".to_owned(), Value::Bool(true));
+        object.insert("display".to_owned(), Value::Bool(false));
+    }
+    bridge::AppBridge::for_commands(&app).document_edit_batch(request)
+}
+
+/// PLY bytes of a preview candidate, so the viewer can show it without committing anything.
+#[tauri::command]
+fn preview_splat_bytes(state: State<'_, AppState>, preview_id: u64) -> Result<Response, String> {
+    Ok(Response::new(state.preview_ply_bytes(preview_id)?))
+}
+
+/// Commits the candidate a dry run retained, if it is still the current revision.
+#[tauri::command]
+fn commit_preview(app: tauri::AppHandle, request: Value) -> Result<Value, String> {
+    bridge::AppBridge::for_commands(&app).document_commit_preview(request)
+}
+
+/// Applies an edit batch as one atomic transaction.
+#[tauri::command]
+fn edit_batch(app: tauri::AppHandle, request: Value) -> Result<Value, String> {
+    bridge::AppBridge::for_commands(&app).document_edit_batch(request)
+}
+
+/// Undo/redo availability and the retained steps of the displayed document.
+#[tauri::command]
+fn edit_history(app: tauri::AppHandle, request: Option<Value>) -> Result<Value, String> {
+    bridge::AppBridge::for_commands(&app).document_history(request.unwrap_or(Value::Null))
+}
+
+/// Undoes the newest step as a new revision.
+#[tauri::command]
+fn edit_undo(app: tauri::AppHandle, request: Option<Value>) -> Result<Value, String> {
+    bridge::AppBridge::for_commands(&app).document_undo(request.unwrap_or(Value::Null), true)
+}
+
+/// Redoes the newest undone step as a new revision.
+#[tauri::command]
+fn edit_redo(app: tauri::AppHandle, request: Option<Value>) -> Result<Value, String> {
+    bridge::AppBridge::for_commands(&app).document_undo(request.unwrap_or(Value::Null), false)
+}
+
 /// Answers a bridge request that was forwarded into the webview.
+
 #[tauri::command]
 fn bridge_respond(
     id: u64,
@@ -130,7 +253,16 @@ fn main() {
             python::splat_bytes_for_revision,
             python::document_info,
             python::python_read_script,
-            python::python_write_script
+            python::python_write_script,
+            component_list,
+            component_action,
+            edit_batch,
+            edit_preview,
+            preview_splat_bytes,
+            commit_preview,
+            edit_history,
+            edit_undo,
+            edit_redo
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -160,9 +292,7 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("splatmcp: MCP bridge is unavailable: {error}");
-                    eprintln!(
-                        "splatmcp: set SPLATMCP_DATA_DIR to a writable folder to enable it"
-                    );
+                    eprintln!("splatmcp: set SPLATMCP_DATA_DIR to a writable folder to enable it");
                 }
             }
 

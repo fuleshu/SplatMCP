@@ -15,17 +15,23 @@
 //! - `opacity` is `0..=1` (PLY stores the sigmoid logit)
 //! - `rotation` is a unit quaternion `(w, x, y, z)` (PLY order `rot_0..rot_3`)
 
+mod authoring;
+pub mod components;
 pub mod contract;
 pub mod document;
+mod edit;
 pub mod fixtures;
 pub mod inspection;
-mod authoring;
-mod edit;
 mod ply;
 mod splat;
+pub mod transaction;
 pub mod validation;
 
 pub use authoring::{MAX_POINTS, Rng, Shape, SplatParams, build, splat_from_points};
+pub use components::{
+    AuthoringSet, Component, ComponentId, Frame, ImportSummary, LocalTransform, PointId,
+    SelectionError, SelectionHandle, SelectionHandles, SelectionQuery, Sphere,
+};
 pub use document::{
     ArtifactChecksum, DocumentError, DocumentHandle, DocumentId, DocumentMetadata, DocumentStore,
     Expected, ExportRecord, Mutation, MutationKind, Provenance, RetentionLimits, RetentionStats,
@@ -35,6 +41,12 @@ pub use edit::{Box3, EditOp, EditStep, OpReport, Selection, apply, apply_all};
 pub use inspection::{Distribution, InspectionReport, OwnedBuffers};
 pub use ply::{PlyReport, read_ply, read_ply_with_report, write_ply};
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
+pub use transaction::{
+    BatchStep, BatchStepReport, BatchTargets, ComponentChange, ComponentList, EditBatch,
+    HistoryEntry, HistoryReport, PreviewCommit, PreviewOutcome, PreviewReport, PreviewSnapshot,
+    SideEffect, TargetResolution, TransactionError, TransactionLimits, TransactionReceipt,
+    TransactionService,
+};
 pub use validation::{
     MAX_REPORTED_ISSUES, ValidationError, ValidationIssue, ValidationLimits, ValidationReason,
     ValidationReport,

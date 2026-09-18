@@ -265,9 +265,8 @@ mod tests {
     #[test]
     fn a_summary_can_be_built_from_bounded_metadata() {
         let splat = splatmcp_core::fixtures::axis_fixture();
-        let inspection = InspectionSummary::from(
-            &splat.inspection(splatmcp_core::ValidationLimits::default()),
-        );
+        let inspection =
+            InspectionSummary::from(&splat.inspection(splatmcp_core::ValidationLimits::default()));
         let from_metadata = SplatSummary::of_inspection(&inspection);
         let from_splat = SplatSummary::of(&splat);
         assert_eq!(from_metadata, from_splat);

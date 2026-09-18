@@ -12,7 +12,7 @@
 
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use splatmcp_bridge::{Method, PythonRunRequest};
 
 use crate::bridge::AppLink;
@@ -318,8 +318,7 @@ pub struct JobSummaryReply {
 
 /// Readiness, versions and limits of the app's embedded runtime.
 pub fn runtime_info(link: &AppLink) -> Result<RuntimeInfoReply, String> {
-    let mut reply: RuntimeInfoReply =
-        link.request_typed(Method::PythonRuntimeInfo, Value::Null)?;
+    let mut reply: RuntimeInfoReply = link.request_typed(Method::PythonRuntimeInfo, Value::Null)?;
     if reply.packages.is_empty() {
         reply.packages = Vec::new();
     }

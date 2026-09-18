@@ -249,7 +249,8 @@ impl fmt::Display for ValidationReport {
 
 /// A refusal that carries its structured issues, so every adapter renders it the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationError {    /// Located issues, bounded by [`MAX_REPORTED_ISSUES`].
+pub struct ValidationError {
+    /// Located issues, bounded by [`MAX_REPORTED_ISSUES`].
     pub issues: Vec<ValidationIssue>,
     /// Total issues, including any beyond the bounded list.
     pub total_issues: usize,
@@ -459,10 +460,10 @@ pub fn check_values(
             values_text(&color),
         ));
     }
-    if color
-        .iter()
-        .any(|value| !(-crate::contract::RANGE_TOLERANCE..=1.0 + crate::contract::RANGE_TOLERANCE).contains(value))
-    {
+    if color.iter().any(|value| {
+        !(-crate::contract::RANGE_TOLERANCE..=1.0 + crate::contract::RANGE_TOLERANCE)
+            .contains(value)
+    }) {
         return Some(ValidationIssue::new(
             "color",
             None,
@@ -478,7 +479,9 @@ pub fn check_values(
             format!("{opacity}"),
         ));
     }
-    if !(-crate::contract::RANGE_TOLERANCE..=1.0 + crate::contract::RANGE_TOLERANCE).contains(&opacity) {
+    if !(-crate::contract::RANGE_TOLERANCE..=1.0 + crate::contract::RANGE_TOLERANCE)
+        .contains(&opacity)
+    {
         return Some(ValidationIssue::new(
             "opacity",
             None,
@@ -565,24 +568,59 @@ mod tests {
 
     #[test]
     fn a_correct_gaussian_has_no_issue() {
-        assert!(check_values(
-            [1.0, 2.0, 3.0],
-            [0.1, 0.2, 0.3],
-            [0.25, 0.5, 0.75],
-            0.5,
-            [0.5, 0.5, 0.5, 0.5]
-        )
-        .is_none());
+        assert!(
+            check_values(
+                [1.0, 2.0, 3.0],
+                [0.1, 0.2, 0.3],
+                [0.25, 0.5, 0.75],
+                0.5,
+                [0.5, 0.5, 0.5, 0.5]
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn each_reason_is_reported_once_with_the_offending_field() {
         let cases = [
-            (ValidationReason::NonFiniteValue, check_values([f32::NAN, 0.0, 0.0], [0.1; 3], [0.5; 3], 0.5, IDENTITY_QUATERNION)),
-            (ValidationReason::NonPositiveScale, check_values([0.0; 3], [0.1, 0.0, 0.1], [0.5; 3], 0.5, IDENTITY_QUATERNION)),
-            (ValidationReason::DegenerateQuaternion, check_values([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0; 4])),
-            (ValidationReason::ColorOutOfRange, check_values([0.0; 3], [0.1; 3], [1.4, 0.0, 0.0], 0.5, IDENTITY_QUATERNION)),
-            (ValidationReason::OpacityOutOfRange, check_values([0.0; 3], [0.1; 3], [0.5; 3], 3.0, IDENTITY_QUATERNION)),
+            (
+                ValidationReason::NonFiniteValue,
+                check_values(
+                    [f32::NAN, 0.0, 0.0],
+                    [0.1; 3],
+                    [0.5; 3],
+                    0.5,
+                    IDENTITY_QUATERNION,
+                ),
+            ),
+            (
+                ValidationReason::NonPositiveScale,
+                check_values(
+                    [0.0; 3],
+                    [0.1, 0.0, 0.1],
+                    [0.5; 3],
+                    0.5,
+                    IDENTITY_QUATERNION,
+                ),
+            ),
+            (
+                ValidationReason::DegenerateQuaternion,
+                check_values([0.0; 3], [0.1; 3], [0.5; 3], 0.5, [0.0; 4]),
+            ),
+            (
+                ValidationReason::ColorOutOfRange,
+                check_values(
+                    [0.0; 3],
+                    [0.1; 3],
+                    [1.4, 0.0, 0.0],
+                    0.5,
+                    IDENTITY_QUATERNION,
+                ),
+            ),
+            (
+                ValidationReason::OpacityOutOfRange,
+                check_values([0.0; 3], [0.1; 3], [0.5; 3], 3.0, IDENTITY_QUATERNION),
+            ),
         ];
         for (expected, issue) in cases {
             let issue = issue.expect("a damaged value must be reported");
@@ -622,7 +660,10 @@ mod tests {
         assert_eq!(report.issues.len(), MAX_REPORTED_ISSUES);
         assert!(report.truncated);
         assert!(report.within_limits, "the budget was not exceeded");
-        assert!(!report.is_acceptable(), "validity is not washed out by the budget");
+        assert!(
+            !report.is_acceptable(),
+            "validity is not washed out by the budget"
+        );
         let summary = report.summary();
         assert!(summary.contains("40 of 40 gaussians"), "{summary}");
         assert!(summary.len() < 200, "{summary}");
@@ -664,12 +705,22 @@ mod tests {
         let mut recorder = IssueRecorder::new();
         assert!(recorder.clone().error(3).is_none());
         recorder.record(
-            ValidationIssue::new("scale", None, ValidationReason::NonPositiveScale, "[0, 0, 0]")
-                .at(2),
+            ValidationIssue::new(
+                "scale",
+                None,
+                ValidationReason::NonPositiveScale,
+                "[0, 0, 0]",
+            )
+            .at(2),
         );
         recorder.record(
-            ValidationIssue::new("color", None, ValidationReason::ColorOutOfRange, "[2, 0, 0]")
-                .at(5),
+            ValidationIssue::new(
+                "color",
+                None,
+                ValidationReason::ColorOutOfRange,
+                "[2, 0, 0]",
+            )
+            .at(5),
         );
         assert!(recorder.has_issues());
         let report = recorder.clone().report(6, ValidationLimits::default());
@@ -689,15 +740,34 @@ mod tests {
     #[test]
     fn tolerance_admits_a_rounded_float_but_not_a_wrong_one() {
         // A float round trip may push 1.0 just past the range; 1.05 is a mistake.
-        assert!(check_values([0.0; 3], [0.1; 3], [1.0005, 0.5, 0.5], 0.5, IDENTITY_QUATERNION)
-            .is_none());
-        assert!(check_values([0.0; 3], [0.1; 3], [1.05, 0.5, 0.5], 0.5, IDENTITY_QUATERNION)
-            .is_some());
+        assert!(
+            check_values(
+                [0.0; 3],
+                [0.1; 3],
+                [1.0005, 0.5, 0.5],
+                0.5,
+                IDENTITY_QUATERNION
+            )
+            .is_none()
+        );
+        assert!(
+            check_values(
+                [0.0; 3],
+                [0.1; 3],
+                [1.05, 0.5, 0.5],
+                0.5,
+                IDENTITY_QUATERNION
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn reason_codes_are_stable_for_adapters() {
-        assert_eq!(ValidationReason::NonPositiveScale.code(), "non_positive_scale");
+        assert_eq!(
+            ValidationReason::NonPositiveScale.code(),
+            "non_positive_scale"
+        );
         assert_eq!(ValidationReason::Empty.code(), "empty");
         assert_eq!(
             ValidationReason::DegenerateQuaternion.code(),

@@ -107,6 +107,30 @@
         border-right: 1px solid var(--border);
         overflow-y: auto;
       }
+      .components {
+        list-style: none;
+        margin: 0 0 0.5rem;
+        padding: 0;
+        max-height: 9rem;
+        overflow-y: auto;
+      }
+
+      .components .component {
+        padding: 0.15rem 0.3rem;
+        cursor: pointer;
+        border-radius: 3px;
+        font-size: 0.8rem;
+      }
+
+      .components .component.selected {
+        background: rgba(90, 140, 255, 0.25);
+      }
+
+      .components .component.empty {
+        cursor: default;
+        opacity: 0.6;
+      }
+
       .sidebar h2 {
         margin: 0;
         font-size: 12px;
@@ -211,6 +235,55 @@
       </header>
       <div class="workspace">
         <aside class="sidebar">
+          <h2>Components</h2>
+          <ul id="component-list" class="components"></ul>
+          <p id="component-summary"></p>
+          <div class="field">
+            <label for="component-name">Name</label>
+            <input id="component-name" type="text" placeholder="hair"
+                   title="Display name for a new component, or the new name when renaming. Names are labels, not identities." />
+          </div>
+          <div class="row">
+            <button id="component-create" type="button" title="Create a component with this name.">Create</button>
+            <button id="component-rename" type="button" title="Rename the selected component; its id does not change.">Rename</button>
+            <button id="component-remove" type="button" title="Remove the selected component. Its gaussians stay in the document.">Remove</button>
+          </div>
+          <div class="field">
+            <label for="component-box">Selection box (min x,y,z / max x,y,z)</label>
+            <div class="row" id="component-box">
+              <input id="component-box-min-x" placeholder="min x" title="Selection box minimum x" />
+              <input id="component-box-min-y" placeholder="min y" title="Selection box minimum y" />
+              <input id="component-box-min-z" placeholder="min z" title="Selection box minimum z" />
+              <input id="component-box-max-x" placeholder="max x" title="Selection box maximum x" />
+              <input id="component-box-max-y" placeholder="max y" title="Selection box maximum y" />
+              <input id="component-box-max-z" placeholder="max z" title="Selection box maximum z" />
+            </div>
+          </div>
+          <div class="row">
+            <button id="component-select" type="button" title="Resolve the box (and the selected component) to a revision-bound selection handle; the reply reports count and bounds.">Select</button>
+            <button id="component-bind" type="button" title="Bind the selection to the selected component. No geometry moves.">Bind</button>
+          </div>
+          <div class="field">
+            <label for="component-frame">Local frame (t x,y,z / s x,y,z)</label>
+            <div class="row" id="component-frame">
+              <input id="component-frame-tx" placeholder="t x" title="Frame translation x, in metres" />
+              <input id="component-frame-ty" placeholder="t y" title="Frame translation y, in metres" />
+              <input id="component-frame-tz" placeholder="t z" title="Frame translation z, in metres" />
+              <input id="component-frame-sx" placeholder="s x" title="Frame scale x. Non-uniform scales transform anisotropic gaussians through their covariance." />
+              <input id="component-frame-sy" placeholder="s y" title="Frame scale y" />
+              <input id="component-frame-sz" placeholder="s z" title="Frame scale z" />
+            </div>
+          </div>
+          <div class="row">
+            <button id="component-transform" type="button" title="Declare (or clear) the selected component's explicit local frame.">Set frame</button>
+            <button id="component-apply" type="button" title="Transform the component's members through its frame, as one committed edit.">Apply frame</button>
+          </div>
+          <h2>Edit history</h2>
+          <div class="row">
+            <button id="edit-undo" type="button" title="Undo the newest step as a new revision.">Undo</button>
+            <button id="edit-redo" type="button" title="Redo the newest undone step as a new revision.">Redo</button>
+          </div>
+          <p id="edit-history"></p>
           <h2>Python generation</h2>
           <p id="python-runtime">Checking the Python runtime&hellip;</p>
           <div class="field">

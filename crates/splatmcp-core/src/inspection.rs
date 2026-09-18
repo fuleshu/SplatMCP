@@ -419,9 +419,16 @@ mod tests {
         assert!(!report.all_finite);
         assert_eq!(report.validation.offending_points, 1);
         assert_eq!(report.scale[0].finite_count, 2, "both X radii are finite");
-        assert_eq!(report.scale[1].finite_count, 1, "the NaN radius is left out");
+        assert_eq!(
+            report.scale[1].finite_count, 1,
+            "the NaN radius is left out"
+        );
         assert_eq!(report.largest_radius.max, 0.4);
-        assert_eq!(report.bounds.unwrap().max[0], 0.2, "the NaN position is skipped");
+        assert_eq!(
+            report.bounds.unwrap().max[0],
+            0.2,
+            "the NaN position is skipped"
+        );
     }
 
     #[test]

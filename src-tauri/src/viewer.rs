@@ -7,9 +7,9 @@
 //! of holding the caller forever.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,12 @@ impl Viewer {
     }
 
     /// Emits a request and blocks until the viewer answers or the timeout expires.
-    pub fn request(&self, method: Method, params: Value, timeout: Duration) -> Result<Value, String> {
+    pub fn request(
+        &self,
+        method: Method,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         if self.app.get_webview_window(VIEWER_WINDOW).is_none() {
             return Err(format!(
                 "the {VIEWER_WINDOW} window is not open, so {method:?} cannot be served"
@@ -67,12 +72,11 @@ impl Viewer {
             table.insert(id, sender);
         }
 
-        let payload = BridgeRequestPayload {
-            id,
-            method,
-            params,
-        };
-        if let Err(error) = self.app.emit_to(VIEWER_WINDOW, BRIDGE_REQUEST_EVENT, payload) {
+        let payload = BridgeRequestPayload { id, method, params };
+        if let Err(error) = self
+            .app
+            .emit_to(VIEWER_WINDOW, BRIDGE_REQUEST_EVENT, payload)
+        {
             self.forget(id);
             return Err(format!("could not reach the viewer window: {error}"));
         }

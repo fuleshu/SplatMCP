@@ -21,7 +21,10 @@ pub fn launch() -> Result<(), String> {
     let exe = app_executable().ok_or_else(missing_app_message)?;
     let mut command = Command::new(&exe);
     // The app is a GUI; its window must outlive this call, so nothing is inherited.
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     command
         .spawn()
         .map(|_child| ())
@@ -40,7 +43,11 @@ pub fn app_executable() -> Option<PathBuf> {
     }
 
     if let Ok(Some(descriptor)) = BridgeDescriptor::read_default() {
-        if let Some(exe) = descriptor.exe.map(PathBuf::from).filter(|path| path.is_file()) {
+        if let Some(exe) = descriptor
+            .exe
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+        {
             return Some(exe);
         }
     }

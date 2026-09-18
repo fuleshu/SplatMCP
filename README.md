@@ -67,6 +67,9 @@ those bytes as binary data.
 
 | Tool | What it does |
 | --- | --- |
+| `edit_batch` | apply several edit steps as **one transaction**: all of them commit as a single new revision or nothing changes. `dry_run` reports a preview (affected counts, before/after bounds, memory estimate) without committing; `preview_id` commits that candidate later and is refused if the document moved on. `operation_id` makes a retry after a lost response safe: an identical resend replays the recorded receipt, different content under the same id is refused. Undo/redo and the history are shared with the window |
+| `edit_history` | `status` reports undo/redo availability and the retained steps of the displayed document; `undo` and `redo` commit a **new** revision each, restoring geometry and component membership. A new edit clears the redo stack |
+| `splat_components` | named components and stable selections: `list`, `create`, `rename`, `remove`, `transform` (declares an explicit local frame; anisotropic gaussians are transformed through their covariance, and singular or reflecting frames are refused), `members` (bind a selection to a component), `apply_transform` (transform those members as a committed edit) and `select` (a revision-bound handle with count, bounds and a bounded sample) |
 | `create_splat` | build a splat from a shape (`sphere`, `cube`, `plane`, `line`, `shell`, `ring`, `grid`) or explicit points, optionally write a `.ply`, and show it |
 | `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) to the displayed document, a `.ply`, or a new empty one, each with an optional box/attribute selection; reports the document id and revision the edit landed in |
 | `load_splat` | display an existing `.ply` and frame it |
@@ -306,7 +309,22 @@ Still open:
   through bounded retention with explicit pin/release, and commits every change under a
   compare-and-swap check - so a stale handle fails with `snapshot_expired` and a stale edit
   with `document_conflict` instead of overwriting newer work. Identities are not durable
-  across restarts and edits are not undoable; task #13 owns transactions and undo.
+  across restarts.
+- **Edit transactions are process local.** Edit batches commit atomically through a shared
+  transaction service (`crates/splatmcp-core/src/transaction.rs`): a candidate is built from an
+  exact snapshot, validated, then swapped in once under compare-and-swap, so a failure at any
+  step leaves the document unchanged. Undo/redo commit new revisions from a bounded per-document
+  history (8 steps / 256 MiB, oldest evicted first) and are only offered for revisions the
+  service itself produced. Idempotency receipts are bounded in memory (32 receipts, 15 minutes),
+  so after a restart an old operation id is *unknown*: the tool says so instead of replaying a
+  destructive edit.
+- **Component metadata and point identities are process local too.** `AuthoringSet` holds opaque
+  component ids, stable point ids and membership beside the gaussian buffer. A revision produced
+  outside the transaction service (a file replace, a Python job) rebuilds that layer, which is
+  reported as `rebuilt` so a caller learns why its ids changed. A save writes a versioned
+  `.authoring.json` sidecar next to the PLY carrying document id, revision and the artifact
+  checksum; loading refuses (and warns about) a sidecar whose association does not match exactly,
+  and a plain PLY export keeps its "geometry only" guarantee.
 
 ## License
 

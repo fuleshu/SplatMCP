@@ -40,7 +40,11 @@ fn base_data_dir() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return env::var_os("HOME")
             .filter(|value| !value.is_empty())
-            .map(|home| PathBuf::from(home).join("Library").join("Application Support"));
+            .map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+            });
     }
     env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())

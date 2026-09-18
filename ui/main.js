@@ -2,6 +2,7 @@
 // viewer side of the MCP bridge so tools can move the camera and capture frames.
 
 import { ViewerBridge } from "./bridge.js";
+import { ComponentsPanel } from "./components.js";
 import { PythonPanel } from "./python-panel.js";
 
 const tauri = window.__TAURI__;
@@ -17,6 +18,7 @@ const saveButton = document.getElementById("save-button");
 let viewer = null;
 let viewerBridge = null;
 let pythonPanel = null;
+let componentsPanel = null;
 let hasSplat = false;
 
 function setStatus(message) {
@@ -80,6 +82,19 @@ async function startPythonPanel() {
   await pythonPanel.start();
 }
 
+/** Starts the component and transaction panel; it shares this window's viewer. */
+async function startComponentsPanel() {
+  if (componentsPanel || !invoke || !listen) {
+    return;
+  }
+  componentsPanel = new ComponentsPanel({
+    invoke,
+    viewer: ensureViewer,
+    setStatus,
+  });
+  await componentsPanel.start();
+}
+
 async function openSplat() {
   setBusy(true);
   try {
@@ -133,4 +148,5 @@ if (!invoke) {
   setStatus("Open a .ply file to start, or generate one from a recipe.");
   startBridge().catch((error) => setStatus(`Bridge unavailable: ${error?.message || error}`));
   startPythonPanel().catch((error) => setStatus(`Python panel unavailable: ${error?.message || error}`));
+  startComponentsPanel().catch((error) => setStatus(`Component panel unavailable: ${error?.message || error}`));
 }

@@ -85,9 +85,7 @@ pub fn rotated_fixture() -> Splat {
 ///
 /// `None` for the grey marker and for anything that is not fixture data.
 pub fn labelled_axis(point: &SplatPoint) -> Option<usize> {
-    AXIS_COLORS
-        .iter()
-        .position(|color| point.color == *color)
+    AXIS_COLORS.iter().position(|color| point.color == *color)
 }
 
 /// Index of the document axis a fixture arrow sits on, from its position.
@@ -140,8 +138,12 @@ mod tests {
                 .collect();
             assert_eq!(tips.len(), AXIS_STEPS, "axis {axis} arrow is incomplete");
             assert!(
-                tips.iter()
-                    .all(|point| point.position.iter().filter(|value| **value != 0.0).count() == 1),
+                tips.iter().all(|point| point
+                    .position
+                    .iter()
+                    .filter(|value| **value != 0.0)
+                    .count()
+                    == 1),
                 "an arrow left its axis"
             );
         }

@@ -119,7 +119,12 @@ impl Selection {
             }
         }
         if let Some(max) = self.max_radius {
-            if point.scale.iter().fold(0.0f32, |acc, value| acc.max(*value)) > max {
+            if point
+                .scale
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(*value))
+                > max
+            {
                 return false;
             }
         }
@@ -205,7 +210,9 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
     // `Merge` appends rather than selecting, so it does not go through the selection.
     if let EditOp::Merge { points } = &step.op {
         if points.is_empty() {
-            return Err(SplatError::Format("merge needs at least one point".to_owned()));
+            return Err(SplatError::Format(
+                "merge needs at least one point".to_owned(),
+            ));
         }
         splat.points.extend(points.iter().copied());
         splat.validate()?;
@@ -220,9 +227,38 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
     }
     let affected = indices.len();
 
-    match &step.op {
+    apply_to_indices(splat, &indices, &step.op)?;
+    splat.validate()?;
+    Ok(OpReport::new(affected, splat))
+}
+
+/// Applies one operation to the given point rows, without resolving a selection.
+///
+/// `indices` must be ascending and in range, which is what [`Selection::indices`] produces and
+/// what the transaction runner maintains through stable point identities. Nothing here
+/// validates the splat as a whole, so a batch of steps is validated once, at its end; a single
+/// [`apply`] call adds that validation itself.
+///
+/// `Merge` is *not* handled here: it appends rather than selects, so it never has point rows
+/// to act on. [`apply`] handles it before resolving a selection, and the transaction runner
+/// handles it as an append.
+pub(crate) fn apply_to_indices(splat: &mut Splat, indices: &[usize], op: &EditOp) -> Result<()> {
+    debug_assert!(
+        indices.windows(2).all(|pair| pair[0] < pair[1]),
+        "indices must be ascending and distinct"
+    );
+    debug_assert!(
+        indices.iter().all(|index| *index < splat.len()),
+        "indices must be inside the splat"
+    );
+    match op {
+        EditOp::Merge { .. } => {
+            return Err(SplatError::Format(
+                "merge appends points; it is not applied to a selection".to_owned(),
+            ));
+        }
         EditOp::Translate { by } => {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 for axis in 0..3 {
                     point.position[axis] += by[axis];
@@ -235,7 +271,7 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
             center,
         } => {
             let rotation = rotation_quaternion(*axis, *degrees);
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 let local = [
                     point.position[0] - center[0],
@@ -252,16 +288,17 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
             }
         }
         EditOp::Scale { center, factor } => {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 for axis in 0..3 {
-                    point.position[axis] = center[axis] + (point.position[axis] - center[axis]) * factor[axis];
+                    point.position[axis] =
+                        center[axis] + (point.position[axis] - center[axis]) * factor[axis];
                     point.scale[axis] = (point.scale[axis] * factor[axis]).max(f32::MIN_POSITIVE);
                 }
             }
         }
         EditOp::SetRadius { factor } => {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 point.scale = point
                     .scale
@@ -269,7 +306,7 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
             }
         }
         EditOp::AdjustColor { delta } => {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 point.color = (0..3)
                     .map(|axis| (point.color[axis] + delta[axis]).clamp(0.0, 1.0))
@@ -279,7 +316,7 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
             }
         }
         EditOp::SetColor { color, mix } => {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 for axis in 0..3 {
                     point.color[axis] =
@@ -288,7 +325,7 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
             }
         }
         EditOp::SetOpacity { factor } => {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let point = &mut splat.points[index];
                 point.opacity = (point.opacity * factor).clamp(0.0, 1.0);
             }
@@ -312,11 +349,9 @@ pub fn apply(splat: &mut Splat, step: &EditStep) -> Result<OpReport> {
                 splat.points.remove(*index);
             }
         }
-        EditOp::Merge { .. } => unreachable!("handled above"),
     }
 
-    splat.validate()?;
-    Ok(OpReport::new(affected, splat))
+    Ok(())
 }
 
 /// Applies several steps in order, stopping at the first failure.
@@ -333,18 +368,21 @@ pub fn apply_all(splat: &mut Splat, steps: &[EditStep]) -> Result<Vec<OpReport>>
     Ok(reports)
 }
 
-fn validate_op(op: &EditOp) -> Result<()> {
-    let finite =
-        |values: &[f32], name: &str| -> Result<()> {
-            if values.iter().all(|value| value.is_finite()) {
-                Ok(())
-            } else {
-                Err(SplatError::Format(format!("{name} must be finite numbers")))
-            }
-        };
+pub(crate) fn validate_op(op: &EditOp) -> Result<()> {
+    let finite = |values: &[f32], name: &str| -> Result<()> {
+        if values.iter().all(|value| value.is_finite()) {
+            Ok(())
+        } else {
+            Err(SplatError::Format(format!("{name} must be finite numbers")))
+        }
+    };
     match op {
         EditOp::Translate { by } => finite(by, "translate.by"),
-        EditOp::Rotate { axis, degrees, center } => {
+        EditOp::Rotate {
+            axis,
+            degrees,
+            center,
+        } => {
             let norm = axis.iter().map(|value| value * value).sum::<f32>();
             if !norm.is_finite() || norm < 1e-12 {
                 return Err(SplatError::Format(
@@ -352,7 +390,9 @@ fn validate_op(op: &EditOp) -> Result<()> {
                 ));
             }
             if !degrees.is_finite() {
-                return Err(SplatError::Format("rotate.degrees must be finite".to_owned()));
+                return Err(SplatError::Format(
+                    "rotate.degrees must be finite".to_owned(),
+                ));
             }
             finite(center, "rotate.center")
         }
@@ -407,7 +447,7 @@ fn validate_op(op: &EditOp) -> Result<()> {
     }
 }
 
-fn validate_selection(selection: &Selection) -> Result<()> {
+pub(crate) fn validate_selection(selection: &Selection) -> Result<()> {
     for (name, box3) in [("within", selection.within), ("outside", selection.outside)] {
         if let Some(box3) = box3 {
             if !box3.is_finite() {
@@ -480,8 +520,13 @@ mod tests {
     #[test]
     fn translate_moves_every_point_by_default() {
         let mut splat = grid(3, 1.0);
-        let report = apply(&mut splat, &EditStep::new(EditOp::Translate { by: [0.0, 1.0, 0.0] }))
-            .unwrap();
+        let report = apply(
+            &mut splat,
+            &EditStep::new(EditOp::Translate {
+                by: [0.0, 1.0, 0.0],
+            }),
+        )
+        .unwrap();
         assert_eq!(report.affected, 3);
         assert_eq!(report.remaining, 3);
         assert!(splat.points.iter().all(|point| point.position[1] == 1.0));
@@ -498,7 +543,12 @@ mod tests {
         };
         let report = apply(
             &mut splat,
-            &EditStep::with_selection(EditOp::Translate { by: [0.0, 0.0, 5.0] }, selection),
+            &EditStep::with_selection(
+                EditOp::Translate {
+                    by: [0.0, 0.0, 5.0],
+                },
+                selection,
+            ),
         )
         .unwrap();
         assert_eq!(report.affected, 2);
@@ -531,9 +581,27 @@ mod tests {
     #[test]
     fn colour_and_opacity_filters_select_as_documented() {
         let mut splat = Splat::from_points(vec![
-            SplatPoint::new([0.0; 3], [0.1; 3], [1.0, 0.0, 0.0], 1.0, [1.0, 0.0, 0.0, 0.0]),
-            SplatPoint::new([1.0, 0.0, 0.0], [0.1; 3], [0.0, 1.0, 0.0], 0.2, [1.0, 0.0, 0.0, 0.0]),
-            SplatPoint::new([2.0, 0.0, 0.0], [0.5; 3], [0.0, 0.0, 1.0], 0.9, [1.0, 0.0, 0.0, 0.0]),
+            SplatPoint::new(
+                [0.0; 3],
+                [0.1; 3],
+                [1.0, 0.0, 0.0],
+                1.0,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            SplatPoint::new(
+                [1.0, 0.0, 0.0],
+                [0.1; 3],
+                [0.0, 1.0, 0.0],
+                0.2,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            SplatPoint::new(
+                [2.0, 0.0, 0.0],
+                [0.5; 3],
+                [0.0, 0.0, 1.0],
+                0.9,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
         ]);
         // Keep only the opaque gaussians.
         let report = apply(
@@ -638,7 +706,11 @@ mod tests {
     #[test]
     fn set_radius_scales_every_axis() {
         let mut splat = grid(1, 1.0);
-        apply(&mut splat, &EditStep::new(EditOp::SetRadius { factor: 3.0 })).unwrap();
+        apply(
+            &mut splat,
+            &EditStep::new(EditOp::SetRadius { factor: 3.0 }),
+        )
+        .unwrap();
         assert_eq!(splat.points[0].scale, [0.30000001192092896; 3]);
     }
 
@@ -647,7 +719,9 @@ mod tests {
         let mut splat = grid(1, 1.0);
         apply(
             &mut splat,
-            &EditStep::new(EditOp::AdjustColor { delta: [0.8, -0.8, 0.0] }),
+            &EditStep::new(EditOp::AdjustColor {
+                delta: [0.8, -0.8, 0.0],
+            }),
         )
         .unwrap();
         assert_eq!(splat.points[0].color, [1.0, 0.0, 0.5]);
@@ -670,7 +744,9 @@ mod tests {
         let mut splat = grid(2, 1.0);
         let report = apply(
             &mut splat,
-            &EditStep::new(EditOp::Duplicate { by: [0.0, 2.0, 0.0] }),
+            &EditStep::new(EditOp::Duplicate {
+                by: [0.0, 2.0, 0.0],
+            }),
         )
         .unwrap();
         assert_eq!(report.affected, 2);
@@ -746,11 +822,23 @@ mod tests {
     fn invalid_operations_are_refused_before_anything_changes() {
         let mut splat = grid(1, 1.0);
         let cases = [
-            EditOp::Translate { by: [f32::NAN, 0.0, 0.0] },
-            EditOp::Rotate { axis: [0.0; 3], degrees: 45.0, center: [0.0; 3] },
-            EditOp::Scale { center: [0.0; 3], factor: [0.0, 1.0, 1.0] },
+            EditOp::Translate {
+                by: [f32::NAN, 0.0, 0.0],
+            },
+            EditOp::Rotate {
+                axis: [0.0; 3],
+                degrees: 45.0,
+                center: [0.0; 3],
+            },
+            EditOp::Scale {
+                center: [0.0; 3],
+                factor: [0.0, 1.0, 1.0],
+            },
             EditOp::SetRadius { factor: -1.0 },
-            EditOp::SetColor { color: [0.5; 3], mix: 1.5 },
+            EditOp::SetColor {
+                color: [0.5; 3],
+                mix: 1.5,
+            },
             EditOp::SetOpacity { factor: -0.5 },
             EditOp::Merge { points: Vec::new() },
         ];
@@ -770,8 +858,12 @@ mod tests {
         let reports = apply_all(
             &mut splat,
             &[
-                EditStep::new(EditOp::Translate { by: [0.0, 1.0, 0.0] }),
-                EditStep::new(EditOp::Duplicate { by: [0.0, 0.0, 1.0] }),
+                EditStep::new(EditOp::Translate {
+                    by: [0.0, 1.0, 0.0],
+                }),
+                EditStep::new(EditOp::Duplicate {
+                    by: [0.0, 0.0, 1.0],
+                }),
             ],
         )
         .unwrap();
@@ -785,7 +877,9 @@ mod tests {
         let error = apply_all(
             &mut splat,
             &[
-                EditStep::new(EditOp::Translate { by: [0.0, 0.0, 1.0] }),
+                EditStep::new(EditOp::Translate {
+                    by: [0.0, 0.0, 1.0],
+                }),
                 EditStep::new(EditOp::SetRadius { factor: 0.0 }),
             ],
         )
@@ -809,10 +903,12 @@ mod tests {
     fn a_default_selection_is_all_points() {
         assert!(Selection::default().is_all());
         assert_eq!(Selection::default().indices(&grid(3, 1.0)).len(), 3);
-        assert!(!Selection {
-            first: Some(1),
-            ..Selection::default()
-        }
-        .is_all());
+        assert!(
+            !Selection {
+                first: Some(1),
+                ..Selection::default()
+            }
+            .is_all()
+        );
     }
 }

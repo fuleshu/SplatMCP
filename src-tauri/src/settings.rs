@@ -328,7 +328,11 @@ mod tests {
 
         // A file from an older schema still loads; missing fields take defaults.
         let partial = temp_path("partial.json");
-        fs::write(&partial, "{\"bounds\":{\"x\":10,\"y\":10,\"width\":800,\"height\":600}}").unwrap();
+        fs::write(
+            &partial,
+            "{\"bounds\":{\"x\":10,\"y\":10,\"width\":800,\"height\":600}}",
+        )
+        .unwrap();
         let loaded = load_file(&partial);
         assert_eq!(loaded.mode, WindowMode::Normal);
         assert_eq!(loaded.version, 1);
@@ -340,9 +344,24 @@ mod tests {
     #[test]
     fn implausible_bounds_are_replaced() {
         let cases = [
-            Bounds { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
-            Bounds { x: 0.0, y: 0.0, width: f64::NEG_INFINITY, height: 600.0 },
-            Bounds { x: 40_000.0, y: 0.0, width: 800.0, height: 600.0 },
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: f64::NEG_INFINITY,
+                height: 600.0,
+            },
+            Bounds {
+                x: 40_000.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
         ];
         for bounds in cases {
             let settings = Settings {
@@ -394,7 +413,12 @@ mod tests {
         let settings = WindowSettings::new(path.clone());
         let first = Settings {
             version: 1,
-            bounds: Bounds { x: 10.0, y: 10.0, width: 800.0, height: 600.0 },
+            bounds: Bounds {
+                x: 10.0,
+                y: 10.0,
+                width: 800.0,
+                height: 600.0,
+            },
             mode: WindowMode::Normal,
         };
         settings.remember(first, false);
@@ -402,11 +426,18 @@ mod tests {
 
         // A second unforced write inside the interval is dropped...
         let second = Settings {
-            bounds: Bounds { x: 500.0, ..first.bounds },
+            bounds: Bounds {
+                x: 500.0,
+                ..first.bounds
+            },
             ..first
         };
         settings.remember(second, false);
-        assert_eq!(settings.snapshot().bounds.x, 10.0, "throttled write should be skipped");
+        assert_eq!(
+            settings.snapshot().bounds.x,
+            10.0,
+            "throttled write should be skipped"
+        );
 
         // ...but a forced one (window closed) always lands.
         settings.remember(second, true);
