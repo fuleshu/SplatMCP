@@ -86,8 +86,10 @@ pub enum EditOpKind {
     Duplicate,
     /// Delete the selection.
     Remove,
-    /// Append `points`.
+    /// Append `points`, or the gaussians of `asset_id`.
     Merge,
+    /// Write one attribute of the selection from a typed binary payload.
+    Patch,
 }
 
 /// One edit step, with its optional selection.
@@ -158,6 +160,64 @@ pub struct EditOpInput {
     /// `[cx, cy, cz, radius]` sphere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sphere: Option<[f32; 4]>,
+    /// Registered asset holding the points to append, for `merge`: the compact form of a
+    /// merge, where no per-point argument travels. `points` and `asset_id` are exclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    /// Typed binary values written by `patch`, addressed to this step's selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<PatchInput>,
+}
+
+/// A typed binary attribute patch: declared shape, dtype, layout and unit convention.
+///
+/// The declared shape must match the attribute and the payload's length exactly.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
+pub struct PatchInput {
+    /// position | scale | rotation | color | opacity.
+    pub attribute: String,
+    /// f32 (default) | f64 | i32 | i16 | u16 | u8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+    /// [components] or [rows, components].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Vec<usize>>,
+    /// Only "scalar" is defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// little (default) | big.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endian: Option<String>,
+    /// activated (default) | serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Registered asset holding the values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    /// Or the values inline as base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values_base64: Option<String>,
+}
+
+impl PatchInput {
+    /// True when the values come from a registered asset rather than the inline field.
+    pub fn is_asset_backed(&self) -> bool {
+        self.asset_id.is_some()
+    }
+
+    /// The wire shape, unchanged: the app owns the asset registry and does the decoding.
+    pub fn to_params(&self) -> splatmcp_bridge::AttributePatchParams {
+        splatmcp_bridge::AttributePatchParams {
+            attribute: self.attribute.clone(),
+            dtype: self.dtype.clone(),
+            shape: self.shape.clone(),
+            layout: self.layout.clone(),
+            endian: self.endian.clone(),
+            encoding: self.encoding.clone(),
+            asset_id: self.asset_id.clone(),
+            values_base64: self.values_base64.clone(),
+        }
+    }
 }
 
 /// A selection filter for `splat_components`.
@@ -338,19 +398,7 @@ fn selection_params(input: &EditOpInput) -> Result<Option<SelectionParams>, Stri
 
 /// Projects a validated core operation onto the wire shape the app runs.
 fn op_params(op: &EditOp) -> BatchOpParams {
-    let mut params = BatchOpParams {
-        op: String::new(),
-        by: None,
-        axis: None,
-        degrees: None,
-        center: None,
-        factor: None,
-        delta: None,
-        color: None,
-        mix: None,
-        points: Vec::new(),
-        selection: None,
-    };
+    let mut params = empty_op("");
     match op {
         EditOp::Translate { by } => {
             params.op = "translate".to_owned();
@@ -406,16 +454,87 @@ fn op_params(op: &EditOp) -> BatchOpParams {
                 })
                 .collect();
         }
+        EditOp::Patch { patch } => {
+            // Unreachable from a tool call: an asset-backed step is forwarded by
+            // `asset_step_params` before this projection runs. Stated anyway, so a future
+            // caller cannot silently project a patch onto an op that drops its payload.
+            params.op = "patch".to_owned();
+            params.patch = Some(splatmcp_bridge::AttributePatchParams {
+                attribute: patch.attribute().name().to_owned(),
+                ..splatmcp_bridge::AttributePatchParams::default()
+            });
+        }
     }
     params
 }
 
 /// Translates one tool step into the wire shape, validating it on the way.
+///
+/// An asset-backed step is forwarded unchanged: only the app can reach the payload, so the
+/// tool sends the descriptor and the app plans it (dtype, shape, layout, encoding, budgets)
+/// before any transaction starts.
 pub fn step_params(input: &EditOpInput, index: usize) -> Result<BatchOpParams, String> {
+    if let Some(params) = asset_step_params(input, index)? {
+        return Ok(params);
+    }
     let step = to_step(input, index)?;
     let mut params = op_params(&step.op);
     params.selection = selection_params(input)?;
     Ok(params)
+}
+
+/// The wire step of an operation whose data lives in the app's asset registry.
+///
+/// Returns `None` when the step is ordinary and can be validated here.
+pub fn asset_step_params(
+    input: &EditOpInput,
+    index: usize,
+) -> Result<Option<BatchOpParams>, String> {
+    match (&input.op, &input.asset_id, &input.patch) {
+        (EditOpKind::Merge, Some(asset_id), None) => {
+            if input.points.as_ref().is_some_and(|points| !points.is_empty()) {
+                return Err(format!(
+                    "step {index} (merge): give asset_id or points, not both"
+                ));
+            }
+            let mut params = empty_op("merge");
+            params.asset_id = Some(asset_id.clone());
+            params.selection = selection_params(input)?;
+            Ok(Some(params))
+        }
+        (EditOpKind::Patch, _, Some(patch)) => {
+            let mut params = empty_op("patch");
+            params.patch = Some(patch.to_params());
+            params.selection = selection_params(input)?;
+            Ok(Some(params))
+        }
+        (EditOpKind::Patch, _, None) => Err(format!(
+            "step {index} (patch) needs patch: {{ attribute, asset_id | values_base64 }}"
+        )),
+        (kind, Some(_), _) => Err(format!(
+            "step {index}: asset_id is only used by merge and patch, not {kind:?}"
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// A wire step with every field unset, ready to be filled in.
+fn empty_op(op: &str) -> BatchOpParams {
+    BatchOpParams {
+        op: op.to_owned(),
+        by: None,
+        axis: None,
+        degrees: None,
+        center: None,
+        factor: None,
+        delta: None,
+        color: None,
+        mix: None,
+        points: Vec::new(),
+        asset_id: None,
+        patch: None,
+        selection: None,
+    }
 }
 
 /// Turns the tool input into the app call it describes.
@@ -552,7 +671,14 @@ pub fn history_target(input: &HistoryInput) -> DocumentTargetRequest {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 pub struct LoadInput {
     /// `.ply` file to display.
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Registered asset to display instead of a path.
+    ///
+    /// The compact form of a load: the app reads its own snapshot, so a large file never
+    /// travels through the tool call. `path` and `asset_id` are mutually exclusive.
+    #[serde(default)]
+    pub asset_id: Option<String>,
     /// Accept a file that needs repair, reporting every change it makes.
     ///
     /// Default false: a damaged file is refused with indexed diagnostics rather than
@@ -747,6 +873,15 @@ pub fn to_step(input: &EditOpInput, index: usize) -> Result<EditStep, String> {
             }
             EditOp::Merge { points: built }
         }
+        EditOpKind::Patch => {
+            // A patch is planned where the payload lives: in the app's asset registry. A
+            // detached edit has no registry to read from, so it is refused instead of being
+            // guessed at.
+            return Err(format!(
+                "op {index} (patch) is applied by the app, which owns the payload: edit the \
+                 displayed document, or register the values and send them with an asset id"
+            ));
+        }
     };
 
     let selection = Selection {
@@ -806,10 +941,22 @@ pub struct ResolvedSource {
 
 /// Resolves where a splat comes from and loads it under `policy`.
 ///
+/// Displays a registered asset as the document, without moving its bytes through the tool.
+///
+/// This is the compact load: the app already holds the snapshot, so the request names an id
+/// and the reply is the app's own report - identity, revision, gaussian count and what the
+/// import did. Nothing is re-encoded here, and a large file never crosses the bridge.
+pub fn display_asset(
+    link: &AppLink,
+    asset_id: &str,
+) -> Result<splatmcp_bridge::ViewerStatus, String> {
+    let params = splatmcp_bridge::asset_load_params(asset_id, None, Some(true));
+    link.request_typed(Method::ViewerLoadPly, params)
+}
+
 /// The policy only applies to a file source: the displayed document is served by the app as
 /// bytes this crate wrote, which already satisfy the contract.
-pub fn resolve_source(
-    link: &AppLink,
+pub fn resolve_source(    link: &AppLink,
     source: Option<&str>,
     policy: PlyImportPolicy,
 ) -> Result<ResolvedSource, String> {
@@ -1182,6 +1329,8 @@ mod tests {
             selection_handle: None,
             frame: None,
             sphere: None,
+            asset_id: None,
+            patch: None,
         }
     }
 

@@ -218,12 +218,20 @@ export class PythonPanel {
     }
   }
 
-  /** Fetches and displays one exact revision, then acknowledges it. */
+  /**
+   * Fetches and displays one exact revision, then acknowledges it.
+   *
+   * The event names the publication request token, and the viewer stages the candidate before
+   * swapping, so the previous view stays visible until this revision is ready. A load a newer
+   * publication superseded returns `null` and is never acknowledged: a late revision cannot
+   * replace a newer one, and nothing is reported as rendered that was not.
+   */
   async showRevision(payload) {
     if (!payload || typeof payload.revision !== "number") {
       return;
     }
     this.pendingRevision = payload.revision;
+    const token = typeof payload.token === "number" ? payload.token : null;
     let bytes;
     try {
       bytes = await this.fetchRevision(payload.document_id, payload.revision);
@@ -231,24 +239,39 @@ export class PythonPanel {
       await this.failDisplay(payload.revision, error?.message || String(error));
       return;
     }
+    let displayed = null;
     try {
       const instance = await this.viewer();
-      await instance.open({
+      displayed = await instance.publish({
         fileBytes: bytes,
         fileName: payload.file_name || "generated.ply",
         frame: payload.frame !== false,
+        request: {
+          documentId: payload.document_id,
+          revision: payload.revision,
+          token,
+        },
       });
-      await this.invoke("python_note_rendered", { revision: payload.revision });
-      this.pendingRevision = null;
-      this.setStatus(
-        `${payload.file_name || "generated.ply"} - ${payload.point_count} gaussians ` +
-          `(revision ${payload.revision})`,
-      );
     } catch (error) {
-      // The previous view is preserved; the job is told what went wrong instead of
-      // reporting a render that did not happen.
+      // The previous view is preserved; the job is told what went wrong instead of reporting a
+      // render that did not happen.
       await this.failDisplay(payload.revision, error?.message || String(error));
+      return;
     }
+    if (!displayed) {
+      this.pendingRevision = null;
+      return;
+    }
+    await this.invoke("python_note_rendered", {
+      revision: payload.revision,
+      documentId: payload.document_id,
+      token,
+    });
+    this.pendingRevision = null;
+    this.setStatus(
+      `${payload.file_name || "generated.ply"} - ${payload.point_count} gaussians ` +
+        `(revision ${payload.revision})`,
+    );
   }
 
   /**

@@ -47,6 +47,14 @@ export class SplatViewer {
     this.objectUrl = null;
     this.resizeObserver = null;
     this.loadToken = 0;
+    // The publication request currently being staged: `{ documentId, revision, token }`.
+    //
+    // A candidate is prepared while the previous model keeps rendering, and swapped in only
+    // once it is ready. Every load carries the request it belongs to, so a load that finishes
+    // after a newer one was already shown is discarded instead of replacing it.
+    this.staged = null;
+    // Identity of what a frame is actually presenting, as this viewer reported it.
+    this.displayed = null;
     // The selection highlight is a second gsplat layer over the document: it is loaded from
     // its own marker PLY so the highlighted gaussians are exactly the ones a selection
     // resolved to, drawn by the same renderer, without touching the document layer.
@@ -60,32 +68,161 @@ export class SplatViewer {
     this.handleResize = this.handleResize.bind(this);
   }
 
-  /** Loads a splat from raw PLY bytes and frames it. */
-  async open({ fileBytes, fileName = "splat.ply", frame = true }) {
+  /**
+   * Replaces the displayed splat with an exact revision, keeping the old model until the new
+   * one is ready.
+   *
+   * `request` is the publication this payload belongs to. The order matters:
+   *
+   * 1. the old model keeps rendering while the candidate is prepared beside it;
+   * 2. only once the candidate is ready, and only if no newer request has arrived, is the old
+   *    model disposed and the new one attached - so a load failure leaves the previous model
+   *    on screen instead of an empty canvas;
+   * 3. a load a newer request superseded is abandoned *before* the swap and reports nothing,
+   *    so a delayed older revision can never replace a newer one.
+   *
+   * Returns the identity a frame is presenting, or `null` when this load was superseded.
+   */
+  async publish({ fileBytes, fileName = "splat.ply", frame = false, request = null }) {
     this.ensureApp();
-    this.clearSplat();
-    this.setStatus("Loading splat...");
-
+    if (!fileBytes || fileBytes.length === 0) {
+      throw new Error("the app sent no bytes for this revision");
+    }
     const token = ++this.loadToken;
-    const url = this.objectUrlFor(fileBytes);
+    this.staged = request ? { ...request } : null;
+    this.setStatus(`Loading revision ${request?.revision ?? "?"}...`);
+
+    const url = this.objectUrlForLayer(fileBytes);
+    let asset = null;
+    let entity = null;
     try {
-      await this.openGsplatAsset(url, fileName, token);
-    } catch (error) {
-      if (token === this.loadToken) {
-        this.clearSplat();
-        this.setStatus(`Could not load splat: ${errorMessage(error)}`);
+      asset = await this.prepareAsset(url, fileName);
+      if (token !== this.loadToken) {
+        // A newer publication took over while this one loaded: release what was prepared and
+        // leave the screen exactly as it was.
+        this.disposeAsset(asset);
+        URL.revokeObjectURL(url);
+        this.staged = null;
+        return null;
       }
+      entity = this.buildEntity(asset, fileName);
+      // Prepared and still the newest: this is the swap point; the old model goes only now.
+      this.swapIn(entity, asset, url);
+      this.plyPointCount = countPlyVertices(fileBytes);
+      if (frame) {
+        this.frameView();
+      }
+      this.displayed = request
+        ? { documentId: request.documentId, revision: request.revision, token: request.token }
+        : null;
+      this.staged = null;
+      this.setStatus("");
+      this.start();
+      return this.displayed;
+    } catch (error) {
+      // The previous model is still the one being rendered: a failed publication never blanks
+      // the canvas, and it is reported rather than hidden.
+      if (entity) {
+        entity.destroy();
+      }
+      if (asset) {
+        this.disposeAsset(asset);
+      }
+      URL.revokeObjectURL(url);
+      this.staged = null;
+      this.setStatus(
+        `Could not prepare revision ${request?.revision ?? "?"}: ${errorMessage(error)}`,
+      );
       throw error;
     }
-    if (token !== this.loadToken) {
+  }
+
+  /** Loads a splat from raw PLY bytes and frames it: the manual Open path. */
+  async open({ fileBytes, fileName = "splat.ply", frame = true }) {
+    return this.publish({ fileBytes, fileName, frame, request: null });
+  }
+
+  /** Disposes the previous model and installs the prepared one. */
+  swapIn(entity, asset, url) {
+    if (this.splatEntity) {
+      this.splatEntity.destroy();
+      this.splatEntity = null;
+    }
+    if (this.splatAsset) {
+      this.disposeAsset(this.splatAsset);
+      this.splatAsset = null;
+    }
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+    }
+    this.objectUrl = url;
+    this.splatAsset = asset;
+    this.splatEntity = entity;
+    this.app.root.addChild(entity);
+    entity.syncHierarchy();
+  }
+
+  /** Removes one asset and its GPU resources. */
+  disposeAsset(asset) {
+    if (!asset) {
       return;
     }
-    this.plyPointCount = countPlyVertices(fileBytes);
-    if (frame) {
-      this.frameView();
+    asset.off();
+    if (this.app?.assets?.get(asset.id)) {
+      this.app.assets.remove(asset);
     }
-    this.setStatus("");
-    this.start();
+    asset.unload();
+  }
+
+  /** Loads PLY bytes into a PlayCanvas asset that is not attached to anything yet. */
+  async prepareAsset(url, fileName) {
+    const asset = new pc.Asset(
+      fileName || "splat.ply",
+      "gsplat",
+      { url, filename: fileName || url },
+      {
+        elementFilter: (propertyName) => REQUIRED_PLY_PROPERTIES.has(propertyName),
+        reorder: false,
+      },
+      { crossOrigin: null, minimalMemory: true },
+    );
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        asset.off("load", onLoad);
+        asset.off("error", onError);
+      };
+      const onLoad = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error) => {
+        cleanup();
+        reject(new Error(errorMessage(error) || "could not parse the splat"));
+      };
+      asset.on("load", onLoad);
+      asset.on("error", onError);
+      this.app.assets.add(asset);
+      this.app.assets.load(asset);
+    });
+    return asset;
+  }
+
+  /** The entity a prepared asset is rendered through. */
+  buildEntity(asset, fileName) {
+    const entity = new pc.Entity(fileName || "splat");
+    entity.addComponent("gsplat", { asset });
+    entity.setEulerAngles(PLY_DEFAULT_X_FLIP_DEG, 0, 0);
+    return entity;
+  }
+
+  /**
+   * What a frame is presenting, as this viewer reports it.
+   *
+   * A publication the viewer could not prepare leaves this untouched, which is what makes a
+   * display failure distinguishable from a display.
+   */
+  displayedRevision() {
+    return this.displayed;
   }
 
   /**
@@ -222,6 +359,7 @@ export class SplatViewer {
 
   dispose() {
     this.loadToken += 1;
+    this.staged = null;
     this.stop();
     this.clearHighlight();
     this.clearSplat();
@@ -310,51 +448,6 @@ export class SplatViewer {
     return this.objectUrl;
   }
 
-  async openGsplatAsset(url, fileName, token) {
-    const asset = new pc.Asset(
-      fileName || "splat.ply",
-      "gsplat",
-      { url, filename: fileName || url },
-      {
-        elementFilter: (propertyName) => REQUIRED_PLY_PROPERTIES.has(propertyName),
-        reorder: false,
-      },
-      { crossOrigin: null, minimalMemory: true },
-    );
-    this.splatAsset = asset;
-
-    await new Promise((resolve, reject) => {
-      const cleanup = () => {
-        asset.off("load", onLoad);
-        asset.off("error", onError);
-      };
-      const onLoad = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = (error) => {
-        cleanup();
-        reject(new Error(errorMessage(error) || "could not parse the splat"));
-      };
-      asset.on("load", onLoad);
-      asset.on("error", onError);
-      this.app.assets.add(asset);
-      this.app.assets.load(asset);
-    });
-
-    if (token !== this.loadToken) {
-      return;
-    }
-
-    const entity = new pc.Entity(fileName || "splat");
-    entity.addComponent("gsplat", { asset });
-    entity.setEulerAngles(PLY_DEFAULT_X_FLIP_DEG, 0, 0);
-    this.splatEntity = entity;
-    this.app.root.addChild(entity);
-    entity.syncHierarchy();
-    await this.settle();
-  }
-
   /**
    * Renders until a freshly loaded splat is actually on screen.
    *
@@ -388,17 +481,15 @@ export class SplatViewer {
       this.splatEntity = null;
     }
     if (this.splatAsset) {
-      this.splatAsset.off();
-      if (this.app?.assets?.get(this.splatAsset.id)) {
-        this.app.assets.remove(this.splatAsset);
-      }
-      this.splatAsset.unload();
+      this.disposeAsset(this.splatAsset);
       this.splatAsset = null;
     }
     if (this.objectUrl) {
       URL.revokeObjectURL(this.objectUrl);
       this.objectUrl = null;
     }
+    this.displayed = null;
+    this.staged = null;
   }
 
   worldBounds() {

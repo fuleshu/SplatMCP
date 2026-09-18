@@ -9,10 +9,13 @@
 //! used. The MCP server is a separate process spawned by the MCP client; it finds this app
 //! through `bridge.json` in the app data directory; see `docs/design/milestone-4.md`.
 
+mod assets;
 mod authoring;
 mod bridge;
 mod document;
+mod jobs;
 mod paths;
+mod publication;
 mod python;
 mod settings;
 mod viewer;
@@ -206,35 +209,78 @@ fn edit_redo(app: tauri::AppHandle, request: Option<Value>) -> Result<Value, Str
 /// Records that the window displayed one exact revision.
 ///
 /// A commit reports `published` until this arrives: the app announcing a revision proves the
-/// announcement, not the picture, and this is the acknowledgement that closes that gap.
+/// announcement, not the picture, and this is the acknowledgement that closes that gap. The
+/// `token` names the publication request, so a late load of an older revision is refused
+/// instead of being recorded as the picture.
 #[tauri::command]
 fn edit_note_displayed(
     state: State<'_, AppState>,
+    publications: State<'_, publication::PublicationHostState>,
     document_id: String,
     revision: u64,
-) -> Result<bool, String> {
+    token: Option<u64>,
+) -> Result<Value, String> {
     let handle = document::handle_of(&document_id, revision)?;
-    Ok(state.note_side_effect(
+    let recorded = state.note_side_effect(
         &handle,
         splatmcp_core::ReceiptSlot::Display,
         splatmcp_core::SideEffect::Done,
-    ))
+    );
+    let publications = publications.0.clone();
+    let status = match token {
+        Some(token) => match publications.acknowledge(&document_id, revision, token) {
+            Ok(status) => status,
+            Err(error) => {
+                // A stale acknowledgement is reported, not swallowed: the display state keeps
+                // whatever was actually there, and the caller learns why.
+                return Ok(json!({
+                    "recorded": false,
+                    "receipt": recorded,
+                    "error": crate::publication::error_json(&error),
+                }));
+            }
+        },
+        // No token: an older caller. The receipt is updated, and the publication status is
+        // left as it was - an acknowledgement without a request identity cannot prove which
+        // request it answers.
+        None => return Ok(json!({"recorded": recorded, "token": Value::Null})),
+    };
+    Ok(json!({
+        "recorded": recorded,
+        "receipt": recorded,
+        "status": crate::publication::status_json(&status),
+    }))
 }
 
 /// Records that the window could not display one exact revision.
+///
+/// The previously displayed model stays on screen: this reports a publication failure without
+/// touching what a frame presented.
 #[tauri::command]
 fn edit_note_display_failed(
     state: State<'_, AppState>,
+    publications: State<'_, publication::PublicationHostState>,
     document_id: String,
     revision: u64,
     message: String,
-) -> Result<bool, String> {
+) -> Result<Value, String> {
     let handle = document::handle_of(&document_id, revision)?;
-    Ok(state.note_side_effect(
+    let recorded = state.note_side_effect(
         &handle,
         splatmcp_core::ReceiptSlot::Display,
-        splatmcp_core::SideEffect::Failed(message),
-    ))
+        splatmcp_core::SideEffect::Failed(message.clone()),
+    );
+    let publications = publications.0.clone();
+    match publications.fail(&document_id, revision, message) {
+        Ok(status) => Ok(json!({
+            "recorded": recorded,
+            "status": crate::publication::status_json(&status),
+        })),
+        Err(error) => Ok(json!({
+            "recorded": recorded,
+            "error": crate::publication::error_json(&error),
+        })),
+    }
 }
 
 /// Bounded markers that show where a selection handle's gaussians are.
@@ -296,6 +342,21 @@ fn main() {
             current_splat_bytes,
             save_splat,
             bridge_respond,
+            assets::asset_register,
+            assets::asset_info,
+            assets::asset_release,
+            assets::asset_upload,
+            publication::publication_status,
+            publication::renderer_capabilities,
+            publication::splat_bytes_for_handle,
+            jobs::job_import,
+            jobs::job_export,
+            jobs::job_inspect,
+            jobs::job_status,
+            jobs::job_list,
+            jobs::job_cancel,
+            jobs::job_stats,
+            jobs::job_wait,
             python::python_runtime_info,
             python::python_submit,
             python::python_job,
@@ -333,10 +394,21 @@ fn main() {
             // panel-started job share one interpreter and one job registry. A missing
             // Python runtime only disables generation; the viewer keeps working.
             let python = Arc::new(python::PythonHost::start(&handle));
-            app.manage(python::PythonHostState(python.clone()));
+            app.manage(python::PythonHostState(python.clone()));            // One asset registry for the whole process: the bridge and the window register
+            // and resolve the same ids, so a payload is never copied to be shared.
+            let assets = Arc::new(assets::AssetHost::default());
+            app.manage(assets::AssetHostState(assets.clone()));
+            // One job service for the whole process: an import started from MCP and one
+            // started from the window are the same queue, with the same states and receipts.
+            let jobs = Arc::new(jobs::JobHost::default());
+            app.manage(jobs::JobHostState(jobs.clone()));
+            // One publication tracker: it is the app's single answer to "which revision is the
+            // viewer showing?", kept apart from the committed revisions in the store.
+            let publications = Arc::new(publication::PublicationHost::default());
+            app.manage(publication::PublicationHostState(publications.clone()));
             // A bridge failure must not stop the viewer from working: without a data
             // directory only the MCP half of the app is unavailable.
-            match bridge::start(&handle, viewer, python) {
+            match bridge::start(&handle, viewer, python, assets) {
                 Ok(host) => {
                     println!("splatmcp: bridge listening on 127.0.0.1:{}", host.port());
                     let state = app.state::<bridge::BridgeHostState>();
@@ -364,6 +436,9 @@ fn main() {
             // Stop the interpreter after the window is gone: a script that ignores
             // cancellation can only be waited for, not killed safely.
             handle.state::<python::PythonHostState>().0.shutdown();
+            // Queued jobs are cancelled outright and running ones are asked to stop; nothing
+            // is rerun on the next start.
+            handle.state::<jobs::JobHostState>().0.shutdown();
         }
     });
 }

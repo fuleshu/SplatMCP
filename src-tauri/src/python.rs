@@ -40,10 +40,18 @@ use crate::viewer::VIEWER_WINDOW;
 pub const REVISION_EVENT: &str = "splat://revision";
 
 /// Payload of [`REVISION_EVENT`]: identity only, never geometry.
+///
+/// The `token` is what makes the acknowledgement unambiguous. The viewer fetches the bytes for
+/// this exact `(document, revision)` and then reports that it displayed *this request*, so a
+/// load that finishes after a newer one was already shown cannot claim the screen.
 #[derive(Debug, Clone, Serialize)]
 pub struct RevisionPayload {
     pub revision: u64,
     pub document_id: String,
+    /// Publication request this event belongs to, minted by the app before the event is sent.
+    pub token: u64,
+    /// `committed` for a document revision, `preview` for a retained candidate.
+    pub source: String,
     pub file_name: String,
     pub point_count: usize,
     pub component_id: Option<String>,
@@ -330,15 +338,30 @@ impl DocumentTarget for AppDocumentTarget {
 
 impl AppDocumentTarget {
     /// Emits the revision identity the viewer loads from.
+    ///
+    /// The publication request is recorded first, so the token this event carries is the one
+    /// the viewer's acknowledgement must quote back. A Python job's revision therefore goes
+    /// through exactly the same publication seam as an edit batch: one token, one
+    /// acknowledgement, one displayed revision.
     fn publish_revision(&self, identity: &DocumentIdentity, frame: bool) -> Result<(), String> {
         let state = self.app.state::<AppState>();
         let file_name = state
             .metadata()
             .map(|metadata| metadata.provenance.file_name)
             .unwrap_or_else(|| "splat.ply".to_owned());
+        let handle = match splatmcp_core::DocumentId::parse(&identity.document_id) {
+            Some(document_id) => splatmcp_core::DocumentHandle::new(document_id, identity.revision),
+            None => return Err(format!("'{}' is not a document id", identity.document_id)),
+        };
+        let publications = self.app.state::<crate::publication::PublicationHostState>().0.clone();
+        let request = publications
+            .begin(&handle, splatmcp_core::PublicationSource::Committed, frame)
+            .map_err(|error| format!("{} ({})", error, error.code()))?;
         let payload = RevisionPayload {
             revision: identity.revision,
             document_id: identity.document_id.clone(),
+            token: request.token,
+            source: request.source.as_str().to_owned(),
             file_name,
             point_count: identity.point_count,
             component_id: identity.component_id.clone(),
@@ -491,9 +514,32 @@ pub fn python_job_cancel(
 }
 
 /// Tauri command: the viewer rendered a revision.
+///
+/// The same acknowledgement also closes the shared publication request, so "what is on screen"
+/// has one answer for a Python job and for an edit batch alike. A token that does not match the
+/// request in flight is reported rather than recorded as the picture.
 #[tauri::command]
-pub fn python_note_rendered(revision: u64, host: tauri::State<'_, PythonHostState>) -> Option<u64> {
-    host.0.note_rendered(revision)
+pub fn python_note_rendered(
+    app: tauri::AppHandle,
+    revision: u64,
+    document_id: Option<String>,
+    token: Option<u64>,
+    host: tauri::State<'_, PythonHostState>,
+) -> Result<Value, String> {
+    let job = host.0.note_rendered(revision);
+    let publications = app.state::<crate::publication::PublicationHostState>().0.clone();
+    let acknowledged = match (document_id, token) {
+        (Some(document_id), Some(token)) => {
+            match publications.acknowledge(&document_id, revision, token) {
+                Ok(status) => json!({ "status": crate::publication::status_json(&status) }),
+                Err(error) => json!({ "error": crate::publication::error_json(&error) }),
+            }
+        }
+        // No request identity: the job acknowledgement stands, and the publication status is
+        // left as it was, because an acknowledgement cannot name a request without its token.
+        _ => json!({ "token": Value::Null }),
+    };
+    Ok(json!({ "job": job, "publication": acknowledged }))
 }
 
 /// Tauri command: the viewer failed to load a revision.

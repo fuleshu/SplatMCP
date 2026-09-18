@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use bridge::AppLink;
 use splatmcp_bridge::Method;
 use splatmcp_core::PlyImportPolicy;
-use tools::{author, edit, python, viewer};
+use tools::{asset, author, edit, job, publication, python, viewer};
 
 /// Shared state of the MCP service: the link to the desktop app.
 #[derive(Clone)]
@@ -94,9 +94,9 @@ impl SplatMcpServer {
 
     /// Moves the camera of the desktop app.
     #[tool(
-        description = "Move the camera in the SplatMCP window and return where it ended up. Give \
-                       fit=true to frame the whole splat, a position, or azimuth/elevation/distance \
-                       to orbit it.",
+        description = "Move the camera in the window and return where it ended up. Give fit=true \
+                       to frame the whole splat, a position, or azimuth/elevation/distance to \
+                       orbit it.",
         annotations(
             title = "Set camera",
             read_only_hint = false,
@@ -114,7 +114,7 @@ impl SplatMcpServer {
 
     /// Reads the camera of the desktop app.
     #[tool(
-        description = "Report the camera of the SplatMCP window: position, look-at target and field of view.",
+        description = "Read the displayed splat's camera: position, look-at target and field of view.",
         annotations(title = "Get camera", read_only_hint = true, open_world_hint = false)
     )]
     async fn get_camera(&self) -> Result<CallToolResult, McpError> {
@@ -125,8 +125,8 @@ impl SplatMcpServer {
     /// Builds a splat from parameters and shows it in the app.
     #[tool(
         description = "Create a gaussian splat from a shape (sphere, cube, plane, line, shell, \
-                       ring, grid) or explicit points, in fixed RGB colour. Optionally writes a .ply \
-                       and shows it in the SplatMCP window. Returns the point count and bounds.",
+                       ring, grid) or explicit points, in fixed RGB colour. Optionally writes a \
+                       .ply and shows it. Returns the point count and bounds.",
         annotations(
             title = "Create splat",
             read_only_hint = false,
@@ -174,11 +174,12 @@ impl SplatMcpServer {
     /// Applies edit steps to a splat.
     #[tool(
         description = "Edit a gaussian splat: translate, rotate, scale, set_radius, adjust_color, \
-                       set_color, set_opacity, duplicate, remove or merge, each with an optional \
-                       box, sphere, attribute, component, point-id or saved-selection target. The \
-                       displayed document is edited through the edit_batch transaction (stable \
-                       ids, one revision, components and undo preserved). A .ply or 'new' source \
-                       is a detached buffer and refuses document-only targets.",
+                       set_color, set_opacity, duplicate, remove, merge or patch, each with an \
+                       optional box, sphere, attribute, component, point-id or saved-selection \
+                       target. The displayed document is edited through the edit_batch \
+                       transaction (stable ids, one revision, components and undo preserved). A \
+                       .ply or 'new' source is a detached buffer and refuses document-only \
+                       targets.",
         annotations(title = "Edit splat", read_only_hint = false, open_world_hint = false)
     )]
     async fn edit_splat(
@@ -227,11 +228,12 @@ impl SplatMcpServer {
         tool_json(&edit::with_import(reply, import))
     }
 
-    /// Shows an existing PLY file in the app.
+    /// Shows an existing PLY file, or a registered asset, in the app.
     #[tool(
-        description = "Load a .ply gaussian splat into the SplatMCP window and frame it. \
-                       Strict: a file that needs repair is refused with indexed diagnostics, \
-                       unless repair:true accepts it and the reply reports every change.",
+        description = "Load a .ply gaussian splat into the window and frame it, by path or by a \
+                       registered asset_id (the compact form for large files). Strict: a file \
+                       that needs repair is refused with indexed diagnostics, unless repair:true \
+                       accepts it and the reply reports every change.",
         annotations(
             title = "Load splat",
             read_only_hint = false,
@@ -243,15 +245,30 @@ impl SplatMcpServer {
         &self,
         Parameters(input): Parameters<edit::LoadInput>,
     ) -> Result<CallToolResult, McpError> {
+        // A registered asset is loaded by the app, which owns the bytes: the reply is the
+        // app's own report of the identity, count and import it resolved - nothing is
+        // re-encoded here, and no large payload crosses the bridge.
+        if let Some(asset_id) = input.asset_id.as_deref() {
+            if input.path.is_some() {
+                return Err(tool_error(
+                    "load_splat takes path or asset_id, not both: a load has one source".to_owned(),
+                ));
+            }
+            let status = edit::display_asset(&self.link, asset_id).map_err(tool_error)?;
+            return tool_json(&status);
+        }
+        let path = input.path.as_deref().ok_or_else(|| {
+            tool_error("load_splat needs path (.ply file) or asset_id (registered asset)".to_owned())
+        })?;
         // Strict by default: a file that needs repair is refused with indexed diagnostics,
         // and `repair: true` accepts it and reports every value that was changed.
         let policy = PlyImportPolicy::from_repair_flag(input.repair);
-        let file = edit::read_splat_file(&input.path, policy).map_err(tool_error)?;
+        let file = edit::read_splat_file(path, policy).map_err(tool_error)?;
         let import = splatmcp_bridge::PlyImportSummary::of(&file.report);
         let splat = file.splat;
         let bytes =
             splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
-        let file_name = std::path::Path::new(&input.path)
+        let file_name = std::path::Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("splat.ply")
@@ -260,14 +277,52 @@ impl SplatMcpServer {
         let status =
             author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?;
         tool_json(
-            &author::splat_reply(
-                &splat,
-                Some(std::path::Path::new(&input.path)),
-                true,
-                Some(&status),
-            )
-            .with_import(import),
+            &author::splat_reply(&splat, Some(std::path::Path::new(path)), true, Some(&status))
+                .with_import(import),
         )
+    }
+
+    /// Registers a payload as an immutable asset the app holds.
+    #[tool(
+        description = "Register a payload as an immutable asset and get its asset_id back. Give \
+                       an absolute path (snapshotted once, so editing the file afterwards cannot \
+                       change queued work) or bytes_base64 for a small inline payload; kind is \
+                       ply, splat_buffers or attribute_patch. Use the id in load_splat, a merge \
+                       step or a patch. Refusals name what is wrong.",
+        annotations(
+            title = "Register asset",
+            read_only_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn register_asset(
+        &self,
+        Parameters(input): Parameters<asset::RegisterAssetInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let reply = asset::register(&self.link, &input).map_err(tool_error)?;
+        tool_json(&reply)
+    }
+
+    /// Describes, lists or releases registered assets.
+    #[tool(
+        description = "Describe one registered asset by asset_id (kind, schema, bytes, checksum, \
+                       provenance, gaussian count, lifetime), list every live asset when no id \
+                       is given, or forget one with release:true. An asset is addressed by id, \
+                       never by a path.",
+        annotations(
+            title = "Asset info",
+            read_only_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn asset_info(
+        &self,
+        Parameters(input): Parameters<asset::AssetInfoInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = asset::info(&self.link, &input).map_err(tool_error)?;
+        Ok(tool_text(value))
     }
 
     /// Applies an edit batch as one atomic, previewable and retry-safe transaction.
@@ -275,8 +330,8 @@ impl SplatMcpServer {
         description = "Apply several edit steps as ONE transaction: all commit as one new \
                        revision or nothing changes. dry_run reports a preview without committing; \
                        commit it later with preview_id (refused if the document moved on). \
-                       operation_id makes a retry safe; undo/redo and history are shared with the \
-                       window.",
+                       operation_id makes a retry safe; undo, redo and history are shared with \
+                       the window.",
         annotations(title = "Edit batch", read_only_hint = false, open_world_hint = false)
     )]
     async fn edit_batch(
@@ -309,8 +364,7 @@ impl SplatMcpServer {
     #[tool(
         description = "Edit history of the displayed document: action 'status' reports undo and \
                        redo availability plus the retained steps, 'undo' restores the previous \
-                       state and 'redo' re-applies it. Each commits a NEW revision and a new edit \
-                       clears the redo stack.",
+                       state and 'redo' re-applies it. Each commits a NEW revision.",
         annotations(
             title = "Edit history",
             read_only_hint = false,
@@ -341,10 +395,10 @@ impl SplatMcpServer {
     /// Lists, creates, renames, removes or reframes named components, and resolves selections.
     #[tool(
         description = "Named components and stable selections of the displayed document. Actions: \
-                       list, create, rename, remove, transform (declares an explicit local frame; \
-                       anisotropic gaussians are transformed through their covariance and singular \
-                       or reflecting frames are refused), members, apply_transform and select \
-                       (count, bounds and a bounded sample). These ids are the window's ids.",
+                       list, create, rename, remove, transform (declares a local frame; \
+                       anisotropic gaussians are transformed through their covariance and \
+                       singular or reflecting frames are refused), members, apply_transform and \
+                       select (count, bounds, bounded sample). These ids are the window's ids.",
         annotations(
             title = "Splat components",
             read_only_hint = false,
@@ -368,11 +422,10 @@ impl SplatMcpServer {
     /// Describes a splat: count, bounds, colour and opacity.
     #[tool(
         description = "Describe a gaussian splat: point count, bounds, mean colour, opacity \
-                       range, scale and colour distributions, contract diagnostics, buffer \
-                       sizes, and the displayed document's id and revision (quote it as \
-                       expected_revision when a Python job edits that document). Reads the \
-                       displayed document as bounded metadata by default, or a .ply path; set \
-                       points for the first n gaussians themselves.",
+                       range, distributions, contract diagnostics, buffer sizes, and the \
+                       displayed document's id and revision. Reads the displayed document as \
+                       bounded metadata by default, or a .ply path; set points for the first n \
+                       gaussians themselves.",
         annotations(title = "Splat info", read_only_hint = true, open_world_hint = false)
     )]
     async fn splat_info(
@@ -405,7 +458,7 @@ impl SplatMcpServer {
 
     /// Reports readiness and versions of the app's embedded Python runtime.
     #[tool(
-        description = "Report the SplatMCP Python runtime: readiness, interpreter and package \
+        description = "Read the SplatMCP Python runtime: readiness, interpreter and package \
                        versions, and the budgets jobs are held to.",
         annotations(
             title = "Python runtime info",
@@ -421,11 +474,10 @@ impl SplatMcpServer {
     /// Runs a Python recipe that generates or edits Gaussians in the app.
     #[tool(
         description = "Run an embedded-Python recipe that builds Gaussians with NumPy and shows \
-                       the result in the SplatMCP window. Pass code or script_path plus a \
-                       request_id, then poll the returned job id with get_python_job. Use \
-                       display:false to commit without changing what is displayed, and \
-                       frame:false to keep the current camera. Scripts are local code execution, \
-                       not a sandbox.",
+                       the result in the window. Pass code or script_path plus a request_id, then \
+                       poll the job id with get_python_job. display:false commits without \
+                       changing what is shown; frame:false keeps the camera. Scripts are local \
+                       code execution, not a sandbox.",
         annotations(
             title = "Run Python splat",
             read_only_hint = false,
@@ -444,7 +496,7 @@ impl SplatMcpServer {
     #[tool(
         description = "Read a run_python_splat job: state, progress, timings, revision, point \
                        count, bounds, export, structured error and logs. Pass log_after from the \
-                       previous reply for only new lines. A committed job is not proof the viewer \\
+                       previous reply for only new lines. A committed job is not proof the viewer \
                        rendered it: check display.",
         annotations(
             title = "Get Python job",
@@ -463,8 +515,8 @@ impl SplatMcpServer {
     /// Asks a Python job to stop and reports the honest state.
     #[tool(
         description = "Cancel a run_python_splat job. A queued job stops immediately; a running \
-                       job stops at its next checkpoint, so a native NumPy or PyTorch call can \
-                       keep it in cancel_requested. A late result is discarded, not committed.",
+                       job stops at its next checkpoint, so a native call can keep it in \
+                       cancel_requested. A late result is discarded, not committed.",
         annotations(
             title = "Cancel Python job",
             read_only_hint = false,
@@ -480,11 +532,47 @@ impl SplatMcpServer {
         tool_json(&cancelled)
     }
 
+    /// Submits, reads, lists or cancels a long desktop operation as a job.
+    #[tool(
+        description = "Run a long operation as a background job. action:submit takes operation \
+                       (import a registered asset_id, export to an absolute path, or inspect) and \
+                       returns a job_id at once; status returns state, phase, percent, result and \
+                       new log lines (pass log_after back); list returns recent jobs and the real \
+                       limits; cancel is cooperative and honest. A dropped connection never \
+                       cancels or resubmits the work.",
+        annotations(title = "Document job", read_only_hint = false, open_world_hint = false)
+    )]
+    async fn document_job(
+        &self,
+        Parameters(input): Parameters<job::JobInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = job::run(&self.link, &input).map_err(tool_error)?;
+        Ok(tool_text(value))
+    }
+
+    /// Reports which revision the viewer is showing, or what the renderer can do.
+    #[tool(
+        description = "Which revision the window is actually showing. action:status returns \
+                       committed_revision and displayed_revision as separate values, whether \
+                       display is lagging behind the document, the publication still in flight \
+                       with its request token, and which revisions were superseded; \
+                       action:capabilities returns the renderer's transport, whether it is \
+                       revision-addressed, and its acknowledgement timeout. A commit is not a \
+                       display: this is how to tell them apart.",
+        annotations(title = "Publication", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn splat_display(
+        &self,
+        Parameters(input): Parameters<publication::PublicationInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = publication::run(&self.link, &input).map_err(tool_error)?;
+        Ok(tool_text(value))
+    }
+
     /// Renders the current view and returns it as an image.
     #[tool(
-        description = "Render the SplatMCP window and return the frame as an image, optionally after \
-                       moving the camera. Use it to check what the splat looks like; give a small \
-                       width to keep the reply cheap.",
+        description = "Render the SplatMCP window and return the frame as an image, optionally \
+                       after moving the camera. Give a small width to keep the reply cheap.",
         annotations(
             title = "Screenshot",
             read_only_hint = true,
@@ -585,7 +673,8 @@ mod tests {
     /// step schema and a nested selection filter cannot be flattened away), and to 2200 when
     /// `edit_splat` gained the same targeting and retry-safety fields as `edit_batch` - it now
     /// accepts an `operation_id` and the full target vocabulary, which is exactly what stopped it
-    /// from silently editing the wrong gaussians. The measured listing is 31 KB for fifteen tools.
+    /// from silently editing the wrong gaussians. The compact asset and job tools arrived with an
+    /// id-shaped surface, so the per-tool budget is unchanged.
     const LISTING_BUDGET_BYTES_PER_TOOL: usize = 2200;
 
     #[test]
@@ -596,8 +685,8 @@ mod tests {
 
         assert_eq!(
             tools.len(),
-            15,
-            "the surface is expected to hold fifteen tools"
+            19,
+            "the surface is expected to hold nineteen tools"
         );
         let budget = tools.len() * LISTING_BUDGET_BYTES_PER_TOOL;
         assert!(

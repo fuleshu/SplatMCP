@@ -13,7 +13,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
-    BatchPointParams, BoundsInfo, BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest,
+    BatchOpParams, BatchPointParams, BoundsInfo, BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest,
     CommitPreviewRequest, ComponentSummary, ComponentsReply, ComponentsRequest, DocumentPlyReply,
     DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest,
     GetPlyRequest, Handler, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
@@ -27,20 +27,25 @@ use tauri::{AppHandle, Emitter, Manager};
 use splatmcp_core::validation::ValidationLimits;
 use splatmcp_core::{
     BatchStep, BatchTargets, Box3, ComponentId, EditBatch, EditOp, Expected, Frame, LocalTransform,
-    PlyImportPolicy, PointId, ReceiptSlot, SelectionQuery, SideEffect, Sphere, SplatPoint,
+    PlyImportPolicy, PointId, PublicationSource, ReceiptSlot, SelectionQuery, SideEffect, Sphere,
+    SplatPoint,
 };
 
+use crate::assets::AssetHost;
 use crate::document::{self, AppState, Mutation, MutationKind, OutcomeInfo, SplatInfo};
+use crate::publication::PublicationHostState;
 use crate::python::{PythonHost, RevisionPayload};
 use crate::viewer::{VIEWER_TIMEOUT, VIEWER_WINDOW, Viewer};
 
-/// Bridge handler that turns requests into webview work, document reads or generation
-/// jobs.
+/// Bridge handler that turns requests into webview work, document reads, generation
+/// jobs or asset registry work.
 pub(crate) struct AppBridge {
     app: AppHandle,
     viewer: Arc<Viewer>,
     /// The one generation service this process hosts; the panel uses the same one.
     python: Arc<PythonHost>,
+    /// The one asset registry this process hosts; the window uses the same one.
+    assets: Arc<AssetHost>,
     started: Instant,
     app_version: String,
 }
@@ -51,6 +56,11 @@ impl Handler for AppBridge {
     }
 
     fn handle(&self, method: Method, params: Value) -> Result<Value, String> {
+        // Asset methods are answered by the asset host, so this handler stays about the
+        // document and the viewer.
+        if let Some(result) = self.assets.handle(method, params.clone()) {
+            return result;
+        }
         match method {
             Method::Hello => Err("the handshake is answered by the bridge server".to_owned()),
             Method::AppPing => Ok(json!({
@@ -90,8 +100,24 @@ impl Handler for AppBridge {
             Method::DocumentUndo => self.document_undo(params, true),
             Method::DocumentRedo => self.document_undo(params, false),
             Method::DocumentComponents => self.document_components(params),
-            Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
-            Method::PythonRunSplat => {
+            // Answered by the asset host before this dispatch runs: stated explicitly so a
+            // future method added to the protocol cannot fall through to the wrong handler.
+            Method::AssetRegister
+            | Method::AssetInfo
+            | Method::AssetRelease
+            | Method::AssetUploadBegin
+            | Method::AssetUploadChunk
+            | Method::AssetUploadStatus
+            | Method::AssetUploadFinalize
+            | Method::AssetUploadCancel => {
+                Err("this method is answered by the asset host".to_owned())
+            }            Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
+            Method::JobSubmit => self.job_submit(params),
+            Method::JobStatus => self.job_status(params),
+            Method::JobList => self.job_list(params),
+            Method::JobCancel => self.job_cancel(params),
+            Method::PublicationStatus => self.publication_status(params),
+            Method::PublicationCapabilities => self.publication_capabilities(params),            Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
                     .map_err(|error| format!("invalid python run request: {error}"))?;
                 let receipt = self.python.submit(request)?;
@@ -127,18 +153,54 @@ impl AppBridge {
     ///   document, which keeps its identity and advances its revision by one. A stale
     ///   revision is refused, and the displayed document is left exactly as it was.
     ///
+    /// The bytes come from a registered asset when `asset_id` is set, and from the inline
+    /// field otherwise. An asset is the compact form: the app already holds a snapshot of
+    /// those bytes, so nothing large travels in the request and a later edit of the source
+    /// file cannot change what is loaded.
+    ///
     /// Parsing happens before the viewer is asked and before the store is touched, so a
     /// malformed payload is rejected while the window keeps showing what it showed before.
     fn load_ply(&self, params: Value) -> Result<Value, String> {
         let request: LoadPlyRequest = serde_json::from_value(params)
             .map_err(|error| format!("invalid load_ply request: {error}"))?;
-        let bytes = BASE64
-            .decode(request.ply_base64.as_bytes())
-            .map_err(|error| format!("ply_base64 is not valid base64: {error}"))?;
+        // Provenance of an asset-backed load: the file the snapshot was read from, when it
+        // came from one.
+        let mut asset_file: Option<String> = None;
+        let bytes = match &request.asset_id {
+            Some(asset_id) => {
+                let asset = self.assets.resolve(asset_id)?;
+                if asset.kind() != splatmcp_core::AssetKind::Ply {
+                    return Err(format!(
+                        "asset {asset_id} holds {} bytes; loading a document needs a ply asset",
+                        asset.kind().as_str()
+                    ));
+                }
+                // A file asset names the file it was read from, so authoring metadata beside
+                // that file can still be associated by content - but the bytes loaded are the
+                // snapshot, never a second read of the file.
+                asset_file = Some(asset.source().to_owned());
+                asset.bytes().to_vec()
+            }
+            None => BASE64
+                .decode(request.ply_base64.as_bytes())
+                .map_err(|error| format!("ply_base64 is not valid base64: {error}"))?,
+        };
 
         let file_name = request
             .file_name
             .clone()
+            .or_else(|| {
+                asset_file
+                    .as_deref()
+                    .map(|path| {
+                        std::path::Path::new(path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .filter(|name| !name.is_empty())
+            })
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "splat.ply".to_owned());
         let expected =
@@ -148,9 +210,9 @@ impl AppBridge {
         let policy = PlyImportPolicy::from_repair_flag(request.repair);
         // A load that names a real file can carry authoring metadata beside it; a buffer with
         // only a display name cannot, and is not guessed at.
-        let source_path = request
-            .file_name
+        let source_path = asset_file
             .clone()
+            .or_else(|| request.file_name.clone())
             .filter(|name| std::path::Path::new(name).is_file());
 
         let state = self.app.state::<AppState>();
@@ -308,8 +370,169 @@ impl AppBridge {
     }
 }
 
-/// Event the app emits when an edit transaction committed a revision that should be shown.
-///
+impl AppBridge {
+    /// Submits a long operation as a job and returns as soon as it is admitted.
+    ///
+    /// The reply is identity and state only: an import's progress, result and failure are read
+    /// afterwards through `job.status`, so a slow operation never holds a bridge request open
+    /// and a dropped connection neither cancels nor resubmits the accepted work.
+    fn job_submit(&self, params: Value) -> Result<Value, String> {
+        let request: splatmcp_bridge::JobSubmitRequest = serde_json::from_value(params)
+            .map_err(|error| format!("invalid job.submit request: {error}"))?;
+        let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+        let expected =
+            document::expected_target(request.document_id.as_deref(), request.expected_revision)?;
+        let admission = match request.operation.as_str() {
+            "import" => {
+                let asset_id = request.asset_id.as_deref().ok_or_else(|| {
+                    "job.submit 'import' needs asset_id (a registered ply asset)".to_owned()
+                })?;
+                let assets = self.app.state::<crate::assets::AssetHostState>().0.clone();
+                let asset = crate::jobs::resolve_asset(&assets, asset_id)?;
+                jobs.import(&self.app, asset, expected, request.operation_id)?
+            }
+            "export" => {
+                let path = request.path.clone().ok_or_else(|| {
+                    "job.submit 'export' needs path (the file to write)".to_owned()
+                })?;
+                if std::path::Path::new(&path).is_relative() {
+                    return Err(format!(
+                        "'{path}' is not an absolute path; pass the full path to write"
+                    ));
+                }
+                jobs.export(&self.app, expected, path, request.operation_id)?
+            }
+            "inspect" => jobs.inspect(&self.app, expected, request.operation_id)?,
+            other => {
+                return Err(format!(
+                    "unknown job operation '{other}'; use import, export or inspect"
+                ));
+            }
+        };
+        serde_json::to_value(splatmcp_bridge::JobAdmissionReply {
+            job_id: admission.job_id.to_string(),
+            state: admission.state.as_str().to_owned(),
+            replayed: admission.replayed,
+            limits: jobs.service().limits().describe(),
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// One job's status and the log lines after a cursor.
+    fn job_status(&self, params: Value) -> Result<Value, String> {
+        let request: splatmcp_bridge::JobStatusRequest = serde_json::from_value(params)
+            .map_err(|error| format!("invalid job.status request: {error}"))?;
+        let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+        let job_id = crate::jobs::parse_job_id(&request.job_id)?;
+        let view = jobs
+            .view(
+                &job_id,
+                request.log_after.unwrap_or(0),
+                request.log_limit.unwrap_or(200).min(500),
+            )
+            .map_err(|error| format!("{} ({})", error, error.code()))?;
+        serde_json::to_value(splatmcp_bridge::JobStatusReply::from(&view))
+            .map_err(|error| error.to_string())
+    }
+
+    /// The newest jobs with the service's counts and limits.
+    fn job_list(&self, params: Value) -> Result<Value, String> {
+        let request: splatmcp_bridge::JobListRequest = if params.is_null() {
+            splatmcp_bridge::JobListRequest::default()
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid job.list request: {error}"))?
+        };
+        let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+        let stats = jobs.service().stats();
+        let reply = splatmcp_bridge::JobListReply {
+            jobs: jobs
+                .recent(request.limit.unwrap_or(10).min(64))
+                .iter()
+                .map(splatmcp_bridge::JobSummary::from)
+                .collect(),
+            statistics: splatmcp_bridge::JobStatsSummary::from(&stats),
+        };
+        serde_json::to_value(reply).map_err(|error| error.to_string())
+    }
+
+    /// Asks a job to stop and reports what actually happened.
+    fn job_cancel(&self, params: Value) -> Result<Value, String> {
+        let request: splatmcp_bridge::JobCancelRequest = serde_json::from_value(params)
+            .map_err(|error| format!("invalid job.cancel request: {error}"))?;
+        let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
+        let job_id = crate::jobs::parse_job_id(&request.job_id)?;
+        let receipt = jobs
+            .cancel(&job_id)
+            .map_err(|error| format!("{} ({})", error, error.code()))?;
+        serde_json::to_value(splatmcp_bridge::JobSummary::from(&receipt))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Which revision the viewer is showing, and which publication is in flight.
+    ///
+    /// Deliberately answers from the publication tracker rather than from the viewer: the app
+    /// knows what it announced and what was acknowledged, and a status query must not depend on
+    /// the renderer being able to answer right now.
+    fn publication_status(&self, params: Value) -> Result<Value, String> {
+        let request: splatmcp_bridge::PublicationStatusRequest = if params.is_null() {
+            splatmcp_bridge::PublicationStatusRequest::default()
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid publication.status request: {error}"))?
+        };
+        let publications = self.app.state::<crate::publication::PublicationHostState>().0.clone();
+        let document_id = match request.document_id {
+            Some(document_id) => document_id,
+            // Absent means "the displayed document", which the app resolves once, here, and
+            // reports back - rather than leaving the caller to guess.
+            None => {
+                let state = self.app.state::<AppState>();
+                match state.active_handle() {
+                    Some(handle) => handle.document_id.to_string(),
+                    None => {
+                        return Err("no splat is loaded, so no publication can be described".to_owned());
+                    }
+                }
+            }
+        };
+        let status = publications
+            .status(&document_id)
+            .map_err(|error| format!("{} ({})", error, error.code()))?
+            .ok_or_else(|| {
+                format!("no publication has been started for {document_id} in this session")
+            })?;
+        serde_json::to_value(splatmcp_bridge::PublicationStatusReply::from(&status))
+            .map_err(|error| error.to_string())
+    }
+
+    /// What the renderer can do, with the viewer's own report of what it is showing.
+    fn publication_capabilities(&self, params: Value) -> Result<Value, String> {
+        let _ = params;
+        let publications = self.app.state::<crate::publication::PublicationHostState>().0.clone();
+        // The viewer's own status, so the capabilities describe the real renderer rather than
+        // an assumption about it. A viewer that cannot answer is reported as not ready.
+        let reported = self
+            .viewer
+            .request(Method::ViewerStatus, Value::Null, VIEWER_TIMEOUT)
+            .ok()
+            .and_then(|value| serde_json::from_value::<ViewerStatus>(value).ok());
+        let (displayed_revision, point_count, viewer_ready) = match reported {
+            Some(status) => (
+                status.document.as_ref().map(|document| document.revision),
+                status.point_count,
+                status.viewer_ready,
+            ),
+            None => (None, 0, false),
+        };
+        let capabilities = publications.capabilities(displayed_revision, point_count);
+        let mut reply = splatmcp_bridge::PublicationCapabilitiesReply::from(&capabilities);
+        reply.viewer_ready = viewer_ready;
+        serde_json::to_value(reply).map_err(|error| error.to_string())
+    }
+}
+
+/// Event the app emits when an edit transaction committed a revision that should be shown.///
 /// Deliberately separate from the Python job's `splat://revision`: a transaction is not a job,
 /// and a viewer acknowledgement of a job's revision must not be confused with an edit.
 pub const EDIT_REVISION_EVENT: &str = "splat://edit-revision";
@@ -418,7 +641,14 @@ fn required<T>(value: Option<T>, index: usize, op: &str, field: &str) -> Result<
 }
 
 /// Turns a wire batch into a core batch, refusing anything it cannot mean.
-pub(crate) fn to_batch(request: &EditBatchRequest) -> Result<EditBatch, String> {
+///
+/// `assets` resolves `merge.asset_id` (points from a registered payload) and `patch`
+/// (decoded binary values). Both are resolved and validated here, before the transaction
+/// starts, so a bad payload is a request error rather than a failed commit.
+pub(crate) fn to_batch(
+    request: &EditBatchRequest,
+    assets: &AssetHost,
+) -> Result<EditBatch, String> {
     let mut steps = Vec::with_capacity(request.steps.len());
     for (index, op) in request.steps.iter().enumerate() {
         let targets = match &op.selection {
@@ -456,16 +686,16 @@ pub(crate) fn to_batch(request: &EditBatchRequest) -> Result<EditBatch, String> 
             },
             "remove" => EditOp::Remove,
             "merge" => EditOp::Merge {
-                points: op
-                    .points
-                    .iter()
-                    .map(to_point)
-                    .collect::<Result<Vec<_>, _>>()?,
+                points: merge_points(op, index, assets)?,
+            },
+            "patch" => EditOp::Patch {
+                patch: std::sync::Arc::new(plan_patch(op, index, assets)?),
             },
             other => {
                 return Err(format!(
                     "step {index}: unknown operation '{other}'; use translate, rotate, scale, \
-                     set_radius, adjust_color, set_color, set_opacity, duplicate, remove or merge"
+                     set_radius, adjust_color, set_color, set_opacity, duplicate, remove, merge \
+                     or patch"
                 ));
             }
         };
@@ -485,6 +715,67 @@ pub(crate) fn to_batch(request: &EditBatchRequest) -> Result<EditBatch, String> 
         batch = batch.with_operation_id(operation_id.clone());
     }
     Ok(batch)
+}
+
+/// The gaussians a `merge` step appends: from a registered asset, or from inline points.
+///
+/// The two forms are mutually exclusive on purpose: sending both would leave the caller
+/// unsure which one the merge used.
+fn merge_points(
+    op: &BatchOpParams,
+    index: usize,
+    assets: &AssetHost,
+) -> Result<Vec<SplatPoint>, String> {
+    match (&op.asset_id, op.points.is_empty()) {
+        (Some(asset_id), true) => Ok(assets.merge_points(asset_id)?.points),
+        (Some(_), false) => Err(format!(
+            "step {index} (merge): give asset_id or points, not both"
+        )),
+        (None, _) => op
+            .points
+            .iter()
+            .map(to_point)
+            .collect::<Result<Vec<_>, _>>(),
+    }
+}
+
+/// The typed binary patch a `patch` step applies, planned before the transaction starts.
+///
+/// The row count is taken from the step's own selection when that selection is a simple
+/// prefix (`first`), which is the case a caller can state without knowing the document. Any
+/// other selection is resolvable only when the step runs, so the payload's own row count is
+/// used and a mismatch is reported by the transaction, before anything is committed.
+fn plan_patch(
+    op: &BatchOpParams,
+    index: usize,
+    assets: &AssetHost,
+) -> Result<splatmcp_core::AttributePatch, String> {
+    let params = op
+        .patch
+        .as_ref()
+        .ok_or_else(|| format!("step {index} (patch) needs patch"))?;
+    let rows = op
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.first)
+        .filter(|_| {
+            // Only a prefix selection has a row count that does not depend on the document.
+            op.selection
+                .as_ref()
+                .is_some_and(|selection| {
+                    selection.within.is_none()
+                        && selection.outside.is_none()
+                        && selection.sphere.is_none()
+                        && selection.component.is_none()
+                        && selection.point_ids.is_empty()
+                        && selection.selection_handle.is_none()
+                        && selection.color_min.is_none()
+                        && selection.color_max.is_none()
+                        && selection.opacity_min.is_none()
+                        && selection.max_radius.is_none()
+                })
+        });
+    assets.plan_patch(params, rows)
 }
 
 fn step_summaries(steps: &[document::StepOutcome]) -> Vec<StepSummary> {
@@ -639,20 +930,35 @@ pub(crate) fn restore_note(
 impl AppBridge {
     /// Tells the viewer to load one exact revision, and reports what that proved.
     ///
-    /// The event names the document *and* the revision, so the frontend can fetch exactly those
-    /// bytes and refuse to display anything else. A successful emission proves only that the
-    /// announcement left the app: it is reported as [`SideEffect::Published`], and only the
-    /// window's acknowledgement turns it into `done`. That is why this returns an outcome
-    /// instead of claiming a render.
+    /// The event names the document, the revision **and the publication request token**, and
+    /// each publication is recorded on the tracker *before* it is emitted. A successful
+    /// emission proves only that the announcement left the app: it is reported as
+    /// [`SideEffect::Published`], and only the window's acknowledgement of that token turns it
+    /// into `done`. That is why this returns an outcome instead of claiming a render.
     fn publish(
         &self,
         document: &splatmcp_core::ReceiptDocument,
         component_id: Option<String>,
         frame: bool,
     ) -> SideEffect {
+        let handle = document.handle();
+        let publications = self.app.state::<PublicationHostState>().0.clone();
+        // A newer publication supersedes anything still in flight: the superseded request is
+        // recorded as skipped, so it can never later be acknowledged as displayed.
+        let request = match publications.begin(&handle, PublicationSource::Committed, frame) {
+            Ok(request) => request,
+            // Re-publishing the revision already on screen is not a failure: there is simply
+            // nothing to announce.
+            Err(error) if error.code() == "already_displayed" => {
+                return SideEffect::Done;
+            }
+            Err(error) => return SideEffect::Failed(error.to_string()),
+        };
         let payload = RevisionPayload {
             revision: document.revision,
             document_id: document.document_id.to_string(),
+            token: request.token,
+            source: request.source.as_str().to_owned(),
             file_name: document.file_name.clone(),
             point_count: document.point_count,
             component_id,
@@ -663,10 +969,17 @@ impl AppBridge {
             .emit_to(VIEWER_WINDOW, EDIT_REVISION_EVENT, payload)
         {
             Ok(()) => SideEffect::Published,
-            Err(error) => SideEffect::Failed(format!(
-                "could not tell the viewer about {}@{}: {error}",
-                document.document_id, document.revision
-            )),
+            Err(error) => {
+                let _ = publications.fail(
+                    request.document_id.as_str(),
+                    request.revision,
+                    format!("could not tell the viewer: {error}"),
+                );
+                SideEffect::Failed(format!(
+                    "could not tell the viewer about {}@{}: {error}",
+                    document.document_id, document.revision
+                ))
+            }
         }
     }
 
@@ -706,7 +1019,7 @@ impl AppBridge {
             serde_json::from_value(params)
                 .map_err(|error| format!("invalid edit_batch request: {error}"))?
         };
-        let batch = to_batch(&request)?;
+        let batch = to_batch(&request, &self.assets)?;
         let expected =
             document::expected_target(request.document_id.as_deref(), request.expected_revision)?;
         let state = self.app.state::<AppState>();
@@ -1001,10 +1314,12 @@ impl AppBridge {
     pub(crate) fn for_commands(app: &AppHandle) -> Self {
         let viewer = app.state::<ViewerState>().0.clone();
         let python = app.state::<crate::python::PythonHostState>().0.clone();
+        let assets = app.state::<crate::assets::AssetHostState>().0.clone();
         Self {
             app: app.clone(),
             viewer,
             python,
+            assets,
             started: Instant::now(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1073,6 +1388,7 @@ pub fn start(
     app: &AppHandle,
     viewer: Arc<Viewer>,
     python: Arc<PythonHost>,
+    assets: Arc<AssetHost>,
 ) -> Result<BridgeHost, String> {
     let server = BridgeServer::bind().map_err(|error| error.to_string())?;
     let descriptor = server
@@ -1082,6 +1398,7 @@ pub fn start(
         app: app.clone(),
         viewer,
         python,
+        assets,
         started: Instant::now(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
     });
@@ -1122,6 +1439,7 @@ mod tests {
 
     #[test]
     fn an_edit_batch_request_becomes_a_transaction_the_core_can_run() {
+        let assets = AssetHost::default();
         let request: EditBatchRequest = serde_json::from_value(json!({
             "operation_id": "recipe-1",
             "resolution": "stable",
@@ -1134,7 +1452,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let batch = to_batch(&request).unwrap();
+        let batch = to_batch(&request, &assets).unwrap();
         assert_eq!(batch.operation_id.as_deref(), Some("recipe-1"));
         assert_eq!(batch.steps.len(), 2);
         assert_eq!(batch.steps[0].targets, BatchTargets::all());
@@ -1146,7 +1464,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            to_batch(&unknown_op)
+            to_batch(&unknown_op, &assets)
                 .unwrap_err()
                 .contains("unknown operation")
         );
@@ -1155,20 +1473,20 @@ mod tests {
             "steps": [{ "op": "remove", "selection": { "frame": "camera" } }]
         }))
         .unwrap();
-        assert!(to_batch(&bad_frame).unwrap_err().contains("unknown frame"));
+        assert!(to_batch(&bad_frame, &assets).unwrap_err().contains("unknown frame"));
 
         let bad_id: EditBatchRequest = serde_json::from_value(json!({
             "steps": [{ "op": "remove", "selection": { "point_ids": ["row-3"] } }]
         }))
         .unwrap();
-        assert!(to_batch(&bad_id).unwrap_err().contains("not a point id"));
+        assert!(to_batch(&bad_id, &assets).unwrap_err().contains("not a point id"));
 
         // A missing required field says which step and which field.
         let missing: EditBatchRequest = serde_json::from_value(json!({
             "steps": [{ "op": "rotate", "degrees": 90.0 }]
         }))
         .unwrap();
-        let batch = to_batch(&missing).unwrap();
+        let batch = to_batch(&missing, &assets).unwrap();
         assert_eq!(
             batch.steps[0].op,
             EditOp::Rotate {
@@ -1180,7 +1498,7 @@ mod tests {
         let missing_by: EditBatchRequest =
             serde_json::from_value(json!({ "steps": [{ "op": "translate" }] })).unwrap();
         assert!(
-            to_batch(&missing_by)
+            to_batch(&missing_by, &assets)
                 .unwrap_err()
                 .contains("step 0 (translate) needs by")
         );

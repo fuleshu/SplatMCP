@@ -381,8 +381,9 @@ export class ComponentsPanel {
    * Two rules, both about not lying to the user:
    * - the bytes come from `splat_bytes_for_revision` for the *event's* document and revision,
    *   never from "the current splat" - a newer document must not be shown under an old label;
-   * - a load that is overtaken by a newer one is dropped, so a slow fetch cannot replace a
-   *   newer view, and the revision is acknowledged to the app only after it is displayed.
+   * - the event carries the publication request token, and that token is what the app records
+   *   as displayed: a load the app superseded is dropped by the viewer *and* refused by the
+   *   app, so a delayed older revision can never become the picture.
    */
   async showRevision(payload) {
     if (!payload || typeof payload.revision !== "number" || !this.viewer) {
@@ -395,7 +396,9 @@ export class ComponentsPanel {
       );
       return;
     }
-    const token = ++this.loadToken;
+    // A publication from an older app build carries no token: the viewer still displays it, but
+    // it reports the display without a request identity, which the app records as such.
+    const token = typeof payload.token === "number" ? payload.token : null;
     this.wantedRevision = payload.revision;
     let bytes;
     try {
@@ -404,30 +407,49 @@ export class ComponentsPanel {
       await this.failDisplay(documentId, payload.revision, error);
       return;
     }
-    if (token !== this.loadToken) {
-      return;
-    }
+    let displayed = null;
     try {
       const instance = await this.viewer();
-      await instance.open({
+      // The viewer stages the candidate and swaps only when it is ready, so the previous model
+      // stays visible while this revision is prepared - and a load a newer publication
+      // superseded returns `null` and is never acknowledged.
+      displayed = await instance.publish({
         fileBytes: bytes,
         fileName: payload.file_name || "edit.ply",
         frame: payload.frame === true,
+        request: { documentId, revision: payload.revision, token },
       });
-      if (this.highlightHandle && this.highlightRevision !== payload.revision) {
-        // The highlighted gaussians belonged to another revision; their markers would point at
-        // geometry that is no longer displayed.
-        await this.clearHighlight();
-      }
-      // The app called this revision `published`; displaying it is what makes it `done`.
-      await this.invoke("edit_note_displayed", { documentId, revision: payload.revision });
-      this.setStatus(
-        `${payload.file_name || "edit.ply"} - ${payload.point_count} gaussians (revision ${payload.revision})`,
-      );
-      await this.refresh();
     } catch (error) {
       await this.failDisplay(documentId, payload.revision, error);
+      return;
     }
+    if (!displayed) {
+      // Superseded before the swap: report nothing, because nothing changed on screen.
+      return;
+    }
+    if (this.highlightHandle && this.highlightRevision !== payload.revision) {
+      // The highlighted gaussians belonged to another revision; their markers would point at
+      // geometry that is no longer displayed.
+      await this.clearHighlight();
+    }
+    // The app called this revision `published`; displaying it is what makes it `done`.
+    const recorded = await this.invoke("edit_note_displayed", {
+      documentId,
+      revision: payload.revision,
+      token,
+    });
+    if (recorded?.error) {
+      // The app refused the acknowledgement (a stale token, say). Say so instead of reporting
+      // a revision the app does not believe is on screen.
+      this.setStatus(
+        `revision ${payload.revision} is displayed, but the app did not record it: ${recorded.error.message}`,
+      );
+      return;
+    }
+    this.setStatus(
+      `${payload.file_name || "edit.ply"} - ${payload.point_count} gaussians (revision ${payload.revision})`,
+    );
+    await this.refresh();
   }
 
   /** Fetches one exact revision of one document, as bytes. */

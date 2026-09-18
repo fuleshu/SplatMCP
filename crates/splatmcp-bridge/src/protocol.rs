@@ -128,6 +128,34 @@ pub enum Method {
     ViewerCapture,
     /// Replaces the displayed splat from PLY bytes.
     ViewerLoadPly,
+    /// Registers an immutable local asset from a file or a small inline payload.
+    AssetRegister,
+    /// Bounded metadata of one asset, or of every live asset.
+    AssetInfo,
+    /// Forgets an asset id.
+    AssetRelease,
+    /// Stages a chunked upload for a client that cannot reach the file.
+    AssetUploadBegin,
+    /// Appends one chunk of a staged upload.
+    AssetUploadChunk,
+    /// Resumable status of a staged upload.
+    AssetUploadStatus,
+    /// Turns a staged upload into a registered asset, or refuses it whole.
+    AssetUploadFinalize,
+    /// Abandons a staged upload.
+    AssetUploadCancel,
+    /// Submits an operation as a job and returns as soon as it is admitted.
+    JobSubmit,
+    /// One job's state, progress, result and logs after a cursor.
+    JobStatus,
+    /// The newest jobs with the service's counts and limits.
+    JobList,
+    /// Asks a job to stop, reporting what actually happened.
+    JobCancel,
+    /// Which revision the viewer is showing, and which publication is in flight.
+    PublicationStatus,
+    /// What the renderer can do, and the exact acceptance timeout it uses.
+    PublicationCapabilities,
     /// The PLY bytes of one revision of one document.
     DocumentGetPly,
     /// Bounded metadata of a document revision, without transferring its geometry.
@@ -344,6 +372,360 @@ impl CaptureResult {
     }
 }
 
+/// Parameters of `job.submit`.
+///
+/// The kind of work is named by `kind`/`operation`: an import of a registered asset, an
+/// export of one revision to a file, or a read-only inspection. Submission returns as soon as
+/// the job is admitted; progress, cancellation and the result are then read through
+/// `job.status`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobSubmitRequest {
+    /// `import`, `export` or `inspect`.
+    pub operation: String,
+    /// Registered ply asset, for `import`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    /// Destination file, for `export`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Caller-supplied identity that makes an identical retry a replay, not a second run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+/// Parameters of `job.status`: which job, and where to continue its logs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobStatusRequest {
+    pub job_id: String,
+    /// Sequence number the caller last saw; only newer lines come back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_limit: Option<usize>,
+}
+
+/// Parameters of `job.list`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Parameters of `job.cancel`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobCancelRequest {
+    pub job_id: String,
+}
+
+/// Reply of `job.submit`: identity and state, never a claim about the work itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobAdmissionReply {
+    pub job_id: String,
+    pub state: String,
+    /// True when an identical earlier request was replayed instead of queueing new work.
+    pub replayed: bool,
+    /// The bounds the job will be held to, so a caller sees the real ceiling.
+    pub limits: String,
+}
+
+/// One job as a reply reports it: bounded status, progress, side effects and result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub job_id: String,
+    pub kind: String,
+    pub state: String,
+    pub terminal: bool,
+    pub success: bool,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub admitted_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    pub phase: String,
+    pub done: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    pub percent: u32,
+    /// Sequence number to pass back as `log_after` after a dropped connection.
+    pub next_log_sequence: u64,
+    pub log_count: usize,
+    /// Bounded description of the result: identity and counts, never a payload.
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<JobFailureSummary>,
+    /// Downstream outcomes, kept separate from the commit.
+    pub export: String,
+    pub display: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    pub replayed: bool,
+}
+
+/// A failure as a reply reports it: a code a caller can branch on, plus a sentence.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobFailureSummary {
+    pub code: String,
+    pub message: String,
+}
+
+/// One bounded log line.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobLogSummary {
+    pub sequence: u64,
+    pub at_ms: u64,
+    pub level: String,
+    pub message: String,
+}
+
+/// Reply of `job.status`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobStatusReply {
+    pub job: JobSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<JobLogSummary>,
+}
+
+/// Reply of `job.list`: the newest jobs plus what the service is holding.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobListReply {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobSummary>,
+    pub statistics: JobStatsSummary,
+}
+
+/// The job service's counts and limits, as a capabilities reply reports them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobStatsSummary {
+    pub queued: usize,
+    pub running: usize,
+    pub retained: usize,
+    pub committed: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub failed: u64,
+    pub conflicted: u64,
+    pub evicted: u64,
+    /// The exact bounds in force.
+    pub limits: String,
+    pub shutting_down: bool,
+    /// What this service does *not* bound, stated rather than assumed.
+    pub memory_note: String,
+}
+
+impl From<&splatmcp_core::JobReceipt> for JobSummary {
+    fn from(receipt: &splatmcp_core::JobReceipt) -> Self {
+        Self {
+            job_id: receipt.job_id.to_string(),
+            kind: receipt.kind.as_str().to_owned(),
+            state: receipt.state.as_str().to_owned(),
+            terminal: receipt.state.is_terminal(),
+            success: receipt.state.is_success(),
+            operation: receipt.operation.clone(),
+            operation_id: receipt.operation_id.clone(),
+            target: receipt.target.clone(),
+            admitted_at_ms: receipt.admitted_at_ms,
+            started_at_ms: receipt.started_at_ms,
+            finished_at_ms: receipt.finished_at_ms,
+            phase: receipt.progress.phase.as_str().to_owned(),
+            done: receipt.progress.done,
+            total: receipt.progress.total,
+            percent: (receipt.progress.fraction * 100.0).round() as u32,
+            next_log_sequence: receipt.next_log_sequence,
+            log_count: receipt.log_count,
+            result: receipt.result.describe(),
+            failure: receipt.failure.as_ref().map(|failure| JobFailureSummary {
+                code: failure.code.clone(),
+                message: failure.message.clone(),
+            }),
+            export: receipt.export.as_str().to_owned(),
+            display: receipt.display.as_str().to_owned(),
+            notes: receipt.notes.clone(),
+            replayed: receipt.replayed,
+        }
+    }
+}
+
+impl From<&splatmcp_core::JobStats> for JobStatsSummary {
+    fn from(stats: &splatmcp_core::JobStats) -> Self {
+        Self {
+            queued: stats.counts.queued,
+            running: stats.counts.running,
+            retained: stats.counts.retained,
+            committed: stats.counts.committed,
+            completed: stats.counts.completed,
+            cancelled: stats.counts.cancelled,
+            failed: stats.counts.failed,
+            conflicted: stats.counts.conflicted,
+            evicted: stats.counts.evicted,
+            limits: stats.limits.clone(),
+            shutting_down: stats.shutting_down,
+            memory_note: stats.memory_note.clone(),
+        }
+    }
+}
+
+impl From<&splatmcp_core::JobView> for JobStatusReply {
+    fn from(view: &splatmcp_core::JobView) -> Self {
+        Self {
+            job: JobSummary::from(&view.receipt),
+            logs: view
+                .logs
+                .iter()
+                .map(|line| JobLogSummary {
+                    sequence: line.sequence,
+                    at_ms: line.at_ms,
+                    level: line.level.as_str().to_owned(),
+                    message: line.message.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Parameters of `publication.status`: one document, or every tracked document.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicationStatusRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+}
+
+/// Which revision is on screen, as the app reports it.
+///
+/// `committed_revision` and `displayed_revision` are separate fields on purpose: a commit is a
+/// fact about the store, a display is a fact about a frame, and the gap between them is what a
+/// caller needs to see rather than have smoothed over.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicationStatusReply {
+    pub contract_version: u32,
+    pub document_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed_revision: Option<u64>,
+    /// True when the frame matches the newest committed revision.
+    pub is_current: bool,
+    /// True when a commit has happened that no frame has presented yet.
+    pub display_lagging: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PublicationRequestSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<PublicationOutcomeSummary>,
+    /// Revisions a newer publication superseded; none of them was displayed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<PublicationFailureSummary>,
+    /// One bounded line, so a caller can quote the state without reassembling it.
+    pub summary: String,
+}
+
+/// A publication request that is waiting for the viewer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicationRequestSummary {
+    pub revision: u64,
+    pub token: u64,
+    /// `committed` or `preview`.
+    pub source: String,
+    pub frame: bool,
+}
+
+/// What happened to the most recent request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicationOutcomeSummary {
+    pub revision: u64,
+    pub token: u64,
+    /// `pending`, `displayed`, `failed`, `skipped` or `timed_out`.
+    pub outcome: String,
+    /// The outcome in words, including the reason when there is one.
+    pub detail: String,
+}
+
+/// One revision the viewer could not display.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicationFailureSummary {
+    pub revision: u64,
+    pub reason: String,
+}
+
+/// What the renderer supports, so a caller never guesses at readiness.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PublicationCapabilitiesReply {
+    pub viewer_ready: bool,
+    pub has_splat: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed_revision: Option<u64>,
+    pub displayed_point_count: usize,
+    /// How the bytes reach the viewer: a local binary response, not a JSON payload.
+    pub transport: String,
+    /// True when the renderer can be asked for an exact revision of an exact document.
+    pub revision_addressed: bool,
+    /// How long a publication waits for acknowledgement before it is timed out.
+    pub ack_timeout_ms: u64,
+    pub summary: String,
+}
+
+impl From<&splatmcp_core::PublicationStatus> for PublicationStatusReply {
+    fn from(status: &splatmcp_core::PublicationStatus) -> Self {
+        Self {
+            contract_version: status.contract_version,
+            document_id: status.document_id.clone(),
+            committed_revision: status.committed_revision,
+            displayed_revision: status.displayed_revision,
+            is_current: status.is_current(),
+            display_lagging: status.display_lagging,
+            pending: status.pending.as_ref().map(|request| PublicationRequestSummary {
+                revision: request.revision,
+                token: request.token,
+                source: request.source.as_str().to_owned(),
+                frame: request.frame,
+            }),
+            last: status
+                .last
+                .as_ref()
+                .map(|(request, outcome)| PublicationOutcomeSummary {
+                    revision: request.revision,
+                    token: request.token,
+                    outcome: outcome.as_str().to_owned(),
+                    detail: outcome.to_string(),
+                }),
+            skipped: status.skipped.clone(),
+            failures: status
+                .failures
+                .iter()
+                .map(|(revision, reason)| PublicationFailureSummary {
+                    revision: *revision,
+                    reason: reason.clone(),
+                })
+                .collect(),
+            summary: status.summary(),
+        }
+    }
+}
+
+impl From<&splatmcp_core::RendererCapabilities> for PublicationCapabilitiesReply {
+    fn from(capabilities: &splatmcp_core::RendererCapabilities) -> Self {
+        Self {
+            viewer_ready: capabilities.viewer_ready,
+            has_splat: capabilities.has_splat,
+            displayed_revision: capabilities.displayed_revision,
+            displayed_point_count: capabilities.displayed_point_count,
+            transport: capabilities.transport.to_owned(),
+            revision_addressed: capabilities.revision_addressed,
+            ack_timeout_ms: capabilities.ack_timeout_ms,
+            summary: capabilities.summary(),
+        }
+    }
+}
+
 /// Parameters of `viewer.load_ply`.
 ///
 /// With no `document_id` the bytes become a **new document** at revision 1, which is what
@@ -353,6 +735,12 @@ impl CaptureResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoadPlyRequest {
     pub ply_base64: String,
+    /// A registered asset to load instead of inline bytes.
+    ///
+    /// This is the compact path: the app already holds the bytes behind the id, so nothing
+    /// large travels in this request. `ply_base64` may be empty when this is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
     /// Re-frame the camera on the new splat; defaults to true in the viewer.
@@ -924,7 +1312,7 @@ pub struct SelectionParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchOpParams {
     /// `translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`,
-    /// `set_opacity`, `duplicate`, `remove` or `merge`.
+    /// `set_opacity`, `duplicate`, `remove`, `merge` or `patch`.
     pub op: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<[f32; 3]>,
@@ -945,8 +1333,234 @@ pub struct BatchOpParams {
     pub mix: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub points: Vec<BatchPointParams>,
+    /// Registered asset holding the points of a `merge`, instead of `points`.
+    ///
+    /// A PLY asset is decoded strictly, a buffer asset is decoded under the same budgets, and
+    /// editing the source file afterwards cannot change what is merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    /// Typed binary values for a `patch`, addressed to this step's selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<AttributePatchParams>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SelectionParams>,
+}
+
+/// One typed binary attribute patch as it travels over the wire.
+///
+/// Every field is explicit, so nothing is inferred from the byte layout: the attribute, its
+/// dtype, the shape, the endianness, the layout and the unit convention are all declared, and
+/// a payload whose shape does not match them is refused before the transaction starts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttributePatchParams {
+    /// `position`, `scale`, `rotation`, `color` or `opacity`.
+    pub attribute: String,
+    /// `f32` (default), `f64`, `i32`, `i16`, `u16` or `u8`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+    /// `[components]` or `[rows, components]`; defaults to the attribute's own width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Vec<usize>>,
+    /// Only `scalar` (tightly packed scalars) is defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// `little` (default) or `big`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endian: Option<String>,
+    /// `activated` (default, document units) or `serialized` (PLY storage convention).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Registered asset holding the values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    /// Or the values inline, base64, for a payload too small to be worth registering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values_base64: Option<String>,
+}
+
+/// Parameters of `asset.register`.
+///
+/// Exactly one source is given: `path` for a local file (absolute, read once and
+/// snapshotted) or `bytes_base64` for a small inline payload. A local file reference is the
+/// required path for bulk work; the inline form exists so a caller with a few kilobytes does
+/// not have to write a file first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetRegisterRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_base64: Option<String>,
+    /// `ply`, `splat_buffers` or `attribute_patch`.
+    pub kind: String,
+    /// Declared FNV-1a 64 checksum of the bytes, when the caller knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<u64>,
+    /// Label recorded as provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Parameters of `asset.info`: one asset by id, or every live asset when no id is given.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetQueryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+}
+
+/// Parameters of `asset.release`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetReleaseRequest {
+    pub asset_id: String,
+}
+
+/// Parameters of `asset.upload_begin`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetUploadBeginRequest {
+    /// `ply`, `splat_buffers` or `attribute_patch`.
+    pub kind: String,
+    /// Exact number of bytes that will be sent. Enforced: fewer is truncated, more is refused.
+    pub declared_bytes: u64,
+    /// FNV-1a 64 of the whole payload; checked at finalize, not after a partial registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Parameters of `asset.upload_chunk`: one chunk at the next offset.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetUploadChunkRequest {
+    pub upload_id: u64,
+    /// Offset this chunk starts at; must equal the status' `next_offset`.
+    pub offset: u64,
+    pub data_base64: String,
+}
+
+/// Parameters of `asset.upload_status`, `asset.upload_finalize` and `asset.upload_cancel`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetUploadRequest {
+    pub upload_id: u64,
+}
+
+/// Bounded description of one asset, as a reply reports it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetSummary {
+    pub asset_id: String,
+    pub kind: String,
+    pub contract_version: u32,
+    pub media_type: String,
+    pub schema: String,
+    pub bytes: usize,
+    /// FNV-1a 64 the bytes hash to, for a caller that wants to compare artifacts.
+    pub checksum_value: u64,
+    pub provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_count: Option<usize>,
+    pub created_at_ms: u64,
+    /// `0` means no lifetime was set.
+    pub expires_at_ms: u64,
+}
+
+/// Live-asset accounting and the limits it is measured against.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetStatsSummary {
+    pub assets: usize,
+    pub bytes: u64,
+    pub uploads: usize,
+    pub upload_bytes: u64,
+    pub evicted: u64,
+    /// The exact budgets in force, so a caller sees the real ceiling rather than guessing.
+    pub budgets: String,
+}
+
+/// Reply of `asset.register` and `asset.upload_finalize`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetRegisterReply {
+    pub asset: AssetSummary,
+    pub stats: AssetStatsSummary,
+}
+
+/// Reply of `asset.info`: one asset, or every live asset.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetInfoReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AssetSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<AssetSummary>,
+    pub stats: AssetStatsSummary,
+}
+
+/// Reply of `asset.upload_begin`, `asset.upload_chunk` and `asset.upload_status`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssetUploadReply {
+    pub upload_id: u64,
+    pub kind: String,
+    pub declared_bytes: u64,
+    pub received_bytes: u64,
+    /// Offset the next chunk must use.
+    pub next_offset: u64,
+    pub provenance: String,
+    /// `0` means no lifetime was set.
+    pub expires_at_ms: u64,
+    pub complete: bool,
+    /// Set once the upload was finalized into an asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AssetSummary>,
+}
+
+impl From<&splatmcp_core::AssetInfo> for AssetSummary {
+    fn from(info: &splatmcp_core::AssetInfo) -> Self {
+        Self {
+            asset_id: info.asset_id.to_string(),
+            kind: info.kind.as_str().to_owned(),
+            contract_version: info.contract_version,
+            media_type: info.media_type.to_owned(),
+            schema: info.schema.to_owned(),
+            bytes: info.bytes,
+            checksum_value: info.checksum.value,
+            provenance: info.provenance.clone(),
+            point_count: info.point_count,
+            created_at_ms: info.created_at_ms,
+            expires_at_ms: info.expires_at_ms.unwrap_or(0),
+        }
+    }
+}
+
+impl From<&splatmcp_core::AssetStats> for AssetStatsSummary {
+    fn from(stats: &splatmcp_core::AssetStats) -> Self {
+        Self {
+            assets: stats.assets,
+            bytes: stats.bytes,
+            uploads: stats.uploads,
+            upload_bytes: stats.upload_bytes,
+            evicted: stats.evicted,
+            budgets: String::new(),
+        }
+    }
+}
+
+impl From<&splatmcp_core::UploadStatus> for AssetUploadReply {
+    fn from(status: &splatmcp_core::UploadStatus) -> Self {
+        Self {
+            upload_id: status.upload_id,
+            kind: status.kind.as_str().to_owned(),
+            declared_bytes: status.declared_bytes,
+            received_bytes: status.received_bytes,
+            next_offset: status.next_offset,
+            provenance: status.provenance.clone(),
+            expires_at_ms: status.expires_at_ms,
+            complete: status.complete,
+            asset: None,
+        }
+    }
+}
+
+impl AssetStatsSummary {
+    /// The same accounting, carrying the budgets actually in force.
+    pub fn with_budgets(mut self, budgets: &splatmcp_core::AssetBudgets) -> Self {
+        self.budgets = budgets.describe();
+        self
+    }
 }
 
 /// Parameters of `document.edit_batch`.
@@ -1335,8 +1949,29 @@ pub fn camera_param(value: Option<CameraRequest>) -> Value {
 pub fn load_ply_params(ply_base64: impl Into<String>, file_name: Option<String>) -> Value {
     json!(LoadPlyRequest {
         ply_base64: ply_base64.into(),
+        asset_id: None,
         file_name,
         frame: Some(true),
+        document_id: None,
+        expected_revision: None,
+        repair: None,
+    })
+}
+
+/// Builds the params for `viewer.load_ply` from a registered asset.
+///
+/// The compact form of the same request: the app reads the bytes from its own registry, so
+/// nothing but an id travels. `asset_ply_params(None, ..)` names the displayed document.
+pub fn asset_load_params(
+    asset_id: impl Into<String>,
+    file_name: Option<String>,
+    frame: Option<bool>,
+) -> Value {
+    json!(LoadPlyRequest {
+        ply_base64: String::new(),
+        asset_id: Some(asset_id.into()),
+        file_name,
+        frame,
         document_id: None,
         expected_revision: None,
         repair: None,
@@ -1355,6 +1990,7 @@ pub fn replace_ply_params(
 ) -> Value {
     json!(LoadPlyRequest {
         ply_base64: ply_base64.into(),
+        asset_id: None,
         file_name: None,
         frame,
         document_id: Some(document_id.into()),

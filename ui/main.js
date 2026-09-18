@@ -3,6 +3,8 @@
 
 import { ViewerBridge } from "./bridge.js";
 import { ComponentsPanel } from "./components.js";
+import { DisplayBadge } from "./display.js";
+import { JobBar } from "./jobs.js";
 import { PythonPanel } from "./python-panel.js";
 
 const tauri = window.__TAURI__;
@@ -12,6 +14,8 @@ const listen = tauri?.event?.listen;
 const viewerNode = document.getElementById("viewer");
 const statusNode = document.getElementById("status");
 const overlayNode = document.getElementById("splat-status");
+const jobNode = document.querySelector(".job");
+const displayBadgeNode = document.getElementById("display-badge");
 const openButton = document.getElementById("open-button");
 const saveButton = document.getElementById("save-button");
 
@@ -19,6 +23,8 @@ let viewer = null;
 let viewerBridge = null;
 let pythonPanel = null;
 let componentsPanel = null;
+let jobBar = null;
+let displayBadge = null;
 let hasSplat = false;
 
 function setStatus(message) {
@@ -80,6 +86,34 @@ async function startPythonPanel() {
     setStatus,
   });
   await pythonPanel.start();
+}
+
+/**
+ * Starts the display badge: which revision is committed, and which one a frame is showing.
+ *
+ * The two are separate facts, and this is where the window says so - a revision the app has
+ * committed but not displayed is shown as exactly that.
+ */
+async function startDisplayBadge() {
+  if (displayBadge || !invoke || !displayBadgeNode) {
+    return;
+  }
+  displayBadge = new DisplayBadge(displayBadgeNode, invoke);
+  await displayBadge.start();
+}
+
+/**
+ * Starts the job bar: the one presentation of background work, from MCP or from here.
+ *
+ * It polls the app's job service, so a long import or export started by a tool call and one
+ * started by a button are the same job, with the same state and the same receipt.
+ */
+async function startJobBar() {
+  if (jobBar || !invoke || !jobNode) {
+    return;
+  }
+  jobBar = new JobBar(jobNode, invoke);
+  await jobBar.start();
 }
 
 /** Starts the component and transaction panel; it shares this window's viewer. */
@@ -149,4 +183,6 @@ if (!invoke) {
   startBridge().catch((error) => setStatus(`Bridge unavailable: ${error?.message || error}`));
   startPythonPanel().catch((error) => setStatus(`Python panel unavailable: ${error?.message || error}`));
   startComponentsPanel().catch((error) => setStatus(`Component panel unavailable: ${error?.message || error}`));
+  startJobBar().catch((error) => setStatus(`Job bar unavailable: ${error?.message || error}`));
+  startDisplayBadge().catch((error) => setStatus(`Display badge unavailable: ${error?.message || error}`));
 }

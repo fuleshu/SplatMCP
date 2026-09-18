@@ -4,8 +4,11 @@
 //! parameter types and the work they do live here, where they can be tested without an
 //! MCP session.
 
+pub mod asset;
 pub mod author;
 pub mod edit;
+pub mod job;
+pub mod publication;
 pub mod python;
 pub mod viewer;
 

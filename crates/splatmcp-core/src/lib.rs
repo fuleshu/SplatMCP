@@ -16,18 +16,27 @@
 //! - `rotation` is a unit quaternion `(w, x, y, z)` (PLY order `rot_0..rot_3`)
 
 mod authoring;
+pub mod asset;
 pub mod components;
 pub mod contract;
 pub mod document;
 mod edit;
 pub mod fixtures;
 pub mod inspection;
+pub mod job;
 mod ply;
+pub mod publish;
 mod splat;
 pub mod transaction;
 pub mod validation;
 
 pub use authoring::{MAX_POINTS, Rng, Shape, SplatParams, build, splat_from_points};
+pub use asset::{
+    ASSET_CONTRACT_VERSION, Asset, AssetBudgets, AssetError, AssetHandle, AssetId, AssetInfo,
+    AssetKind, AssetRegistry, AssetStats, AssetUpload, AttributePatch, PatchAttribute,
+    PatchDescriptor, PatchDtype, PatchEncoding, PatchEndian, PatchError, PatchLayout, PatchReport,
+    PatchShape, UploadProgress, UploadStatus, decode_points,
+};
 pub use components::{
     AuthoringSet, Component, ComponentId, Frame, ImportSummary, LocalTransform, PointId,
     SelectionError, SelectionHandle, SelectionHandles, SelectionQuery, Sphere,
@@ -39,8 +48,18 @@ pub use document::{
 };
 pub use edit::{Box3, EditOp, EditStep, OpReport, Selection, apply, apply_all};
 pub use inspection::{Distribution, InspectionReport, OwnedBuffers};
+pub use job::{
+    JOB_CONTRACT_VERSION, JobAdmission, JobBody, JobContext, JobCounts, JobError, JobFailure, JobId,
+    JobKind, JobLimits, JobLogEntry, JobPhase, JobProgress, JobReceipt, JobRequest, JobResult,
+    JobService, JobState, JobStats, JobView, LogLevel, SideEffectState, checksum_hex,
+};
 pub use ply::{
     PlyImportPolicy, PlyReport, read_ply, read_ply_repairing, read_ply_with_policy, write_ply,
+};
+pub use publish::{
+    DocumentPublication, PUBLICATION_CONTRACT_VERSION, PublicationError, PublicationOutcome,
+    PublicationRequest, PublicationSource, PublicationStatus, PublicationTracker,
+    RendererCapabilities,
 };
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
 pub use transaction::{

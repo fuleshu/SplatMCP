@@ -62,6 +62,29 @@
         letter-spacing: 0.02em;
         margin-right: 4px;
       }
+      #display-badge {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      #display-badge[data-lagging="true"] {
+        color: var(--accent);
+      }
+      .job {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-left: auto;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .job progress {
+        width: 120px;
+        height: 8px;
+      }
+      .job[hidden] {
+        display: none;
+      }
       #status {
         margin-left: auto;
         color: var(--muted);
@@ -232,6 +255,15 @@
         <button id="open-button" type="button">Open Splat</button>
         <button id="save-button" type="button" disabled>Save Splat</button>
         <p id="status"></p>
+        <span id="display-badge" hidden
+              title="Which revision the viewer has actually drawn, next to the one the document committed. A revision can be committed before it is displayed."></span>
+        <div class="job">
+          <progress id="job-progress" max="100" value="0"
+                    title="Progress of the newest desktop job: an import, an export or an inspection."></progress>
+          <span id="job-label"></span>
+          <button id="job-cancel" type="button"
+                  title="Ask the newest job to stop at its next checkpoint. A job that already committed is reported as committed.">Cancel</button>
+        </div>
       </header>
       <div class="workspace">
         <aside class="sidebar">

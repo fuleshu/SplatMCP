@@ -293,6 +293,17 @@ impl EditBatch {
                 EditOp::SetOpacity { factor } => text.push_str(&format!("set_opacity{factor:?}")),
                 EditOp::Duplicate { by } => text.push_str(&format!("duplicate{by:?}")),
                 EditOp::Remove => text.push_str("remove"),
+                EditOp::Patch { patch } => {
+                    // The payload's own bytes identify the request: a retry that re-registers
+                    // the same values from another asset id hashes the same.
+                    text.push_str(&format!(
+                        "patch{}/{}/{}/{:016x}",
+                        patch.attribute().name(),
+                        patch.descriptor().shape.describe(),
+                        patch.descriptor().encoding.as_str(),
+                        patch.payload_hash()
+                    ));
+                }
                 EditOp::Merge { points } => {
                     text.push_str(&format!("merge:{}", points.len()));
                     for point in points {

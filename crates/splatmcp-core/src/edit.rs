@@ -8,8 +8,19 @@
 //! Colour is fixed per gaussian - there are no spherical harmonics - so `set_color` is
 //! the only colour operation and it writes RGB directly.
 
+use std::sync::Arc;
+
+use crate::asset::AttributePatch;
 use crate::contract::{multiply_quaternions, rotate_vector};
 use crate::{Result, Splat, SplatError, SplatPoint, normalize_quat};
+
+/// Turns a refused patch into the error type an edit step reports.
+///
+/// The message keeps the patch's own reason *and* its stable code, so a caller reading a
+/// receipt can tell a shape mistake from a contract violation.
+fn patch_failure(error: crate::asset::PatchError) -> SplatError {
+    SplatError::Format(format!("{} ({})", error, error.code()))
+}
 
 /// Axis-aligned region used to select points.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,6 +173,12 @@ pub enum EditOp {
     Remove,
     /// Add gaussians at the end, keeping the rest untouched.
     Merge { points: Vec<SplatPoint> },
+    /// Write one attribute of the selection from a decoded binary payload.
+    ///
+    /// The payload holds exactly one row per selected gaussian, in selection order. It is
+    /// planned (decoded, converted and budget-checked) before the step runs, so a malformed
+    /// payload fails before anything is committed.
+    Patch { patch: Arc<AttributePatch> },
 }
 
 /// Result of one operation.
@@ -349,6 +366,11 @@ pub(crate) fn apply_to_indices(splat: &mut Splat, indices: &[usize], op: &EditOp
                 splat.points.remove(*index);
             }
         }
+        EditOp::Patch { patch } => {
+            patch
+                .apply_rows(&mut splat.points, indices)
+                .map_err(patch_failure)?;
+        }
     }
 
     Ok(())
@@ -444,6 +466,11 @@ pub(crate) fn validate_op(op: &EditOp) -> Result<()> {
             }
             Ok(())
         }
+        EditOp::Patch { patch } => patch
+            .descriptor()
+            .validate()
+            .map_err(patch_failure)
+            .map(|_| ()),
     }
 }
 
