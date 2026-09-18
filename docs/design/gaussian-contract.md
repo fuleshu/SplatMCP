@@ -79,10 +79,35 @@ the PLY field is an SH degree-0 coefficient that is linear in the same way. `lin
 and `srgb_to_linear` exist for images a caller writes or reads (an export, a swatch file) —
 never for the model or the file format — so a value can never be gamma converted twice.
 
-## PLY import: attributes, defaults and diagnostics
+## PLY import: policy, attributes, defaults and diagnostics
 
-- **Required**: the 14 canonical properties (`x y z f_dc_0..2 opacity scale_0..2 rot_0..3`).
-  A file missing one is refused; nothing is silently defaulted at the file boundary.
+Import is **strict by default**. A file whose values do not satisfy the contract is refused,
+with bounded *indexed* diagnostics (`point 3 rotation [0, 0, 0, 0] must be a non-zero
+(w, x, y, z) quaternion`), and the refusal says how to accept it deliberately. Silent repair
+is never the default at an import boundary.
+
+| Policy | Who selects it | Behaviour |
+| --- | --- | --- |
+| `PlyImportPolicy::Strict` | the default: `read_ply`, and every tool that was not asked otherwise | refuses a file that needs repair |
+| `PlyImportPolicy::Repair` | `read_ply_repairing`, or `repair: true` on `load_splat`, `edit_splat`, `splat_info`, `viewer.load_ply` and `document.reload` | repairs, and reports every change with the index it happened at |
+
+### What is refused, what is repaired, and what is neither
+
+| Value | Strict | Repair |
+| --- | --- | --- |
+| position, `f_dc_*` coefficient, or an opacity logit that is `NaN`/infinite where infinite has no meaning | error | error: nothing sensible can be invented |
+| radius that is zero, unreadable or overflowing (`exp` of an extreme log-scale) | error `point N scale` | `f32::MIN_POSITIVE`, reported |
+| quaternion that is all zero, unreadable or shorter than `QUATERNION_MIN_NORM` | error `point N rotation` | identity rotation, reported |
+| `f_dc_*` outside the representable window | error `point N color` | clamped to the endpoint, reported |
+| finite quaternion whose length is not 1 (beyond `QUATERNION_LENGTH_TOLERANCE`) | accepted, rescaled, and **counted in the report** | same, reported |
+| serialized endpoints: log-scale `0`, logit `+/-inf` | accepted, not reported | accepted, not reported |
+
+One gaussian contributes at most one violation, so a report's counts are counts of gaussians
+to fix rather than a pile of field errors.
+
+- **Required properties**: the 14 canonical ones (`x y z f_dc_0..2 opacity scale_0..2
+  rot_0..3`). A file missing one is refused; nothing is silently defaulted at the file
+  boundary.
 - **Written**: the canonical 17-property order, including `nx`/`ny`/`nz` as zeros, which
   other viewers expect. The model keeps no normals, so a re-import reports them as dropped.
 - **Discarded, with a reason** (`contract::ply_attribute_use`): `f_rest_*` (higher
@@ -91,17 +116,21 @@ never for the model or the file format — so a value can never be gamma convert
   documented defaults (`color = [0.85, 0.25, 0.2]`, `opacity = 0.9`, `radius = 0.02 m`,
   identity rotation), which are part of the tool schema rather than hidden in a parser.
 
-`read_ply_with_report` returns the same gaussians as `read_ply` plus a `PlyReport`:
+`read_ply_with_policy` returns the gaussians the policy promises, plus a `PlyReport`:
 
 | Report part | Contents |
 | --- | --- |
+| `policy` | `strict` or `repair` |
 | `discarded` | every dropped attribute with the reason |
 | `ignored_elements` | every non-`vertex` element that was stepped over |
 | `repairs` / `total_repairs` | repaired values, the first 16 listed, all counted |
+| `normalized` / `total_normalized` | quaternions rescaled to unit length, bounded the same way |
 
-**Repairs** (recorded, never hidden): an unreadable or non-positive radius becomes
-`f32::MIN_POSITIVE`; an unreadable or degenerate quaternion becomes the identity rotation; an
-`f_dc` coefficient outside the representable window is clamped to the endpoint.
+The tool and bridge layers turn that report into a bounded `PlyImportSummary` in the reply
+whenever the import was not lossless (`load_splat`, `edit_splat`, `splat_info` on a path,
+`viewer.load_ply`, `document.reload`), so whoever receives the geometry also receives what
+the import did to the file.
+
 
 **Errors** (nothing sensible can be invented): a non-finite position, a non-finite `f_dc`
 coefficient, and a `NaN` opacity logit. `±inf` logits are the opacity endpoints above.
@@ -129,7 +158,10 @@ Entry points, and how each one fails:
 | `validation::check_values` / `check_gaussian` / `IssueRecorder` | strict, indexed, bounded reporting for an adapter's own arrays |
 | `Splat::check` / `check_strict` | full report, or a structured `ValidationError` |
 | `Splat::validate` | the document invariant: the first problem as a terse message |
-| `read_ply_with_report` | refuses unreadable values, reports repairs |
+| `read_ply` / `read_ply_with_policy(.., Strict)` | refuses a file that needs repair, with indexed diagnostics |
+| `read_ply_repairing` / `read_ply_with_policy(.., Repair)` | repairs and reports every change |
+| MCP `load_splat`, `edit_splat`, `splat_info` | strict unless `repair: true`; the reply carries `import` |
+| bridge `viewer.load_ply`, `document.reload` | strict unless `repair: true`; the reply carries `import` |
 | MCP `create_splat` / `edit_splat` (`merge`) | explicit points are validated before they are clamped, with `points[i]`/`point i` in the message |
 | Python `GaussianBatch::validate` | the same rules for the NumPy arrays (own error codes, same reasons) |
 
@@ -192,10 +224,13 @@ this task:
    colour/opacity outside `0..=1` (beyond the `1e-3` round-trip tolerance) or a degenerate
    quaternion now fails with an indexed message instead of being silently clamped. In-range
    values behave exactly as before, and a non-unit but usable quaternion is still normalised.
-2. **PLY import reports what it did.** `read_ply` is unchanged; `read_ply_with_report` adds
-   the dropped attributes, skipped elements and repaired values.
-3. **A `NaN` opacity logit is now an import error** (previously it entered the document as a
-   `NaN` opacity and failed later, on write). `±inf` logits remain valid endpoints.
+2. **PLY import is strict by default and reports what it did.** `read_ply` now refuses a file
+   that needs repair instead of repairing it in silence; `read_ply_with_policy` returns the
+   report, and `repair: true` (or `PlyImportPolicy::Repair`) is the explicit opt-in. A file
+   that an earlier build loaded *and repaired* now fails until the caller asks for repair,
+   which is the point: the repair becomes a decision the caller makes and sees.
+3. **A `NaN` opacity logit is an import error** (previously it entered the document as a
+   `NaN` opacity and failed later, on write). Infinite logits remain valid endpoints.
 4. **`splat_info` returns bounded metadata.** The reply gained an `inspection` object and, on
    the displayed document, is answered from the app's own state. Every field it had before is
    still there with the same meaning. If the app cannot serve `document.inspect` (an older

@@ -40,6 +40,7 @@ impl Handler for FakeApp {
                     file_name: "scene.ply".to_owned(),
                     ..splatmcp_bridge::DocumentSummary::default()
                 }),
+                import: None,
             })),
             Method::ViewerGetCamera => Ok(json!({
                 "position": [2.0, 1.5, 3.7],

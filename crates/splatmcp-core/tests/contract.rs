@@ -15,7 +15,9 @@ use splatmcp_core::validation::{
     self, IssueRecorder, ValidationLimits, ValidationReason,
 };
 use splatmcp_core::{
-    MAX_REPORTED_ISSUES, Splat, SplatPoint, read_ply, read_ply_with_report, write_ply,
+    MAX_REPORTED_ISSUES, PlyImportPolicy, Splat, SplatPoint, read_ply, read_ply_repairing,
+    read_ply_with_policy,
+    write_ply,
 };
 
 /// PLY property names, in the order the reader resolves them and this file's rows use.
@@ -61,7 +63,7 @@ fn the_contract_is_versioned_and_reported_as_data() {
 #[test]
 fn the_axis_fixture_keeps_its_labels_through_ply_and_the_viewer_flip() {
     let fixture = fixtures::axis_fixture();
-    let (loaded, report) = read_ply_with_report(&write_ply(&fixture).unwrap()).unwrap();
+    let (loaded, report) = read_ply_with_policy(&write_ply(&fixture).unwrap(), PlyImportPolicy::Strict).unwrap();
 
     assert_eq!(loaded.len(), fixture.len());
     assert!(fixtures::labels_match_positions(&loaded), "an axis moved");
@@ -107,7 +109,7 @@ fn the_axis_fixture_keeps_its_labels_through_ply_and_the_viewer_flip() {
 fn a_rotated_anisotropic_gaussian_keeps_its_covariance_through_ply() {
     let splat = fixtures::rotated_fixture();
     let point = splat.points[0];
-    let (loaded, report) = read_ply_with_report(&write_ply(&splat).unwrap()).unwrap();
+    let (loaded, report) = read_ply_with_policy(&write_ply(&splat).unwrap(), PlyImportPolicy::Strict).unwrap();
     let loaded_point = loaded.points[0];
 
     assert_eq!(report.total_repairs, 0);
@@ -151,7 +153,7 @@ fn activated_values_round_trip_within_the_stated_tolerances() {
             [0.0, 1.0, 0.0, 0.0],
         ),
     ]);
-    let (loaded, report) = read_ply_with_report(&write_ply(&splat).unwrap()).unwrap();
+    let (loaded, report) = read_ply_with_policy(&write_ply(&splat).unwrap(), PlyImportPolicy::Strict).unwrap();
     assert_eq!(report.total_repairs, 0);
 
     // Colour is a linear SH coefficient: no gamma is applied on either side.
@@ -256,11 +258,22 @@ fn invalid_raw_input_is_refused_with_an_indexed_reason_at_every_core_entry_point
     assert!(error.contains("non-finite position"), "{error}");
 
     // 5. The importer reports what it had to repair instead of hiding it.
-    let (repaired, report) = read_ply_with_report(&ascii_ply("0 0 0 0 0 0 0 NaN NaN NaN 1 0 0 0"))
+    let (repaired, report) = read_ply_with_policy(
+        &ascii_ply("0 0 0 0 0 0 0 NaN NaN NaN 1 0 0 0"),
+        PlyImportPolicy::Repair,
+    )
         .unwrap();
-    assert_eq!(report.total_repairs, 3);
+    // One repair per damaged field of the row: the radius field, not one per axis.
+    assert_eq!(report.total_repairs, 1);
+    assert_eq!(report.changed_values(), 1);
     assert_eq!(repaired.points[0].scale, [f32::MIN_POSITIVE; 3]);
     assert!(report.repairs.iter().all(|repair| repair.field == "scale"));
+    // The same file is refused when repair was not asked for, and the refusal is indexed.
+    let refused = read_ply(&ascii_ply("0 0 0 0 0 0 0 NaN NaN NaN 1 0 0 0"))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("point 0 scale"), "{refused}");
+    assert!(refused.contains("repair"), "{refused}");
 }
 
 #[test]
@@ -323,10 +336,48 @@ fn a_valid_file_from_elsewhere_reports_nothing_to_fix() {
     // `tests/data/external_grid.ply` is authored outside this crate; the report must not
     // invent repairs for it.
     let bytes = include_bytes!("data/external_grid.ply");
-    let (splat, report) = read_ply_with_report(bytes).unwrap();
+    let (splat, report) = read_ply_with_policy(bytes, PlyImportPolicy::Strict).unwrap();
     assert_eq!(splat.len(), 189);
     assert_eq!(report.vertex_count, 189);
     assert_eq!(report.total_repairs, 0, "{}", report.summary());
     assert!(!report.ascii, "the sample is a binary PLY");
     assert_eq!(splat, read_ply(bytes).unwrap());
+}
+
+#[test]
+fn the_reviewed_invalid_quaternion_file_is_refused_strictly_and_repaired_on_request() {
+    // The exact file the review reproduced the defect with: five gaussians, the first
+    // carrying a [0, 0, 0, 0] quaternion, which used to become the identity rotation in
+    // silence - the load succeeded and nothing in the reply said a value had been replaced.
+    let bytes = include_bytes!("data/invalid_quaternion.ply");
+
+    // Strict, which is now the default: refused, indexed, and told how to proceed.
+    let error = read_ply(bytes).unwrap_err().to_string();
+    assert!(error.contains("point 0 rotation"), "{error}");
+    assert!(error.contains("1 of 5 gaussians are invalid"), "{error}");
+    assert!(error.contains("[0, 0, 0, 0]"), "{error}");
+    assert!(error.contains("repair"), "{error}");
+
+    // Repair, which is now an explicit decision the caller makes and sees.
+    let (splat, report) = read_ply_repairing(bytes).unwrap();
+    assert_eq!(splat.len(), 5);
+    assert_eq!(report.total_repairs, 1, "exactly the one damaged value");
+    assert_eq!(report.repairs[0].point, 0);
+    assert_eq!(report.repairs[0].field, "rotation");
+    assert_eq!(splat.points[0].rotation, [1.0, 0.0, 0.0, 0.0], "the value that replaced it");
+    // Everything else is untouched: the quarter turn on the last gaussian survives, and
+    // an ordinary unit quaternion is not reported as rescaled.
+    assert!((splat.points[4].rotation[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4);
+    assert_eq!(report.total_normalized, 0, "float rounding stays quiet");
+    assert_eq!(splat.points[1].rotation, [1.0, 0.0, 0.0, 0.0]);
+    splat.validate().unwrap();
+
+    // The attributes the model cannot keep are named too, so a caller sees the whole
+    // import rather than only the repair.
+    assert_eq!(report.discarded_names(), vec!["nx", "ny", "nz"]);
+    assert_eq!(report.vertex_count, 5);
+
+    // And the wire summary a tool reply carries says the same thing.
+    let summary = splatmcp_core::PlyReport::summary(&report);
+    assert!(summary.contains("1 value(s) repaired"), "{summary}");
 }

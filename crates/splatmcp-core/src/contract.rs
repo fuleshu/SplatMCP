@@ -88,6 +88,13 @@ pub const QUATERNION_MIN_NORM: f32 = 1e-6;
 /// just outside `0..=1`. Anything further out is refused, never silently clamped.
 pub const RANGE_TOLERANCE: f32 = 1e-3;
 
+/// How far a quaternion's length may differ from 1 before an importer reports that it had to
+/// rescale it.
+///
+/// Float rounding leaves a stored unit quaternion at `1 ± 1e-7`, so this keeps an ordinary
+/// file quiet while a genuinely scaled quaternion is reported instead of silently normalised.
+pub const QUATERNION_LENGTH_TOLERANCE: f32 = 1e-3;
+
 /// Machine readable statement of the contract, for tool replies and runtime metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Contract {

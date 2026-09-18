@@ -17,7 +17,8 @@ use splatmcp_bridge::{
     CommitPreviewRequest, ComponentSummary, ComponentsReply, ComponentsRequest, DocumentPlyReply,
     DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest,
     GetPlyRequest, Handler, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
-    InspectionSummary, LoadPlyRequest, Method, PreviewSummary, PythonCancelRequest, PythonJobQuery,
+    InspectionSummary, LoadPlyRequest, Method, PlyImportSummary, PreviewSummary,
+    PythonCancelRequest, PythonJobQuery,
     PythonRunRequest, ReloadRequest, RetentionSummary, SelectionParams, SelectionSummary,
     SetComponentRequest, SideEffectSummary, StepSummary, TransformSummary, ViewerStatus,
 };
@@ -26,7 +27,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use splatmcp_core::validation::ValidationLimits;
 use splatmcp_core::{
     BatchStep, BatchTargets, Box3, ComponentId, EditBatch, EditOp, Expected, Frame, LocalTransform,
-    PointId, SelectionQuery, Sphere, SplatPoint,
+    PlyImportPolicy, PointId, SelectionQuery, Sphere, SplatPoint,
 };
 
 use crate::document::{self, AppState, Mutation, MutationKind, OutcomeInfo, SplatInfo};
@@ -142,19 +143,23 @@ impl AppBridge {
             .unwrap_or_else(|| "splat.ply".to_owned());
         let expected =
             document::expected_target(request.document_id.as_deref(), request.expected_revision)?;
+        // Repair is opt-in: without it a file that would need repair is refused with indexed
+        // diagnostics instead of being loaded as a quietly repaired document.
+        let policy = PlyImportPolicy::from_repair_flag(request.repair);
 
         let state = self.app.state::<AppState>();
-        let metadata = match expected {
-            Expected::Any => state.open_ply(&bytes, Mutation::import(file_name))?,
+        let imported = match expected {
+            Expected::Any => state.open_ply(&bytes, Mutation::import(file_name), policy)?,
             target => state.replace_ply(
                 target,
                 &bytes,
                 Mutation::new(MutationKind::Edit)
                     .operation("load_splat")
                     .file_name(file_name),
+                policy,
             )?,
         };
-        let info = SplatInfo::of(&metadata);
+        let info = SplatInfo::of(&imported.metadata);
 
         let value = self.viewer.request(
             Method::ViewerLoadPly,
@@ -165,8 +170,10 @@ impl AppBridge {
             .map_err(|error| format!("the viewer returned an unexpected reply: {error}"))?;
         status.point_count = info.point_count;
         status.loaded = true;
-        // The reply identifies the revision the caller actually got.
-        status.document = Some(DocumentSummary::from(&metadata));
+        // The reply identifies the revision the caller actually got, and what the import did
+        // to the file it came from.
+        status.document = Some(DocumentSummary::from(&imported.metadata));
+        status.import = PlyImportSummary::of(&imported.report);
         serde_json::to_value(status).map_err(|error| error.to_string())
     }
 
@@ -222,10 +229,12 @@ impl AppBridge {
             Some(revision) => Expected::Revision(revision),
             None => Expected::Any,
         };
-        let metadata = state.reload(expected)?;
+        let policy = PlyImportPolicy::from_repair_flag(request.repair);
+        let imported = state.reload(expected, policy)?;
         serde_json::to_value(DocumentReply {
-            document: DocumentSummary::from(&metadata),
+            document: DocumentSummary::from(&imported.metadata),
             retention: RetentionSummary::from(state.retention()),
+            import: PlyImportSummary::of(&imported.report),
         })
         .map_err(|error| error.to_string())
     }
@@ -247,6 +256,7 @@ impl AppBridge {
         serde_json::to_value(DocumentReply {
             document: DocumentSummary::from(&metadata),
             retention: RetentionSummary::from(state.retention()),
+            import: None,
         })
         .map_err(|error| error.to_string())
     }
@@ -1097,6 +1107,7 @@ mod tests {
             canvas_height: 720,
             camera: None,
             document: None,
+            import: None,
         };
         // The handler overwrites the count and fills in the resolved identity.
         let mut adjusted = status.clone();

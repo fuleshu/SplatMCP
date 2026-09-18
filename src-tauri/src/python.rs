@@ -254,9 +254,7 @@ impl DocumentTarget for AppDocumentTarget {
     fn snapshot(&self, target: &TargetSpec) -> splatmcp_python::Result<SourceSnapshot> {
         let state = self.app.state::<AppState>();
         let expected = expected_for(target)?;
-        let snapshot = state
-            .snapshot(expected)
-            .map_err(|error| PythonError::DocumentConflict(error.to_string()))?;
+        let snapshot = state.snapshot(expected).map_err(|error| python_error(&error))?;
         Ok(SourceSnapshot {
             document_id: snapshot.handle().document_id.to_string(),
             revision: snapshot.handle().revision,
@@ -299,7 +297,7 @@ impl DocumentTarget for AppDocumentTarget {
                     request.splat,
                     with_component(Mutation::job(&operation, recipe).file_name(file_name)),
                 )
-                .map_err(|error| PythonError::DocumentConflict(error.to_string()))?;
+                .map_err(|error| python_error(&error))?;
             return Ok(CommitOutcome::Committed {
                 identity: identity_of(&metadata),
             });
@@ -313,7 +311,7 @@ impl DocumentTarget for AppDocumentTarget {
             }),
             Err(error) => match conflict_of(&error, &request.target) {
                 Some(conflict) => Ok(conflict),
-                None => Err(PythonError::DocumentConflict(error.to_string())),
+                None => Err(python_error(&error)),
             },
         }
     }
@@ -363,9 +361,8 @@ impl AppDocumentTarget {
 fn expected_for(target: &TargetSpec) -> splatmcp_python::Result<Expected> {
     match (target.document_id.as_deref(), target.expected_revision) {
         (Some(text), Some(revision)) => {
-            let document_id = DocumentId::parse(text).ok_or_else(|| {
-                PythonError::DocumentConflict(format!("'{text}' is not a document id"))
-            })?;
+            let document_id = DocumentId::parse(text)
+                .ok_or_else(|| PythonError::UnknownDocument(format!("'{text}' is not a document id")))?;
             Ok(Expected::Handle(DocumentHandle::new(document_id, revision)))
         }
         (Some(text), None) => Err(PythonError::DocumentConflict(format!(
@@ -374,6 +371,20 @@ fn expected_for(target: &TargetSpec) -> splatmcp_python::Result<Expected> {
         ))),
         (None, Some(revision)) => Ok(Expected::Revision(revision)),
         (None, None) => Ok(Expected::Any),
+    }
+}
+
+/// Maps a document failure onto the code that names it.
+///
+/// The three cases stay distinguishable, because the answer differs: a document that is no
+/// longer available means the request named something that is gone, a revision conflict
+/// means "re-read the revision and try again", and an expired snapshot means the revision
+/// is past retention. Only an invalid *request* keeps the pre-existing `document_conflict`
+/// shape, because that is the code the service already documents for a malformed target.
+fn python_error(error: &ServiceError) -> PythonError {
+    match error.document_error() {
+        Some(document) => PythonError::document(document),
+        None => PythonError::DocumentConflict(error.to_string()),
     }
 }
 
@@ -557,6 +568,7 @@ pub struct PythonHostState(pub Arc<PythonHost>);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splatmcp_core::DocumentId;
 
     #[test]
     fn an_unavailable_runner_reports_why_and_refuses_jobs() {
@@ -566,5 +578,82 @@ mod tests {
         let info = runner.describe();
         assert!(!info.ready);
         assert!(info.error.unwrap().contains("no interpreter"));
+    }
+
+    #[test]
+    fn a_job_keeps_the_document_failure_it_hit() {
+        let handle = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 3);
+        let cases = [
+            (
+                ServiceError::Document(DocumentError::NoDocument),
+                "no_document",
+            ),
+            (
+                ServiceError::Document(DocumentError::UnknownDocument {
+                    document_id: DocumentId::mint(0x4f2a, 9),
+                    active: Some(DocumentId::mint(0x4f2a, 1)),
+                }),
+                "unknown_document",
+            ),
+            (
+                ServiceError::Document(DocumentError::SnapshotExpired {
+                    handle: handle.clone(),
+                }),
+                "snapshot_expired",
+            ),
+            (
+                ServiceError::Document(DocumentError::Conflict {
+                    expected: DocumentHandle::new(handle.document_id.clone(), 2),
+                    current: handle.clone(),
+                }),
+                "document_conflict",
+            ),
+            // A malformed request keeps the code the service documents for a bad target.
+            (
+                ServiceError::Invalid("component_id must not be blank".to_owned()),
+                "document_conflict",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(python_error(&error).code(), code, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_target_that_is_not_a_document_id_is_an_unknown_document() {
+        let target = TargetSpec {
+            document_id: Some("C:/tmp/scene.ply".to_owned()),
+            component_id: None,
+            expected_revision: Some(1),
+            file_name: None,
+        };
+        assert_eq!(expected_for(&target).unwrap_err().code(), "unknown_document");
+    }
+
+    #[test]
+    fn only_a_revision_race_becomes_a_conflict_outcome() {
+        let handle = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 3);
+        let target = TargetSpec::component(handle.document_id.to_string(), "roof", 2);
+        let stale = ServiceError::Document(DocumentError::Conflict {
+            expected: DocumentHandle::new(handle.document_id.clone(), 2),
+            current: handle.clone(),
+        });
+        let outcome = conflict_of(&stale, &target).expect("a stale revision is a conflict");
+        assert!(matches!(
+            outcome,
+            CommitOutcome::Conflict {
+                expected: 2,
+                actual: 3,
+                ..
+            }
+        ));
+
+        // A document that is gone is an error, not a conflict: the job did not merely arrive
+        // late, so a caller must not be told to retry against the revision it can see.
+        let gone = ServiceError::Document(DocumentError::UnknownDocument {
+            document_id: DocumentId::mint(0x4f2a, 9),
+            active: Some(handle.document_id.clone()),
+        });
+        assert!(conflict_of(&gone, &target).is_none());
     }
 }

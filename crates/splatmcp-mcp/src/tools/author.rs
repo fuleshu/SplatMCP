@@ -285,6 +285,22 @@ pub fn splat_reply(
 mod tests {
     use super::*;
 
+    /// A two-point ASCII PLY whose first quaternion is all zero.
+    fn ascii_with_zero_quaternion() -> Vec<u8> {
+        const PROPERTIES: [&str; 14] = [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let mut header = String::from("ply\nformat ascii 1.0\nelement vertex 2\n");
+        for name in PROPERTIES {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        header.push_str("end_header\n");
+        header.push_str("0 0 0 0 0 0 0 -8 -8 -8 0 0 0 0\n");
+        header.push_str("1 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
+        header.into_bytes()
+    }
+
     #[test]
     fn a_bare_call_builds_the_documented_default() {
         let splat = build_splat(&CreateInput::default()).unwrap();
@@ -460,6 +476,7 @@ mod tests {
                 point_count: 1000,
                 ..splatmcp_bridge::DocumentSummary::default()
             }),
+            import: None,
         };
         let reply = splat_reply(&splat, None, true, Some(&status));
         let document = reply.document.expect("the identity travels with the reply");
@@ -471,6 +488,22 @@ mod tests {
         silent.document = None;
         let reply = splat_reply(&splat, None, true, Some(&silent));
         assert!(reply.document.is_none());
+    }
+
+    #[test]
+    fn a_reply_reports_what_an_import_did_to_a_file() {
+        let splat = build_splat(&CreateInput::default()).unwrap();
+        let plain = splat_reply(&splat, None, true, None);
+        let encoded = serde_json::to_string(&plain).unwrap();
+        assert!(!encoded.contains("import"), "{encoded}");
+
+        let (_, report) = splatmcp_core::read_ply_repairing(&ascii_with_zero_quaternion()).unwrap();
+        let summary = splatmcp_bridge::PlyImportSummary::of(&report);
+        let reply = plain.with_import(summary);
+        let encoded = serde_json::to_string(&reply).unwrap();
+        assert!(encoded.contains("\"import\""), "{encoded}");
+        assert!(encoded.contains("point 0 rotation"), "{encoded}");
+        assert!(encoded.contains("\"policy\":\"repair\""), "{encoded}");
     }
     #[test]
     fn explicit_points_are_checked_before_they_are_clamped() {

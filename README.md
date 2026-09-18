@@ -72,7 +72,7 @@ those bytes as binary data.
 | `splat_components` | named components and stable selections: `list`, `create`, `rename`, `remove`, `transform` (declares an explicit local frame; anisotropic gaussians are transformed through their covariance, and singular or reflecting frames are refused), `members` (bind a selection to a component), `apply_transform` (transform those members as a committed edit) and `select` (a revision-bound handle with count, bounds and a bounded sample) |
 | `create_splat` | build a splat from a shape (`sphere`, `cube`, `plane`, `line`, `shell`, `ring`, `grid`) or explicit points, optionally write a `.ply`, and show it |
 | `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) to the displayed document, a `.ply`, or a new empty one, each with an optional box/attribute selection; reports the document id and revision the edit landed in |
-| `load_splat` | display an existing `.ply` and frame it |
+| `load_splat` | display an existing `.ply` and frame it; the import is strict, so a file that needs repair is refused with indexed diagnostics unless `repair: true` accepts it and the reply reports every change |
 | `splat_info` | document id, revision, point count, bounds, mean colour, opacity range, scale/colour distributions, contract diagnostics and buffer sizes; reads the displayed document as bounded metadata, and shows the first *n* gaussians when asked |
 | `set_camera` | move the camera: `fit`, an explicit position, or orbit values |
 | `get_camera` | report position, target and field of view |
@@ -269,9 +269,10 @@ MCP server to the live window, the eight M4 tools work end to end, and window ge
 persisted.
 
 The Gaussian contract is versioned and enforced: raw values are validated before any
-clamping constructor at every boundary, PLY import reports the attributes it dropped and the
-values it repaired, and inspecting a 500 000-Gaussian document returns bounded metadata
-without transferring geometry. See [docs/design/gaussian-contract.md](docs/design/gaussian-contract.md).
+clamping constructor at every boundary, PLY import is strict by default and only repairs a
+file when the caller asks for it, reporting every changed value and every dropped attribute
+in the reply, and inspecting a 500 000-Gaussian document returns bounded metadata without
+transferring geometry. See [docs/design/gaussian-contract.md](docs/design/gaussian-contract.md).
 
 The embedded Python generation milestone is implemented: the app hosts one CPython
 interpreter and one generation service, the four `python_*` tools and the desktop panel

@@ -14,10 +14,13 @@ use splatmcp_bridge::protocol::ViewerStatus;
 use splatmcp_bridge::{
     BatchOpParams, BatchPointParams, CommitPreviewRequest, ComponentsRequest,
     DocumentTargetRequest, EditBatchRequest, InspectResult, InspectionSummary, Method,
-    SelectionParams, load_ply_params, replace_ply_params,
+    PlyImportSummary, SelectionParams, load_ply_params, replace_ply_params,
 };
 use splatmcp_core::validation::IssueRecorder;
-use splatmcp_core::{Box3, EditOp, EditStep, Selection, Splat, apply_all, read_ply, write_ply};
+use splatmcp_core::{
+    Box3, EditOp, EditStep, PlyImportPolicy, PlyReport, Selection, Splat, apply_all,
+    read_ply_with_policy, write_ply,
+};
 
 use crate::bridge::AppLink;
 use crate::tools::{Factor, PointOut, SplatSummary, round3};
@@ -42,6 +45,12 @@ pub struct EditInput {
     /// Show the result in the SplatMCP window. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<bool>,
+    /// Accept a file source that needs repair, reporting every change it makes.
+    ///
+    /// Default false: a damaged file is refused with indexed diagnostics instead of being
+    /// edited as if it were intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// The edit operations a step can ask for.
@@ -495,6 +504,12 @@ pub fn history_target(input: &HistoryInput) -> DocumentTargetRequest {
 pub struct LoadInput {
     /// `.ply` file to display.
     pub path: String,
+    /// Accept a file that needs repair, reporting every change it makes.
+    ///
+    /// Default false: a damaged file is refused with indexed diagnostics rather than
+    /// loaded as a quietly repaired document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// Parameters of `splat_info`.
@@ -506,6 +521,12 @@ pub struct InfoInput {
     /// Include the first `n` points in the reply, for detailed inspection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub points: Option<usize>,
+    /// Accept a file that needs repair, reporting every change it makes.
+    ///
+    /// Default false: a damaged file is refused with indexed diagnostics instead of being
+    /// described as if it were intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// Edits applied to a splat, with one report per step.
@@ -521,6 +542,9 @@ pub struct EditReply {
     pub document: Option<DocumentIdentity>,
     /// Points touched by each step, in order.
     pub steps: Vec<StepReport>,
+    /// What the import of a file source did, when it was not lossless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<PlyImportSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub displayed: bool,
@@ -556,6 +580,9 @@ pub struct InfoReply {
     /// an addition to the reply, so a caller that only wanted the summary is unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<DocumentIdentity>,
+    /// What the import of a file source did, when it was not lossless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<PlyImportSummary>,
 }
 
 /// Identity and revision of the document a reply describes.
@@ -690,10 +717,22 @@ pub fn to_step(input: &EditOpInput, index: usize) -> Result<EditStep, String> {
     Ok(EditStep::with_selection(op, selection))
 }
 
-/// Reads a splat from a `.ply` file.
-pub fn read_splat_file(path: &str) -> Result<Splat, String> {
+/// What a file source produced: the geometry plus what the import reported.
+pub struct FileSource {
+    pub splat: Splat,
+    pub report: PlyReport,
+}
+
+/// Reads a splat from a `.ply` file under `policy`, reporting what the import did.
+///
+/// Strict by default: a file that would need repair is refused with indexed diagnostics, so
+/// a tool call cannot silently change a caller's data. `repair: true` accepts the file and
+/// the reply then names every value that was changed.
+pub fn read_splat_file(path: &str, policy: PlyImportPolicy) -> Result<FileSource, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("could not read {path}: {error}"))?;
-    read_ply(&bytes).map_err(|error| format!("{path} is not a readable splat: {error}"))
+    let (splat, report) = read_ply_with_policy(&bytes, policy)
+        .map_err(|error| format!("{path} is not a readable splat: {error}"))?;
+    Ok(FileSource { splat, report })
 }
 
 /// `true` when the source names a file rather than a keyword.
@@ -712,10 +751,19 @@ pub struct ResolvedSource {
     pub path: Option<String>,
     /// Identity of the displayed document, when the source was the app.
     pub document: Option<DocumentIdentity>,
+    /// What reading a file source did, when it was not lossless.
+    pub import: Option<PlyImportSummary>,
 }
 
-/// Resolves where a splat comes from and loads it.
-pub fn resolve_source(link: &AppLink, source: Option<&str>) -> Result<ResolvedSource, String> {
+/// Resolves where a splat comes from and loads it under `policy`.
+///
+/// The policy only applies to a file source: the displayed document is served by the app as
+/// bytes this crate wrote, which already satisfy the contract.
+pub fn resolve_source(
+    link: &AppLink,
+    source: Option<&str>,
+    policy: PlyImportPolicy,
+) -> Result<ResolvedSource, String> {
     let source = source.unwrap_or(SOURCE_VIEWER).trim().to_owned();
     if source.eq_ignore_ascii_case(SOURCE_NEW) {
         return Ok(ResolvedSource {
@@ -723,6 +771,7 @@ pub fn resolve_source(link: &AppLink, source: Option<&str>) -> Result<ResolvedSo
             source: "new".to_owned(),
             path: None,
             document: None,
+            import: None,
         });
     }
     if source.eq_ignore_ascii_case(SOURCE_VIEWER) {
@@ -737,22 +786,25 @@ pub fn resolve_source(link: &AppLink, source: Option<&str>) -> Result<ResolvedSo
             );
         }
         let document = document_ply(link)?;
-        let splat = read_ply(&document.1)
-            .map_err(|error| format!("the displayed splat could not be read: {error}"))?;
+        let splat = read_ply_with_policy(&document.1, PlyImportPolicy::Strict)
+            .map_err(|error| format!("the displayed splat could not be read: {error}"))?
+            .0;
         return Ok(ResolvedSource {
             splat,
             source: "viewer".to_owned(),
             path: None,
             document: document.0,
+            import: None,
         });
     }
     if looks_like_path(&source) {
-        let splat = read_splat_file(&source)?;
+        let file = read_splat_file(&source, policy)?;
         return Ok(ResolvedSource {
-            splat,
+            splat: file.splat,
             source: format!("path:{source}"),
             path: Some(source),
             document: None,
+            import: PlyImportSummary::of(&file.report),
         });
     }
     Err(format!(
@@ -879,9 +931,16 @@ pub fn edit_reply(
         summary: SplatSummary::of(splat),
         document,
         steps,
+        import: None,
         path,
         displayed,
     }
+}
+
+/// Same reply, reporting what reading a file source did.
+pub fn with_import(mut reply: EditReply, import: Option<PlyImportSummary>) -> EditReply {
+    reply.import = import;
+    reply
 }
 
 /// Builds the reply of `splat_info`.
@@ -910,7 +969,16 @@ pub fn info_reply_with_document(
         sample,
         source: Some(source),
         document,
+        import: None,
     }
+}
+
+/// Same reply, reporting what reading a file source did.
+pub fn info_reply_with_import(
+    reply: InfoReply,
+    import: Option<PlyImportSummary>,
+) -> InfoReply {
+    InfoReply { import, ..reply }
 }
 
 /// Bounded inspection of a splat that is already in memory.
@@ -967,6 +1035,7 @@ pub fn info_reply_from_inspect(result: InspectResult) -> InfoReply {
         sample: None,
         source: Some(SOURCE_VIEWER.to_owned()),
         document,
+        import: None,
     }
 }
 
@@ -1268,11 +1337,11 @@ mod tests {
     fn source_keywords_are_validated() {
         // No app is running here, so `viewer` fails on the bridge, not on the name.
         let link = AppLink::new(false);
-        let error = resolve_source(&link, Some("gallery")).unwrap_err();
+        let error = resolve_source(&link, Some("gallery"), PlyImportPolicy::Strict).unwrap_err();
         assert!(error.contains("unknown source 'gallery'"), "{error}");
         assert!(error.contains("viewer"), "{error}");
 
-        let resolved = resolve_source(&link, Some("new")).unwrap();
+        let resolved = resolve_source(&link, Some("new"), PlyImportPolicy::Strict).unwrap();
         assert!(resolved.splat.is_empty());
         assert_eq!(resolved.source, "new");
         assert_eq!(resolved.path, None);
@@ -1281,7 +1350,8 @@ mod tests {
             "a new splat has no document identity"
         );
 
-        let error = resolve_source(&link, Some("C:/nowhere/missing.ply")).unwrap_err();
+        let error =
+            resolve_source(&link, Some("C:/nowhere/missing.ply"), PlyImportPolicy::Strict).unwrap_err();
         assert!(error.contains("could not read"), "{error}");
     }
 
@@ -1409,6 +1479,61 @@ mod tests {
             ),
         ]);
         assert_eq!(opacity_range(&splat), [0.123, 0.988]);
+    }
+    /// A two-point ASCII PLY whose first quaternion is all zero.
+    fn ascii_with_zero_quaternion() -> Vec<u8> {
+        const PROPERTIES: [&str; 14] = [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let mut header = String::from("ply\nformat ascii 1.0\nelement vertex 2\n");
+        for name in PROPERTIES {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        header.push_str("end_header\n");
+        header.push_str("0 0 0 0 0 0 0 -8 -8 -8 0 0 0 0\n");
+        header.push_str("1 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
+        header.into_bytes()
+    }
+
+    #[test]
+    fn a_file_source_is_strict_by_default_and_repairable_on_request() {
+        let path = std::env::temp_dir().join(format!("splatmcp-import-{}.ply", std::process::id()));
+        std::fs::write(&path, ascii_with_zero_quaternion()).unwrap();
+        let text = path.to_string_lossy().to_string();
+
+        // Default: refuse, with the index and a way forward.
+        let refused = read_splat_file(&text, PlyImportPolicy::Strict)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(refused.contains("point 0 rotation"), "{refused}");
+        assert!(refused.contains("repair"), "{refused}");
+
+        // Explicit: load it and report every change, which is what the reply carries.
+        let repaired = read_splat_file(&text, PlyImportPolicy::Repair).unwrap();
+        assert_eq!(repaired.splat.len(), 2);
+        assert_eq!(repaired.report.total_repairs, 1);
+        let summary = PlyImportSummary::of(&repaired.report).unwrap();
+        assert!(summary.changed[0].contains("point 0 rotation"));
+        assert_eq!(summary.policy, "repair");
+
+        // The policy the tools select from an omitted or explicit flag.
+        assert_eq!(PlyImportPolicy::from_repair_flag(None), PlyImportPolicy::Strict);
+        assert_eq!(PlyImportPolicy::from_repair_flag(Some(true)), PlyImportPolicy::Repair);
+        let strict: LoadInput = serde_json::from_str(r#"{"path":"a.ply"}"#).unwrap();
+        assert_eq!(strict.repair, None);
+        let repairing: LoadInput =
+            serde_json::from_str(r#"{"path":"a.ply","repair":true}"#).unwrap();
+        assert_eq!(repairing.repair, Some(true));
+        let info: InfoInput =
+            serde_json::from_str(r#"{"source":"a.ply","repair":true}"#).unwrap();
+        assert_eq!(info.repair, Some(true));
+        let editing: EditInput = serde_json::from_str(
+            r#"{"source":"a.ply","ops":[{"op":"translate","by":[0,1,0]}],"repair":true}"#,
+        )
+        .unwrap();
+        assert_eq!(editing.repair, Some(true));
+        std::fs::remove_file(&path).ok();
     }
     #[test]
     fn a_bounded_inspection_is_chosen_only_when_it_can_answer() {

@@ -364,6 +364,10 @@ pub struct LoadPlyRequest {
     /// Revision the caller expects that document to be at, for a replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+    /// Accept a file that needs repair, reporting what was changed. Defaults to false: a
+    /// damaged file is refused with indexed diagnostics unless the caller asks for repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// Result of `viewer.load_ply` and `viewer.status`.
@@ -381,6 +385,9 @@ pub struct ViewerStatus {
     /// Identity and provenance of what is displayed, filled in by the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<DocumentSummary>,
+    /// What the import of these bytes did, when it was not lossless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<PlyImportSummary>,
 }
 
 /// Distribution of one scalar over a document, for `document.inspect`.
@@ -705,6 +712,9 @@ pub struct ReloadRequest {
     /// Revision the caller believes is displayed; omitted accepts whatever is displayed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+    /// Accept a source that needs repair, reporting what was changed. Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<bool>,
 }
 
 /// Parameters of `document.set_component`.
@@ -725,6 +735,93 @@ pub struct DocumentReply {
     /// What retention holds after the change.
     #[serde(default)]
     pub retention: RetentionSummary,
+    /// What the import of a re-read source did, when it was not lossless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<PlyImportSummary>,
+}
+
+/// What a PLY import did to the file it read.
+///
+/// Present only when the import was not lossless, so an ordinary load adds nothing to a
+/// reply: an import that repaired values, or dropped attributes the model cannot keep
+/// (`f_rest_*`, normals), says so - with bounded lists and complete totals.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlyImportSummary {
+    /// `strict` or `repair`.
+    pub policy: String,
+    /// Vertices the file declared.
+    pub vertex_count: usize,
+    /// True when nothing was dropped or changed.
+    pub lossless: bool,
+    /// Attributes the model cannot keep, bounded.
+    pub dropped: Vec<String>,
+    /// How many attributes were dropped in total.
+    pub dropped_count: usize,
+    /// Non-`vertex` elements that were stepped over.
+    pub ignored_elements: Vec<String>,
+    /// Values that were repaired or rescaled, bounded, e.g. `point 0 rotation: ...`.
+    pub changed: Vec<String>,
+    /// How many values were repaired or rescaled in total.
+    pub changed_count: usize,
+    /// True when a list above is shorter than its total.
+    pub truncated: bool,
+    /// One line describing the import.
+    pub summary: String,
+}
+
+/// Largest number of names one list in a [`PlyImportSummary`] carries.
+pub const MAX_LISTED_IMPORT_DETAILS: usize = 8;
+
+impl PlyImportSummary {
+    /// Bounded summary of an import, or `None` when the import was lossless.
+    ///
+    /// A lossless import produces no reply field at all, which keeps a clean load cheap; a
+    /// load that changed or dropped something always carries the description.
+    pub fn of(report: &splatmcp_core::PlyReport) -> Option<Self> {
+        if report.is_lossless() {
+            return None;
+        }
+        let dropped: Vec<String> = report
+            .discarded
+            .iter()
+            .take(MAX_LISTED_IMPORT_DETAILS)
+            .map(|attribute| attribute.property.clone())
+            .collect();
+        let ignored_elements: Vec<String> = report
+            .ignored_elements
+            .iter()
+            .take(MAX_LISTED_IMPORT_DETAILS)
+            .map(|element| element.name.clone())
+            .collect();
+        let mut changed: Vec<String> = report
+            .repairs
+            .iter()
+            .map(|repair| repair.to_string())
+            .chain(report.normalized.iter().map(|entry| entry.to_string()))
+            .take(MAX_LISTED_IMPORT_DETAILS)
+            .collect();
+        let changed_count = report.changed_values();
+        let truncated = report.repairs_truncated()
+            || report.discarded.len() > dropped.len()
+            || report.ignored_elements.len() > ignored_elements.len()
+            || changed_count > changed.len();
+        if truncated && changed.len() == MAX_LISTED_IMPORT_DETAILS {
+            changed.pop();
+            changed.push(format!("... and {} more", changed_count - changed.len()));
+        }
+        Some(Self {
+            policy: report.policy.name().to_owned(),
+            vertex_count: report.vertex_count,
+            lossless: false,
+            dropped,
+            dropped_count: report.discarded.len(),
+            ignored_elements,
+            changed,
+            changed_count,
+            truncated,
+            summary: report.summary(),
+        })
+    }
 }
 
 /// One point to append, in a batch's `merge` operation.
@@ -1185,6 +1282,7 @@ pub fn load_ply_params(ply_base64: impl Into<String>, file_name: Option<String>)
         frame: Some(true),
         document_id: None,
         expected_revision: None,
+        repair: None,
     })
 }
 
@@ -1204,6 +1302,7 @@ pub fn replace_ply_params(
         frame,
         document_id: Some(document_id.into()),
         expected_revision: Some(expected_revision),
+        repair: None,
     })
 }
 
@@ -1475,6 +1574,7 @@ mod tests {
             canvas_width: 640,
             canvas_height: 480,
             camera: None,
+            import: None,
             document: Some(DocumentSummary {
                 document_id: "doc-4f2a-1".to_owned(),
                 revision: 8,
@@ -1499,6 +1599,93 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.document.is_none());
+    }
+
+    /// A one-point ASCII PLY with only the properties the contract keeps.
+    fn ascii_with_one_valid_point() -> Vec<u8> {
+        const PROPERTIES: [&str; 14] = [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let mut header = String::from("ply\nformat ascii 1.0\nelement vertex 1\n");
+        for name in PROPERTIES {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        header.push_str("end_header\n0 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
+        header.into_bytes()
+    }
+
+    /// A two-point ASCII PLY whose first quaternion is all zero.
+    fn ascii_with_zero_quaternion() -> Vec<u8> {
+        const PROPERTIES: [&str; 14] = [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let mut header = String::from("ply\nformat ascii 1.0\nelement vertex 2\n");
+        for name in PROPERTIES {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        header.push_str("end_header\n");
+        header.push_str("0 0 0 0 0 0 0 -8 -8 -8 0 0 0 0\n");
+        header.push_str("1 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
+        header.into_bytes()
+    }
+
+    #[test]
+    fn repair_is_opt_in_and_a_reply_says_what_an_import_changed() {
+        // A load without the flag is strict, which is what makes silent repair impossible.
+        let plain: LoadPlyRequest =
+            serde_json::from_value(serde_json::json!({"ply_base64": "AA=="})).unwrap();
+        assert_eq!(plain.repair, None);
+        let repairing: LoadPlyRequest = serde_json::from_value(serde_json::json!({
+            "ply_base64": "AA==",
+            "repair": true,
+        }))
+        .unwrap();
+        assert_eq!(repairing.repair, Some(true));
+        let reload: ReloadRequest =
+            serde_json::from_value(serde_json::json!({"repair": true})).unwrap();
+        assert_eq!(reload.repair, Some(true));
+
+        // A file that needs no repair adds nothing to a reply: nothing dropped, nothing
+        // changed. (Every file this crate writes carries placeholder normals, so a clean
+        // file is one with only the properties the contract keeps.)
+        let (_, lossless) = splatmcp_core::read_ply_with_policy(
+            &ascii_with_one_valid_point(),
+            splatmcp_core::PlyImportPolicy::Strict,
+        )
+        .unwrap();
+        assert!(lossless.is_lossless());
+        assert!(PlyImportSummary::of(&lossless).is_none());
+
+        // A repaired import reports the index and the reason, bounded.
+        let (_, report) = splatmcp_core::read_ply_with_policy(
+            &ascii_with_zero_quaternion(),
+            splatmcp_core::PlyImportPolicy::Repair,
+        )
+        .unwrap();
+        let summary = PlyImportSummary::of(&report).expect("a repair is reported");
+        assert_eq!(summary.policy, "repair");
+        assert!(!summary.lossless);
+        assert_eq!(summary.vertex_count, 2);
+        assert_eq!(summary.changed_count, 1);
+        assert!(summary.changed[0].starts_with("point 0 rotation"));
+        assert!(summary.summary.contains("repaired"));
+        let encoded = serde_json::to_string(&summary).unwrap();
+        let decoded: PlyImportSummary = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, summary);
+
+        // The status and the document reply both carry it.
+        let status = ViewerStatus {
+            import: Some(summary.clone()),
+            ..ViewerStatus::default()
+        };
+        assert_eq!(serde_json::to_value(&status).unwrap()["import"]["policy"], "repair");
+        let reply = DocumentReply {
+            import: Some(summary),
+            ..DocumentReply::default()
+        };
+        assert!(serde_json::to_value(&reply).unwrap().get("import").is_some());
     }
 
     #[test]
@@ -1560,6 +1747,7 @@ mod tests {
                 max_bytes: 1024,
                 over_budget: false,
             },
+            import: None,
         };
         let encoded = serde_json::to_value(&reply).unwrap();
         assert_eq!(encoded["document"]["revision"], 3);

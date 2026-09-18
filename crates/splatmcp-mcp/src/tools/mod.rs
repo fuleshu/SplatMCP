@@ -12,7 +12,7 @@ pub mod viewer;
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 use serde::Serialize;
-use splatmcp_bridge::InspectionSummary;
+use splatmcp_bridge::{InspectionSummary, PlyImportSummary};
 use splatmcp_core::{Bounds, Splat, SplatPoint};
 
 use crate::tools::edit::DocumentIdentity;
@@ -124,6 +124,9 @@ pub struct SplatReply {
     /// guessing which document its edit landed in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<DocumentIdentity>,
+    /// What the import of a file this call read did, when it was not lossless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<PlyImportSummary>,
     /// File the splat was written to, when the call asked for one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -136,9 +139,16 @@ impl SplatReply {
         Self {
             summary: SplatSummary::of(splat),
             document: None,
+            import: None,
             path: path.map(|path| path.to_string_lossy().to_string()),
             displayed,
         }
+    }
+
+    /// Same reply, reporting what reading a file source did.
+    pub fn with_import(mut self, import: Option<PlyImportSummary>) -> Self {
+        self.import = import;
+        self
     }
 
     /// Same reply, reporting the identity the app resolved.

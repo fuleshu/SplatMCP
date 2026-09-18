@@ -23,7 +23,8 @@ use splatmcp_core::document::{DocumentStore, now_ms};
 use splatmcp_core::{
     ComponentId, ComponentList, EditBatch, HistoryReport, LocalTransform, PreviewReport,
     SelectionQuery, SideEffect, Splat, SplatError, TransactionError, TransactionLimits,
-    TransactionReceipt, TransactionService, read_ply, write_ply,
+    PlyImportPolicy, PlyReport, TransactionReceipt, TransactionService, read_ply_with_policy,
+    write_ply,
 };
 
 pub use splatmcp_core::document::{
@@ -110,11 +111,30 @@ impl From<ServiceError> for String {
     }
 }
 
-/// Parses PLY bytes and validates them, so an unusable document never enters state.
-pub fn parse_ply(bytes: &[u8]) -> Result<Splat, String> {
-    let splat = read_ply(bytes).map_err(|error| error.to_string())?;
+/// What reading PLY bytes produced: the geometry plus what the import reported.
+pub struct Imported {
+    pub splat: Splat,
+    pub report: PlyReport,
+}
+
+/// What an import committed: the new revision plus the report of the file it came from.
+pub struct ImportedDocument {
+    pub metadata: DocumentMetadata,
+    pub report: PlyReport,
+}
+
+/// Parses PLY bytes under `policy` and validates the result, so an unusable document never
+/// enters state.
+///
+/// The policy is the caller's explicit decision: [`PlyImportPolicy::Strict`] refuses a file
+/// that would need repair, with indexed diagnostics, and [`PlyImportPolicy::Repair`]
+/// accepts it and reports what was changed. Either way the report travels back with the
+/// geometry, so an import never silently changes a caller's data.
+pub fn parse_ply(bytes: &[u8], policy: PlyImportPolicy) -> Result<Imported, String> {
+    let (splat, report) =
+        read_ply_with_policy(bytes, policy).map_err(|error| error.to_string())?;
     splat.validate().map_err(|error| error.to_string())?;
-    Ok(splat)
+    Ok(Imported { splat, report })
 }
 
 /// Canonical PLY bytes of a splat.
@@ -209,9 +229,13 @@ impl AppState {
         &self,
         bytes: &[u8],
         mutation: Mutation,
-    ) -> Result<DocumentMetadata, ServiceError> {
-        let splat = parse_ply(bytes)?;
-        Ok(self.store.open(splat, mutation))
+        policy: PlyImportPolicy,
+    ) -> Result<ImportedDocument, ServiceError> {
+        let imported = parse_ply(bytes, policy)?;
+        Ok(ImportedDocument {
+            metadata: self.store.open(imported.splat, mutation),
+            report: imported.report,
+        })
     }
 
     /// Makes already parsed geometry a **new document**, at revision 1.
@@ -245,9 +269,13 @@ impl AppState {
         expected: Expected,
         bytes: &[u8],
         mutation: Mutation,
-    ) -> Result<DocumentMetadata, ServiceError> {
-        let splat = parse_ply(bytes)?;
-        Ok(self.store.commit(expected, splat, mutation)?)
+        policy: PlyImportPolicy,
+    ) -> Result<ImportedDocument, ServiceError> {
+        let imported = parse_ply(bytes, policy)?;
+        Ok(ImportedDocument {
+            metadata: self.store.commit(expected, imported.splat, mutation)?,
+            report: imported.report,
+        })
     }
 
     /// Changes the named component of the displayed document.
@@ -273,7 +301,11 @@ impl AppState {
     /// **before** the commit, so a slow disk does not hold the store, and the commit is made
     /// against the exact revision that was read - a change that landed meanwhile conflicts
     /// instead of being lost.
-    pub fn reload(&self, expected: Expected) -> Result<DocumentMetadata, ServiceError> {
+    pub fn reload(
+        &self,
+        expected: Expected,
+        policy: PlyImportPolicy,
+    ) -> Result<ImportedDocument, ServiceError> {
         let snapshot = self.snapshot(expected)?;
         let handle = snapshot.handle().clone();
         let Some(source) = snapshot.provenance().source_path.clone() else {
@@ -285,12 +317,15 @@ impl AppState {
         let bytes =
             std::fs::read(&source).map_err(|error| format!("could not read {source}: {error}"))?;
         drop(snapshot);
-        let splat = parse_ply(&bytes)?;
-        Ok(self.store.commit(
-            Expected::Handle(handle),
-            splat,
-            Mutation::reload("reload").source(source),
-        )?)
+        let imported = parse_ply(&bytes, policy)?;
+        Ok(ImportedDocument {
+            metadata: self.store.commit(
+                Expected::Handle(handle),
+                imported.splat,
+                Mutation::reload("reload").source(source),
+            )?,
+            report: imported.report,
+        })
     }
 
     /// The displayed revision, as an immutable snapshot.
@@ -328,9 +363,13 @@ impl AppState {
     /// snapshot and recording what was written. The export does not advance the revision: the
     /// geometry and the component metadata are the ones that were already there, and only the
     /// artifact checksum is new.
+    ///
+    /// The pin is held by a guard, so every failure path below - a serializer error, a
+    /// directory where a file should be, a refused export record - releases it before
+    /// returning. A leaked pin would keep a whole scene alive past the retention budget.
     pub fn export(&self, expected: Expected, path: &Path) -> Result<ExportOutcome, ServiceError> {
         let snapshot = self.snapshot(expected)?;
-        let pin = self.store.pin(snapshot.handle())?;
+        let _pin = self.store.pin_guarded(snapshot.handle())?;
         let bytes = ply_bytes(snapshot.splat())?;
         if let Some(parent) = path
             .parent()
@@ -348,7 +387,6 @@ impl AppState {
             checksum,
             now_ms(),
         )?;
-        self.store.release(&pin);
         Ok(ExportOutcome {
             path: path.to_string_lossy().to_string(),
             document_id: metadata.handle.document_id.to_string(),
@@ -947,7 +985,7 @@ mod tests {
         let state = AppState::default();
         assert!(
             state
-                .open_ply(b"not a ply", Mutation::import("x.ply"))
+                .open_ply(b"not a ply", Mutation::import("x.ply"), PlyImportPolicy::Strict)
                 .is_err()
         );
         assert!(state.active().is_err());
@@ -960,13 +998,13 @@ mod tests {
         let state = AppState::default();
         let first = SplatInfo::of(
             &state
-                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"))
-                .unwrap(),
+                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"), PlyImportPolicy::Strict)
+                .unwrap().metadata,
         );
         let second = SplatInfo::of(
             &state
-                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"))
-                .unwrap(),
+                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"), PlyImportPolicy::Strict)
+                .unwrap().metadata,
         );
 
         assert_ne!(
@@ -987,8 +1025,9 @@ mod tests {
                     )),
                     &ply_of(5),
                     Mutation::edit("edit_splat"),
-                )
-                .unwrap(),
+                    PlyImportPolicy::Strict,
+            )
+                .unwrap().metadata,
         );
         assert_eq!(replaced.document_id, second.document_id);
         assert_eq!(replaced.revision, 2);
@@ -996,25 +1035,100 @@ mod tests {
         assert_eq!(replaced.last_operation.as_deref(), Some("edit_splat"));
     }
 
+    /// A two-point ASCII PLY whose first quaternion is all zero.
+    fn ascii_with_zero_quaternion() -> Vec<u8> {
+        const PROPERTIES: [&str; 14] = [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let mut header = String::from("ply\nformat ascii 1.0\nelement vertex 2\n");
+        for name in PROPERTIES {
+            header.push_str(&format!("property float {name}\n"));
+        }
+        header.push_str("end_header\n");
+        header.push_str("0 0 0 0 0 0 0 -8 -8 -8 0 0 0 0\n");
+        header.push_str("1 0 0 0 0 0 0 -8 -8 -8 1 0 0 0\n");
+        header.into_bytes()
+    }
+
+    #[test]
+    fn a_strict_import_refuses_a_damaged_file_and_repair_reports_what_it_changed() {
+        let state = AppState::default();
+        let damaged = ascii_with_zero_quaternion();
+
+        // The default: refuse, with the index and the reason, and change nothing.
+        let error = state
+            .open_ply(&damaged, Mutation::import("damaged.ply"), PlyImportPolicy::Strict)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .unwrap_err();
+        assert!(error.contains("point 0 rotation"), "{error}");
+        assert!(error.contains("[0, 0, 0, 0]"), "{error}");
+        assert!(error.contains("repair"), "the refusal says what to do: {error}");
+        assert!(state.metadata().is_none(), "a refused import leaves nothing behind");
+
+        // The explicit opt-in: load it, and report every change.
+        let imported = state
+            .open_ply(&damaged, Mutation::import("damaged.ply"), PlyImportPolicy::Repair)
+            .unwrap();
+        assert_eq!(imported.metadata.point_count, 2);
+        assert_eq!(imported.report.total_repairs, 1);
+        assert_eq!(imported.report.repairs[0].point, 0, "repairs are indexed");
+        assert!(imported.report.policy.repairs());
+
+        // What a reply carries: the summary names the repair, so it is never silent.
+        let summary = splatmcp_bridge::PlyImportSummary::of(&imported.report).unwrap();
+        assert_eq!(summary.policy, "repair");
+        assert!(!summary.lossless);
+        assert!(summary.changed.iter().any(|entry| entry.contains("point 0 rotation")));
+        assert_eq!(summary.changed_count, 1);
+    }
+
+    #[test]
+    fn a_failed_export_releases_its_pin() {
+        let state = AppState::default();
+        state.open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict).unwrap();
+        let directory = std::env::temp_dir().join(format!("splatmcp-export-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // A directory cannot be written as a file, so the export fails *after* the pin was
+        // taken. The pin must be gone again, or repeated failures would keep whole scenes
+        // alive past the retention budget.
+        assert_eq!(state.retention().pins, 0);
+        let error = state.export(Expected::Any, &directory).unwrap_err().to_string();
+        assert!(!error.is_empty());
+        assert_eq!(state.retention().pins, 0, "a failed export must not leak a pin");
+
+        // The successful path takes and releases one too.
+        let path = directory.join("out.ply");
+        let outcome = state.export(Expected::Any, &path).unwrap();
+        assert_eq!(state.retention().pins, 0);
+        assert!(outcome.checksum.starts_with("fnv1a64:"));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn a_stale_replacement_is_refused_and_leaves_the_document_alone() {
         let state = AppState::default();
         let opened = state
-            .open_ply(&ply_of(3), Mutation::import("scene.ply"))
-            .unwrap();
+            .open_ply(&ply_of(3), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
         let handle = opened.handle.clone();
         state
             .replace_ply(
                 Expected::Handle(handle.clone()),
                 &ply_of(4),
                 Mutation::edit("edit"),
+                PlyImportPolicy::Strict,
             )
-            .unwrap();
+            .unwrap().metadata;
 
         let error = state
-            .replace_ply(Expected::Handle(handle), &ply_of(9), Mutation::edit("edit"))
-            .unwrap_err();
-        assert!(error.to_string().contains("revision conflict"), "{error}");
+            .replace_ply(Expected::Handle(handle), &ply_of(9), Mutation::edit("edit"), PlyImportPolicy::Strict)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("revision conflict"), "{error}");
         let current = info(&state).unwrap();
         assert_eq!(current.revision, 2);
         assert_eq!(current.point_count, 4);
@@ -1043,8 +1157,8 @@ mod tests {
     fn an_export_records_its_artifact_without_moving_the_revision() {
         let state = AppState::default();
         let opened = state
-            .open_ply(&ply_of(4), Mutation::import("scene.ply"))
-            .unwrap();
+            .open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
         let directory =
             std::env::temp_dir().join(format!("splatmcp-export-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -1060,7 +1174,7 @@ mod tests {
         assert!(outcome.bytes > 0);
         assert!(path.is_file());
         // The file is a readable splat with the same gaussians.
-        let reloaded = parse_ply(&std::fs::read(&path).unwrap()).unwrap();
+        let reloaded = parse_ply(&std::fs::read(&path).unwrap(), PlyImportPolicy::Strict).unwrap().splat;
         assert_eq!(reloaded.len(), 4);
 
         // The export is visible as provenance, newest first.
@@ -1072,8 +1186,8 @@ mod tests {
         // A later change still moves exactly one revision.
         let handle = state.active_handle().unwrap();
         let advanced = state
-            .replace_ply(Expected::Handle(handle), &ply_of(6), Mutation::edit("edit"))
-            .unwrap();
+            .replace_ply(Expected::Handle(handle), &ply_of(6), Mutation::edit("edit"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
         assert_eq!(advanced.handle.revision, opened.handle.revision + 1);
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -1090,12 +1204,13 @@ mod tests {
             .open_ply(
                 &std::fs::read(&path).unwrap(),
                 Mutation::open(path.to_string_lossy()),
+                PlyImportPolicy::Strict,
             )
-            .unwrap();
+            .unwrap().metadata;
 
         // The file changes on disk; reload brings it in without changing identity.
         std::fs::write(&path, ply_of(6)).unwrap();
-        let reloaded = SplatInfo::of(&state.reload(Expected::Any).unwrap());
+        let reloaded = SplatInfo::of(&state.reload(Expected::Any, PlyImportPolicy::Strict).unwrap().metadata);
         assert_eq!(reloaded.document_id, opened.handle.document_id.to_string());
         assert_eq!(reloaded.revision, opened.handle.revision + 1);
         assert_eq!(reloaded.point_count, 6);
@@ -1104,9 +1219,13 @@ mod tests {
         // A document with no source cannot be reloaded, and says why.
         let state = AppState::default();
         state
-            .open_ply(&ply_of(2), Mutation::import("generated.ply"))
+            .open_ply(&ply_of(2), Mutation::import("generated.ply"), PlyImportPolicy::Strict)
             .unwrap();
-        let error = state.reload(Expected::Any).unwrap_err().to_string();
+        let error = state
+            .reload(Expected::Any, PlyImportPolicy::Strict)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("no source file"), "{error}");
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -1115,8 +1234,8 @@ mod tests {
     fn a_component_change_moves_the_revision_and_keeps_the_geometry() {
         let state = AppState::default();
         let opened = state
-            .open_ply(&ply_of(4), Mutation::import("scene.ply"))
-            .unwrap();
+            .open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
         let geometry = state.active().unwrap();
         let before = Arc::as_ptr(geometry.splat());
 
@@ -1154,8 +1273,8 @@ mod tests {
     fn scene_state() -> AppState {
         let state = AppState::default();
         state
-            .open_ply(&ply_of(4), Mutation::import("scene.ply"))
-            .unwrap();
+            .open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
         state
     }
 
@@ -1276,17 +1395,17 @@ mod tests {
     fn a_retained_revision_stays_readable_after_the_display_moves_on() {
         let state = AppState::default();
         let first = state
-            .open_ply(&ply_of(3), Mutation::open("C:/tmp/first.ply"))
-            .unwrap();
+            .open_ply(&ply_of(3), Mutation::open("C:/tmp/first.ply"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
         let handle = first.handle.clone();
         state
-            .open_ply(&ply_of(7), Mutation::open("C:/tmp/second.ply"))
-            .unwrap();
+            .open_ply(&ply_of(7), Mutation::open("C:/tmp/second.ply"), PlyImportPolicy::Strict)
+            .unwrap().metadata;
 
         // The old revision still reads, exactly, and does not disturb what is displayed.
         let (snapshot, bytes) = state.ply_bytes_for(&handle).unwrap();
         assert_eq!(snapshot.len(), 3);
-        assert_eq!(parse_ply(&bytes).unwrap().len(), 3);
+        assert_eq!(parse_ply(&bytes, PlyImportPolicy::Strict).unwrap().splat.len(), 3);
         assert_eq!(info(&state).unwrap().point_count, 7);
 
         // An unknown handle is reported as unknown, and an evicted one as expired.

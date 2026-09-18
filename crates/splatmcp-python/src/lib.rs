@@ -76,6 +76,12 @@ pub enum PythonError {
     RequestConflict(String),
     #[error("document_conflict: {0}")]
     DocumentConflict(String),
+    #[error("unknown_document: {0}")]
+    UnknownDocument(String),
+    #[error("no_document: {0}")]
+    NoDocument(String),
+    #[error("snapshot_expired: {0}")]
+    SnapshotExpired(String),
     #[error("display_failed: {0}")]
     Display(String),
     #[error("queue_full: {0}")]
@@ -97,6 +103,9 @@ impl PythonError {
             Self::JobNotFound(_) => "job_not_found",
             Self::RequestConflict(_) => "request_conflict",
             Self::DocumentConflict(_) => "document_conflict",
+            Self::UnknownDocument(_) => "unknown_document",
+            Self::NoDocument(_) => "no_document",
+            Self::SnapshotExpired(_) => "snapshot_expired",
             Self::Display(_) => "display_failed",
             Self::QueueFull(_) => "queue_full",
             Self::Cancelled(_) => "job_cancelled",
@@ -116,9 +125,29 @@ impl PythonError {
             | Self::JobNotFound(message)
             | Self::RequestConflict(message)
             | Self::DocumentConflict(message)
+            | Self::UnknownDocument(message)
+            | Self::NoDocument(message)
+            | Self::SnapshotExpired(message)
             | Self::Display(message)
             | Self::QueueFull(message)
             | Self::Cancelled(message) => message.clone(),
+        }
+    }
+
+    /// Maps a document failure onto the code that names it.
+    ///
+    /// A caller has to be able to tell the cases apart: a document that is not available
+    /// (something else was opened in the meantime), a revision that raced (a conflict to
+    /// reconcile) and a revision that retention has already evicted (expired, so the
+    /// request has to start again) are three different problems with three different
+    /// answers. Collapsing them into one code hides which one happened.
+    pub fn document(error: &splatmcp_core::DocumentError) -> Self {
+        let message = error.to_string();
+        match error {
+            splatmcp_core::DocumentError::Conflict { .. } => Self::DocumentConflict(message),
+            splatmcp_core::DocumentError::UnknownDocument { .. } => Self::UnknownDocument(message),
+            splatmcp_core::DocumentError::NoDocument => Self::NoDocument(message),
+            splatmcp_core::DocumentError::SnapshotExpired { .. } => Self::SnapshotExpired(message),
         }
     }
 
@@ -131,6 +160,9 @@ impl PythonError {
                 | Self::BudgetExceeded(_)
                 | Self::RequestConflict(_)
                 | Self::DocumentConflict(_)
+                | Self::UnknownDocument(_)
+                | Self::NoDocument(_)
+                | Self::SnapshotExpired(_)
                 | Self::JobNotFound(_)
                 | Self::QueueFull(_)
         )
@@ -140,6 +172,54 @@ impl PythonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splatmcp_core::{DocumentError, DocumentHandle, DocumentId};
+
+    /// Every document failure keeps its own code, so a caller can act on the difference
+    /// instead of reading a revision race into every problem.
+    #[test]
+    fn document_failures_keep_their_own_codes() {
+        let handle = DocumentHandle::new(DocumentId::mint(1, 1), 3);
+        let cases = [
+            (DocumentError::NoDocument, "no_document"),
+            (
+                DocumentError::UnknownDocument {
+                    document_id: DocumentId::mint(1, 9),
+                    active: Some(DocumentId::mint(1, 1)),
+                },
+                "unknown_document",
+            ),
+            (
+                DocumentError::Conflict {
+                    expected: DocumentHandle::new(handle.document_id.clone(), 2),
+                    current: handle.clone(),
+                },
+                "document_conflict",
+            ),
+            (
+                DocumentError::SnapshotExpired {
+                    handle: handle.clone(),
+                },
+                "snapshot_expired",
+            ),
+        ];
+        for (error, code) in cases {
+            let mapped = PythonError::document(&error);
+            assert_eq!(mapped.code(), code, "{error}");
+            assert!(mapped.is_caller_error());
+            // The message keeps the detail the document layer reported.
+            assert!(!mapped.detail().is_empty());
+        }
+
+        // Opening a different document is not a revision race, and is not reported as one.
+        assert_eq!(
+            PythonError::document(&DocumentError::UnknownDocument {
+                document_id: DocumentId::mint(1, 9),
+                active: None,
+            })
+            .code(),
+            "unknown_document"
+        );
+    }
 
     #[test]
     fn every_error_carries_a_stable_code() {
@@ -151,6 +231,9 @@ mod tests {
             PythonError::JobNotFound("no job 4".to_owned()),
             PythonError::RequestConflict("reused".to_owned()),
             PythonError::DocumentConflict("stale".to_owned()),
+            PythonError::UnknownDocument("gone".to_owned()),
+            PythonError::NoDocument("empty".to_owned()),
+            PythonError::SnapshotExpired("evicted".to_owned()),
             PythonError::Display("viewer".to_owned()),
             PythonError::QueueFull("busy".to_owned()),
             PythonError::Cancelled("stopped".to_owned()),

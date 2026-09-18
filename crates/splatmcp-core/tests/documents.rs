@@ -376,11 +376,19 @@ fn a_pin_keeps_one_revision_readable_while_the_document_moves_on() {
     assert!(store.stats().over_budget());
     assert_eq!(store.stats().pins, 1);
 
+    // Two pins on one revision are two tokens: releasing one twice must not drop the
+    // protection the other reader is still holding.
+    let second = store.pin(&opened.handle).unwrap();
+    let copied = second.duplicate();
     assert!(store.release(&pinned));
     assert!(
         !store.release(&pinned),
         "a released pin is not released twice"
     );
+    assert_eq!(store.stats().pins, 1, "the other reader keeps its protection");
+    assert_eq!(store.resolve(&opened.handle).unwrap().len(), 6);
+    assert!(store.release(&second));
+    assert!(!store.release(&copied), "a copied token is the same token");
     assert_eq!(store.stats().pins, 0);
     store
         .commit(

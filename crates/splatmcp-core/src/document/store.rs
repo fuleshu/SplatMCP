@@ -15,7 +15,7 @@
 //! - Copy-on-write means a retained snapshot never changes: `Arc::make_mut` clones only when
 //!   somebody is still reading that revision.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -153,6 +153,10 @@ impl Snapshot {
 /// Jobs and captures read an owned copy and need no pin; a pin exists for a handle that will
 /// be resolved *later* by identity - an export that runs after the edit that triggered it, an
 /// undo step, or a request that fetched metadata and comes back for the bytes.
+///
+/// A pin is identified by the token minted for it, and [`DocumentStore::release`] consumes
+/// that token exactly once. Releasing an already released pin reports `false` and changes
+/// nothing, so a double release cannot drop protection another reader still holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPin {
     id: u64,
@@ -169,7 +173,64 @@ impl SnapshotPin {
     pub fn handle(&self) -> &DocumentHandle {
         &self.handle
     }
+
+    /// Mint the same token again, as a caller would if it copied the pin.
+    ///
+    /// Used by tests to prove that a repeated token cannot release somebody else's pin.
+    pub fn duplicate(&self) -> Self {
+        self.clone()
+    }
 }
+
+/// A pin that releases itself when it goes out of scope.
+///
+/// The reason this exists: a fallible path that pins a revision and then returns early on an
+/// error would otherwise leak the pin, and leaked pins keep whole scenes alive past the
+/// retention budget. Dropping the guard releases exactly one token, on every exit path.
+pub struct PinGuard<'a> {
+    store: &'a DocumentStore,
+    pin: SnapshotPin,
+}
+
+impl PinGuard<'_> {
+    /// Revision the guard keeps alive.
+    pub fn handle(&self) -> &DocumentHandle {
+        self.pin.handle()
+    }
+
+    /// The underlying pin, for callers that need to release it early.
+    pub fn pin(&self) -> &SnapshotPin {
+        &self.pin
+    }
+
+    /// Releases the pin now. Dropping the guard afterwards is harmless.
+    pub fn release(mut self) -> bool {
+        let released = self.store.release(&self.pin);
+        // Mark the token as spent so the Drop below cannot release it a second time.
+        self.pin.id = SPENT_TOKEN;
+        released
+    }
+}
+
+impl std::fmt::Debug for PinGuard<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinGuard")
+            .field("pin", &self.pin)
+            .finish()
+    }
+}
+
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        if self.pin.id != SPENT_TOKEN {
+            self.store.release(&self.pin);
+        }
+    }
+}
+
+/// Token value that can never be minted, used to mark a released guard.
+const SPENT_TOKEN: u64 = u64::MAX;
 
 /// One retained revision that is no longer the newest of its document.
 ///
@@ -183,7 +244,8 @@ struct RetainedRevision {
     point_count: usize,
     bounds: Option<Bounds>,
     provenance: Provenance,
-    pins: usize,
+    /// Tokens of the pins keeping this revision alive.
+    pins: HashSet<u64>,
     serial: u64,
 }
 
@@ -200,8 +262,8 @@ struct Entry {
     history: Vec<RevisionRecord>,
     /// Previous revisions, newest first.
     older: VecDeque<RetainedRevision>,
-    /// Pins on the newest revision.
-    pins: usize,
+    /// Tokens of the pins on the newest revision.
+    pins: HashSet<u64>,
     serial: u64,
 }
 
@@ -271,7 +333,9 @@ impl Inner {
             pins: self
                 .entries
                 .iter()
-                .map(|entry| entry.pins + entry.older.iter().map(|older| older.pins).sum::<usize>())
+                .map(|entry| {
+                    entry.pins.len() + entry.older.iter().map(|older| older.pins.len()).sum::<usize>()
+                })
                 .sum(),
             bytes: self.entries.iter().map(Entry::bytes).sum(),
             max_revisions: limits.max_revisions,
@@ -288,14 +352,14 @@ impl Inner {
         let mut best: Option<(u64, usize, Option<usize>)> = None;
         for (index, entry) in self.entries.iter().enumerate() {
             let is_active_newest = self.active.as_ref().is_some_and(|id| id == &entry.id);
-            if !is_active_newest && entry.pins == 0 {
+            if !is_active_newest && entry.pins.is_empty() {
                 let candidate = (entry.serial, index, None);
                 if best.is_none_or(|current| candidate.0 < current.0) {
                     best = Some(candidate);
                 }
             }
             for (older_index, older) in entry.older.iter().enumerate() {
-                if older.pins == 0 {
+                if older.pins.is_empty() {
                     let candidate = (older.serial, index, Some(older_index));
                     if best.is_none_or(|current| candidate.0 < current.0) {
                         best = Some(candidate);
@@ -434,7 +498,7 @@ impl DocumentStore {
                 at_ms,
             )],
             older: VecDeque::new(),
-            pins: 0,
+            pins: HashSet::new(),
             serial,
         };
         let metadata = metadata_of(&entry);
@@ -515,20 +579,22 @@ impl DocumentStore {
         let entry = &mut inner.entries[index];
         // Copy-on-write: a retained snapshot of the previous revision keeps pointing at the
         // old content, and nothing is copied unless somebody is still reading it.
+        // Outstanding tokens travel with the revision they protect; the new revision starts
+        // with none, because nothing has read it yet.
+        let carried = std::mem::take(&mut entry.pins);
         entry.older.push_front(RetainedRevision {
             revision: entry.revision,
             splat: Arc::clone(&entry.splat),
             point_count: entry.point_count,
             bounds: entry.bounds,
             provenance: entry.provenance.clone(),
-            pins: entry.pins,
+            pins: carried,
             serial: entry.serial,
         });
         entry.revision += 1;
         entry.splat = Arc::new(splat);
         entry.point_count = point_count;
         entry.bounds = bounds;
-        entry.pins = 0;
         entry.serial = serial;
         entry.provenance.apply(&mutation, at_ms);
         entry.history.push(RevisionRecord::new(
@@ -590,17 +656,17 @@ impl DocumentStore {
         let serial = inner.serial;
         inner.mutations += 1;
         let entry = &mut inner.entries[index];
+        let carried = std::mem::take(&mut entry.pins);
         entry.older.push_front(RetainedRevision {
             revision: entry.revision,
             splat: Arc::clone(&entry.splat),
             point_count: entry.point_count,
             bounds: entry.bounds,
             provenance: entry.provenance.clone(),
-            pins: entry.pins,
+            pins: carried,
             serial: entry.serial,
         });
         entry.revision += 1;
-        entry.pins = 0;
         entry.serial = serial;
         entry.provenance.apply(&mutation, at_ms);
         entry.history.push(RevisionRecord::new(
@@ -707,8 +773,12 @@ impl DocumentStore {
     }
 
     /// Pins a revision so retention keeps it resolvable.
+    ///
+    /// Every call mints its own token, so the caller's protection is independent of every
+    /// other reader's.
     pub fn pin(&self, handle: &DocumentHandle) -> Result<SnapshotPin, DocumentError> {
         let mut inner = self.lock();
+        let id = self.pins.fetch_add(1, Ordering::SeqCst);
         let position = inner.position(&handle.document_id).ok_or_else(|| {
             if inner.known.contains(&handle.document_id) {
                 DocumentError::SnapshotExpired {
@@ -723,25 +793,42 @@ impl DocumentStore {
         })?;
         let entry = &mut inner.entries[position];
         if entry.revision == handle.revision {
-            entry.pins += 1;
+            entry.pins.insert(id);
         } else if let Some(older) = entry
             .older
             .iter_mut()
             .find(|older| older.revision == handle.revision)
         {
-            older.pins += 1;
+            older.pins.insert(id);
         } else {
             return Err(DocumentError::SnapshotExpired {
                 handle: handle.clone(),
             });
         }
         Ok(SnapshotPin {
-            id: self.pins.fetch_add(1, Ordering::SeqCst),
+            id,
             handle: handle.clone(),
         })
     }
 
-    /// Releases a pin. Returns false when it had already been released.
+    /// Pins a revision and returns a guard that releases it on the way out.
+    ///
+    /// Use this when the pin covers a fallible sequence - serialising, writing a file,
+    /// recording an export - so an early return cannot leak it.
+    pub fn pin_guarded(
+        &self,
+        handle: &DocumentHandle,
+    ) -> Result<PinGuard<'_>, DocumentError> {
+        Ok(PinGuard {
+            store: self,
+            pin: self.pin(handle)?,
+        })
+    }
+
+    /// Releases one pin, identified by the token it was minted with.
+    ///
+    /// Returns false when that token had already been released: the token is consumed exactly
+    /// once, so releasing a pin twice can never drop another reader's protection.
     pub fn release(&self, pin: &SnapshotPin) -> bool {
         let mut inner = self.lock();
         let Some(position) = inner.position(&pin.handle.document_id) else {
@@ -749,22 +836,15 @@ impl DocumentStore {
         };
         let entry = &mut inner.entries[position];
         if entry.revision == pin.handle.revision {
-            if entry.pins == 0 {
-                return false;
-            }
-            entry.pins -= 1;
-            return true;
+            return entry.pins.remove(&pin.id);
         }
         match entry
             .older
             .iter_mut()
             .find(|older| older.revision == pin.handle.revision)
         {
-            Some(older) if older.pins > 0 => {
-                older.pins -= 1;
-                true
-            }
-            _ => false,
+            Some(older) => older.pins.remove(&pin.id),
+            None => false,
         }
     }
 
@@ -953,6 +1033,69 @@ mod tests {
             "snapshot_expired"
         );
         assert!(store.stats().revisions <= 3);
+    }
+
+    #[test]
+    fn two_pins_on_one_revision_are_independent_tokens() {
+        let store = store(RetentionLimits::new(1, usize::MAX));
+        let first = store.open(splat(6), Mutation::import("first.ply"));
+        let a = store.pin(&first.handle).unwrap();
+        let b = store.pin(&first.handle).unwrap();
+        assert_eq!(store.stats().pins, 2);
+
+        // Releasing one pin leaves the other reader protected.
+        assert!(store.release(&a));
+        assert_eq!(store.stats().pins, 1, "one reader is still holding the revision");
+
+        // Releasing the same token again changes nothing: it was consumed above.
+        assert!(!store.release(&a), "a released token cannot release again");
+        assert_eq!(store.stats().pins, 1);
+
+        // A copied token cannot double-release either.
+        let copy = b.duplicate();
+        assert!(store.release(&b));
+        assert!(!store.release(&copy), "a copied token is the same token");
+        assert_eq!(store.stats().pins, 0);
+
+        // With every token consumed retention can catch up again.
+        store
+            .commit(Expected::Any, splat(1), Mutation::edit("edit"))
+            .unwrap();
+        store
+            .commit(Expected::Any, splat(1), Mutation::edit("edit"))
+            .unwrap();
+        assert_eq!(
+            store.resolve(&first.handle).unwrap_err().code(),
+            "snapshot_expired"
+        );
+    }
+
+    #[test]
+    fn a_pin_guard_releases_on_every_exit_path() {
+        let store = store(RetentionLimits::new(1, usize::MAX));
+        let opened = store.open(splat(4), Mutation::import("scene.ply"));
+
+        // The early return stands for a fallible serializer or a failed write.
+        fn fallible(store: &DocumentStore, handle: &DocumentHandle) -> Result<(), &'static str> {
+            let guard = store
+                .pin_guarded(handle)
+                .map_err(|_| "the revision is not retained")?;
+            assert_eq!(guard.handle().revision, 1);
+            assert_eq!(store.stats().pins, 1, "the guard holds one pin");
+            Err("the write failed")
+        }
+
+        assert_eq!(fallible(&store, &opened.handle), Err("the write failed"));
+        assert_eq!(store.stats().pins, 0, "the guard released the pin on the way out");
+
+        // A guard that is released explicitly does not release a second time on drop.
+        {
+            let guard = store.pin_guarded(&opened.handle).unwrap();
+            assert!(guard.release());
+        }
+        assert_eq!(store.stats().pins, 0);
+        // The revision is still the displayed one, so it is still resolvable.
+        assert_eq!(store.resolve(&opened.handle).unwrap().len(), 4);
     }
 
     #[test]

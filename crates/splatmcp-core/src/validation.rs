@@ -258,6 +258,12 @@ pub struct ValidationError {
     pub offending_points: usize,
     /// Gaussians that were checked.
     pub point_count: usize,
+    /// What the caller can do about it, when there is something useful to say.
+    ///
+    /// A boundary that refuses untrusted input says how to accept it deliberately - for a
+    /// PLY import, "repair it and tell me what was changed" - so a refusal is actionable
+    /// rather than a dead end.
+    pub hint: Option<String>,
 }
 
 impl ValidationError {
@@ -268,7 +274,14 @@ impl ValidationError {
             total_issues: 1,
             offending_points: 1,
             point_count: 1,
+            hint: None,
         }
+    }
+
+    /// Same refusal, with a line telling the caller what to do next.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 
     /// Error for a report that found something, or `None` when it found nothing.
@@ -284,6 +297,7 @@ impl ValidationError {
             total_issues: report.total_issues,
             offending_points: report.offending_points,
             point_count: report.point_count,
+            hint: None,
         })
     }
 
@@ -307,6 +321,9 @@ impl fmt::Display for ValidationError {
         let hidden = self.total_issues.saturating_sub(1);
         if hidden > 0 {
             write!(formatter, " (and {hidden} more issues)")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(formatter, "; {hint}")?;
         }
         Ok(())
     }
@@ -378,6 +395,11 @@ impl IssueRecorder {
         self.total_issues > 0
     }
 
+    /// Number of issues actually listed, which stops growing at the bound.
+    pub fn listed(&self) -> usize {
+        self.issues.len()
+    }
+
     /// Finishes the report for a batch of `point_count` gaussians.
     pub fn report(self, point_count: usize, limits: ValidationLimits) -> ValidationReport {
         let within_limits = limits
@@ -406,6 +428,7 @@ impl IssueRecorder {
             total_issues: self.total_issues,
             offending_points: self.offending_points,
             point_count,
+            hint: None,
         })
     }
 }
@@ -760,6 +783,38 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn a_refusal_can_say_what_to_do_next() {
+        let issue = ValidationIssue::new(
+            "rotation",
+            None,
+            ValidationReason::DegenerateQuaternion,
+            "[0, 0, 0, 0]",
+        )
+        .at(0);
+        let plain = ValidationError::from_issue(issue.clone()).to_string();
+        assert!(!plain.contains(";"), "{plain}");
+
+        let hinted = ValidationError::from_issue(issue)
+            .with_hint("import with repair enabled to accept the repaired values")
+            .to_string();
+        assert!(hinted.ends_with("import with repair enabled to accept the repaired values"));
+        assert!(hinted.contains("point 0 rotation"), "{hinted}");
+    }
+
+    #[test]
+    fn the_recorder_reports_how_many_issues_it_listed() {
+        let mut recorder = IssueRecorder::new();
+        assert_eq!(recorder.listed(), 0);
+        for index in 0..(MAX_REPORTED_ISSUES + 5) {
+            recorder.record(
+                ValidationIssue::new("scale", None, ValidationReason::NonPositiveScale, "0").at(index),
+            );
+        }
+        assert_eq!(recorder.listed(), MAX_REPORTED_ISSUES);
+        assert_eq!(recorder.clone().report(64, ValidationLimits::MATHEMATICAL).total_issues, MAX_REPORTED_ISSUES + 5);
     }
 
     #[test]

@@ -74,6 +74,16 @@ Error codes, stable for structured replies: `no_document`, `unknown_document`,
 `document_conflict`, `snapshot_expired` (plus `invalid_request` from the app adapter when the
 input itself is wrong).
 
+**The codes survive every adapter.** `PythonError::document` maps each core failure onto its
+own code - `DocumentError::Conflict` -> `document_conflict`, `UnknownDocument` ->
+`unknown_document`, `NoDocument` -> `no_document`, `SnapshotExpired` -> `snapshot_expired` -
+and the app's generation host uses that mapping, so a job that ran against a document which is
+no longer active reports `unknown_document` rather than being flattened into a revision race,
+and a revision that retention already evicted reports `snapshot_expired`. A caller can then
+tell apart "re-read the revision and retry" from "the thing you named is gone". Only the
+CommitOutcome path turns a genuine revision race into the job state `conflict`; every other
+document failure leaves the job `failed` with its own code.
+
 ## Snapshots, locks and retention
 
 Reading yields a `Snapshot`: an immutable `Arc<Splat>` of one exact revision plus the
@@ -157,6 +167,12 @@ which callers already tolerate.
    with `snapshot_expired`; increase the window or pin the revision if a caller needs it longer.
 6. **Saving reports the identity and an artifact checksum.** `save_splat` returns
    `{ path, document_id, revision, checksum, bytes }`; the window shows the path and revision.
+7. **Releasing the same pin twice is now a no-op.** `DocumentStore::release` consumes the
+   token minted by `pin` (or `pin_guarded`), so a double release no longer removes another
+   reader's protection; it returns `false` and reports that the pin was already spent. Code
+   that relied on a counter should hold one pin per reader, or use the guard.
+8. **A failed export no longer retains its revision.** The export's pin is released on every
+   path out, so a write error leaves `retention().pins` where it started.
 
 Out of scope, and deliberately not promised: durable identities across restarts, a project
 file, multi-document tabs, peer/remote sharing of identities, and undo (which will commit a new

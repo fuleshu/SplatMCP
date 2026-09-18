@@ -39,7 +39,9 @@ pub use document::{
 };
 pub use edit::{Box3, EditOp, EditStep, OpReport, Selection, apply, apply_all};
 pub use inspection::{Distribution, InspectionReport, OwnedBuffers};
-pub use ply::{PlyReport, read_ply, read_ply_with_report, write_ply};
+pub use ply::{
+    PlyImportPolicy, PlyReport, read_ply, read_ply_repairing, read_ply_with_policy, write_ply,
+};
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
 pub use transaction::{
     BatchStep, BatchStepReport, BatchTargets, ComponentChange, ComponentList, EditBatch,

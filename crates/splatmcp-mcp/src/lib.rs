@@ -24,6 +24,7 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use bridge::AppLink;
+use splatmcp_core::PlyImportPolicy;
 use splatmcp_bridge::Method;
 use tools::{author, edit, python, viewer};
 
@@ -173,6 +174,7 @@ impl SplatMcpServer {
     /// Applies edit steps to a splat.
     #[tool(
         description = "Edit a gaussian splat in place: translate, rotate, scale, set_radius, \
+                       and a .ply source is imported strictly unless repair:true is given; \
                        adjust_color, set_color, set_opacity, duplicate, remove or merge, each with \
                        an optional box or attribute selection. Works on the displayed splat by \
                        default; returns per-step counts.",
@@ -182,8 +184,13 @@ impl SplatMcpServer {
         &self,
         Parameters(input): Parameters<edit::EditInput>,
     ) -> Result<CallToolResult, McpError> {
+        // A file source is imported under the policy the caller chose: strict by default,
+        // so a damaged file is refused with indexed diagnostics instead of being edited as
+        // if it were intact. The report travels back in the reply.
+        let policy = PlyImportPolicy::from_repair_flag(input.repair);
         let resolved =
-            edit::resolve_source(&self.link, input.source.as_deref()).map_err(tool_error)?;
+            edit::resolve_source(&self.link, input.source.as_deref(), policy).map_err(tool_error)?;
+        let import = resolved.import.clone();
         let mut splat = resolved.splat;
         // The identity the edit started from: when the source was the displayed document the
         // result replaces exactly that revision, so the edit keeps its identity and a stale
@@ -198,18 +205,21 @@ impl SplatMcpServer {
             target.as_ref(),
         )
         .map_err(tool_error)?;
-        tool_json(&edit::edit_reply(
+        let reply = edit::edit_reply(
             &splat,
             steps,
             outcome.path,
             outcome.displayed,
             outcome.document,
-        ))
+        );
+        tool_json(&edit::with_import(reply, import))
     }
 
     /// Shows an existing PLY file in the app.
     #[tool(
-        description = "Load a .ply gaussian splat into the SplatMCP window and frame it.",
+        description = "Load a .ply gaussian splat into the SplatMCP window and frame it. \
+                       Strict: a file that needs repair is refused with indexed diagnostics, \
+                       unless repair:true accepts it and the reply reports every change.",
         annotations(
             title = "Load splat",
             read_only_hint = false,
@@ -221,7 +231,12 @@ impl SplatMcpServer {
         &self,
         Parameters(input): Parameters<edit::LoadInput>,
     ) -> Result<CallToolResult, McpError> {
-        let splat = edit::read_splat_file(&input.path).map_err(tool_error)?;
+        // Strict by default: a file that needs repair is refused with indexed diagnostics,
+        // and `repair: true` accepts it and reports every value that was changed.
+        let policy = PlyImportPolicy::from_repair_flag(input.repair);
+        let file = edit::read_splat_file(&input.path, policy).map_err(tool_error)?;
+        let import = splatmcp_bridge::PlyImportSummary::of(&file.report);
+        let splat = file.splat;
         let bytes =
             splatmcp_core::write_ply(&splat).map_err(|error| tool_error(error.to_string()))?;
         let file_name = std::path::Path::new(&input.path)
@@ -237,7 +252,8 @@ impl SplatMcpServer {
             Some(std::path::Path::new(&input.path)),
             true,
             Some(&status),
-        ))
+        )
+        .with_import(import))
     }
 
     /// Applies an edit batch as one atomic, previewable and retry-safe transaction.
@@ -361,14 +377,16 @@ impl SplatMcpServer {
                 edit::InspectOutcome::Unavailable => {}
             }
         }
+        let policy = PlyImportPolicy::from_repair_flag(input.repair);
         let resolved =
-            edit::resolve_source(&self.link, input.source.as_deref()).map_err(tool_error)?;
-        tool_json(&edit::info_reply_with_document(
+            edit::resolve_source(&self.link, input.source.as_deref(), policy).map_err(tool_error)?;
+        let reply = edit::info_reply_with_document(
             &resolved.splat,
             resolved.source,
             input.points,
             resolved.document,
-        ))
+        );
+        tool_json(&edit::info_reply_with_import(reply, resolved.import))
     }
 
     /// Reports readiness and versions of the app's embedded Python runtime.

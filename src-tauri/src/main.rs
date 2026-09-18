@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use document::AppState;
 use serde_json::{Value, json};
-use splatmcp_core::Expected;
+use splatmcp_core::{Expected, PlyImportPolicy};
 use tauri::ipc::Response;
 use tauri::{Manager, State};
 use viewer::Viewer;
@@ -80,16 +80,28 @@ fn open_splat(state: State<'_, AppState>) -> Result<Option<document::SplatInfo>,
 
     let bytes =
         std::fs::read(&path).map_err(|error| format!("could not read {path:?}: {error}"))?;
-    let metadata = state.open_ply(&bytes, document::open_mutation(&path))?;
-    warn_about_sidecar(&path, &metadata, &bytes);
-    Ok(Some(document::SplatInfo::of(&metadata)))
+    // Opening a file is the strict import path: a file that needs repair is refused with
+    // its indexed reason instead of being loaded as a quietly repaired document.
+    let imported = state.open_ply(
+        &bytes,
+        document::open_mutation(&path),
+        PlyImportPolicy::Strict,
+    )?;
+    if !imported.report.is_lossless() {
+        println!("splatmcp: import report: {}", imported.report.summary());
+    }
+    warn_about_sidecar(&path, &imported.metadata, &bytes);
+    Ok(Some(document::SplatInfo::of(&imported.metadata)))
 }
 
 /// Reads the source file of the displayed document again, as a new revision.
 #[tauri::command]
 fn reload_splat(state: State<'_, AppState>) -> Result<document::SplatInfo, String> {
-    let metadata = state.reload(Expected::Any)?;
-    Ok(document::SplatInfo::of(&metadata))
+    let imported = state.reload(Expected::Any, PlyImportPolicy::Strict)?;
+    if !imported.report.is_lossless() {
+        println!("splatmcp: import report: {}", imported.report.summary());
+    }
+    Ok(document::SplatInfo::of(&imported.metadata))
 }
 
 /// Raw PLY bytes of the displayed revision, handed to the PlayCanvas viewer.
