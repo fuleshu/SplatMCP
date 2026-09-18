@@ -33,6 +33,7 @@ impl Handler for FakeApp {
                 canvas_width: 800,
                 canvas_height: 600,
                 camera: None,
+                document: None,
             })),
             Method::ViewerSetCamera => {
                 if params.get("fov").and_then(Value::as_f64).is_none() {

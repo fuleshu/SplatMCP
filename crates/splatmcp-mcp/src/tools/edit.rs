@@ -11,7 +11,7 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use splatmcp_bridge::protocol::ViewerStatus;
-use splatmcp_bridge::{InspectResult, InspectionSummary, LoadPlyRequest, Method};
+use splatmcp_bridge::{InspectResult, InspectionSummary, Method, load_ply_params, replace_ply_params};
 use splatmcp_core::validation::IssueRecorder;
 use splatmcp_core::{
     Box3, EditOp, EditStep, Selection, Splat, apply_all, read_ply, write_ply,
@@ -144,6 +144,12 @@ pub struct InfoInput {
 pub struct EditReply {
     #[serde(flatten)]
     pub summary: SplatSummary,
+    /// Identity of the document revision the edit landed in.
+    ///
+    /// The app reports it, so a caller can quote that revision back for the next edit - or
+    /// finds out that it edited a different document than it assumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<DocumentIdentity>,
     /// Points touched by each step, in order.
     pub steps: Vec<StepReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,6 +194,23 @@ pub struct InfoReply {
 pub struct DocumentIdentity {
     pub document_id: String,
     pub revision: u64,
+}
+
+impl DocumentIdentity {
+    /// Reads the identity out of a bridge document summary.
+    ///
+    /// `None` when the app reported none - an older build, or a viewer reply that never went
+    /// through the document service - so a caller is never handed an invented identity.
+    pub fn of_summary(summary: Option<&splatmcp_bridge::DocumentSummary>) -> Option<Self> {
+        let summary = summary?;
+        if summary.document_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            document_id: summary.document_id.clone(),
+            revision: summary.revision,
+        })
+    }
 }
 
 fn parse_box(values: &[f32], name: &str) -> Result<Box3, String> {
@@ -386,17 +409,12 @@ fn document_ply(link: &AppLink) -> Result<(Option<DocumentIdentity>, Vec<u8>), S
     let bytes = BASE64
         .decode(encoded.as_bytes())
         .map_err(|error| format!("the app returned an unreadable splat: {error}"))?;
-    // Identity is additive: an older app that does not report it still answers the bytes.
-    let document = match (
-        value.get("document_id").and_then(Value::as_str),
-        value.get("revision").and_then(Value::as_u64),
-    ) {
-        (Some(document_id), Some(revision)) => Some(DocumentIdentity {
-            document_id: document_id.to_owned(),
-            revision,
-        }),
-        _ => None,
-    };
+    // Identity is additive: an older app that does not report it still answers the bytes, and
+    // a reply that names no document is not turned into an invented identity.
+    let document = value
+        .get("document")
+        .and_then(|document| serde_json::from_value::<splatmcp_bridge::DocumentSummary>(document.clone()).ok())
+        .and_then(|summary| DocumentIdentity::of_summary(Some(&summary)));
     Ok((document, bytes))
 }
 
@@ -422,13 +440,30 @@ pub fn apply_edits(splat: &mut Splat, ops: &[EditOpInput]) -> Result<Vec<StepRep
         .collect())
 }
 
+/// What a save-and-display step did, including the identity it resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayedEdit {
+    /// File the splat was written to, when the call asked for one.
+    pub path: Option<String>,
+    /// True when the app was asked to display the result.
+    pub displayed: bool,
+    /// Identity of the revision the app resolved, when it reported one.
+    pub document: Option<DocumentIdentity>,
+}
+
 /// Writes PLY bytes for a splat and shows it.
+///
+/// `target` is the document the edit started from: when it is known, the load is an explicit
+/// replacement of that document at that revision, so the edit keeps its identity and a stale
+/// edit is refused. A `None` target means the geometry came from somewhere else, and the
+/// result becomes a document of its own.
 pub fn save_and_display(
     link: &AppLink,
     splat: &Splat,
     path: Option<&str>,
     display: bool,
-) -> Result<(Option<String>, bool), String> {
+    target: Option<&DocumentIdentity>,
+) -> Result<DisplayedEdit, String> {
     let bytes = write_ply(splat).map_err(|error| format!("could not encode the splat: {error}"))?;
     let written = match path {
         Some(path) => Some(
@@ -438,6 +473,7 @@ pub fn save_and_display(
         ),
         None => None,
     };
+    let mut document = None;
     if display {
         let file_name = written
             .as_deref()
@@ -445,17 +481,22 @@ pub fn save_and_display(
             .and_then(|name| name.to_str())
             .unwrap_or("splat.ply")
             .to_owned();
-        let request = LoadPlyRequest {
-            ply_base64: BASE64.encode(&bytes),
-            file_name: Some(file_name),
-            frame: Some(false),
+        let encoded = BASE64.encode(&bytes);
+        let params = match target {
+            Some(target) => {
+                replace_ply_params(encoded, &target.document_id, target.revision, Some(false))
+            }
+            None => load_ply_params(encoded, Some(file_name)),
         };
-        let params = serde_json::to_value(&request)
-            .map_err(|error| format!("could not encode the splat: {error}"))?;
         // Editing keeps the current camera, so the caller's view is not thrown away.
-        link.request_typed::<ViewerStatus>(Method::ViewerLoadPly, params)?;
+        let status: ViewerStatus = link.request_typed(Method::ViewerLoadPly, params)?;
+        document = DocumentIdentity::of_summary(status.document.as_ref());
     }
-    Ok((written, display))
+    Ok(DisplayedEdit {
+        path: written,
+        displayed: display,
+        document,
+    })
 }
 
 /// Builds the reply of `edit_splat`.
@@ -464,9 +505,11 @@ pub fn edit_reply(
     steps: Vec<StepReport>,
     path: Option<String>,
     displayed: bool,
+    document: Option<DocumentIdentity>,
 ) -> EditReply {
     EditReply {
         summary: SplatSummary::of(splat),
+        document,
         steps,
         path,
         displayed,
@@ -549,13 +592,7 @@ pub fn inspect_displayed(link: &AppLink) -> InspectOutcome {
 
 /// Reply of `splat_info` built from a bounded inspection.
 pub fn info_reply_from_inspect(result: InspectResult) -> InfoReply {
-    let document = match (&result.document_id, result.revision) {
-        (Some(document_id), Some(revision)) => Some(DocumentIdentity {
-            document_id: document_id.clone(),
-            revision,
-        }),
-        _ => None,
-    };
+    let document = DocumentIdentity::of_summary(Some(&result.document));
     InfoReply {
         summary: SplatSummary::of_inspection(&result.inspection),
         inspection: Some(result.inspection),
@@ -943,12 +980,31 @@ mod tests {
             }],
             Some("C:/tmp/a.ply".to_owned()),
             true,
+            None,
         );
         let encoded = serde_json::to_string(&reply).unwrap();
         assert!(encoded.starts_with("{\"point_count\":3"), "{encoded}");
         assert!(encoded.contains("\"steps\":[{\"op_index\":0,\"affected\":3,\"remaining\":3}]"));
         assert!(encoded.contains("\"displayed\":true"));
         assert!(!encoded.contains("0.80000001"), "{encoded}");
+        assert!(!encoded.contains("\"document\""), "no identity is invented: {encoded}");
+
+        // With an identity it is reported, so a caller can quote the revision back.
+        let named = edit_reply(
+            &splat,
+            Vec::new(),
+            None,
+            false,
+            Some(DocumentIdentity {
+                document_id: "doc-5-1".to_owned(),
+                revision: 2,
+            }),
+        );
+        let encoded = serde_json::to_string(&named).unwrap();
+        assert!(
+            encoded.contains("\"document\":{\"document_id\":\"doc-5-1\",\"revision\":2}"),
+            "{encoded}"
+        );
     }
 
     #[test]
@@ -974,10 +1030,14 @@ mod tests {
     fn an_inspection_reply_keeps_the_summary_shape() {
         let splat = grid(3);
         let result = InspectResult {
+            document: splatmcp_bridge::DocumentSummary {
+                document_id: "doc-5".to_owned(),
+                revision: 2,
+                point_count: splat.len(),
+                file_name: "a.ply".to_owned(),
+                ..splatmcp_bridge::DocumentSummary::default()
+            },
             inspection: inspect_splat(&splat),
-            file_name: Some("a.ply".to_owned()),
-            document_id: Some("doc-5".to_owned()),
-            revision: Some(2),
         };
         let reply = info_reply_from_inspect(result);
         assert_eq!(reply.summary, SplatSummary::of(&splat));

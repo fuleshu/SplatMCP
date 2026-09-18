@@ -24,10 +24,13 @@ pub use client::BridgeClient;
 pub use paths::{app_data_dir, bridge_descriptor_path, ensure_app_data_dir, settings_path};
 pub use protocol::{
     BoundsSummary, BridgeDescriptor, CameraRequest, CameraState, CaptureRequest, CaptureResult,
-    DistributionSummary, InspectRequest, InspectResult, InspectionSummary, LoadPlyRequest,
-    Method, PythonCancelRequest, PythonErrorReport, PythonJobQuery, PythonRunRequest, Request,
-    Response, ViewerStatus, PROTOCOL_VERSION,
+    DistributionSummary, DocumentPlyReply, DocumentReply, DocumentSummary, ExportSummary,
+    GetPlyRequest, InspectRequest, InspectResult, InspectionSummary, LoadPlyRequest, Method,
+    PythonCancelRequest, PythonErrorReport, PythonJobQuery, PythonRunRequest, ReloadRequest,
+    Request, Response, RetentionSummary, RevisionSummary, SetComponentRequest, ViewerStatus,
+    PROTOCOL_VERSION,
 };
+pub use protocol::{load_ply_params, replace_ply_params};
 pub use server::{BridgeServer, BridgeService, Handler};
 pub use wire::{read_line_limited, read_message, write_message, MAX_FRAME_BYTES};
 

@@ -16,6 +16,7 @@
 //! - `rotation` is a unit quaternion `(w, x, y, z)` (PLY order `rot_0..rot_3`)
 
 pub mod contract;
+pub mod document;
 pub mod fixtures;
 pub mod inspection;
 mod authoring;
@@ -25,6 +26,11 @@ mod splat;
 pub mod validation;
 
 pub use authoring::{MAX_POINTS, Rng, Shape, SplatParams, build, splat_from_points};
+pub use document::{
+    ArtifactChecksum, DocumentError, DocumentHandle, DocumentId, DocumentMetadata, DocumentStore,
+    Expected, ExportRecord, Mutation, MutationKind, Provenance, RetentionLimits, RetentionStats,
+    RevisionRecord, Snapshot, SnapshotPin,
+};
 pub use edit::{Box3, EditOp, EditStep, OpReport, Selection, apply, apply_all};
 pub use inspection::{Distribution, InspectionReport, OwnedBuffers};
 pub use ply::{PlyReport, read_ply, read_ply_with_report, write_ply};

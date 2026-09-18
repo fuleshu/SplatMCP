@@ -137,6 +137,7 @@ impl SplatMcpServer {
 
         let display = input.display.unwrap_or(true);
         let mut displayed = false;
+        let mut status = None;
         if display {
             let file_name = path
                 .as_ref()
@@ -144,11 +145,19 @@ impl SplatMcpServer {
                 .and_then(|name| name.to_str())
                 .unwrap_or("splat.ply")
                 .to_owned();
-            author::display_splat(&self.link, &file_name, &bytes).map_err(tool_error)?;
+            // A created splat is a new document: nothing was edited, so nothing is replaced.
+            status = Some(
+                author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?,
+            );
             displayed = true;
         }
 
-        tool_json(&author::splat_reply(&splat, path.as_deref(), displayed))
+        tool_json(&author::splat_reply(
+            &splat,
+            path.as_deref(),
+            displayed,
+            status.as_ref(),
+        ))
     }
 
     /// Applies edit steps to a splat.
@@ -166,15 +175,26 @@ impl SplatMcpServer {
         let resolved = edit::resolve_source(&self.link, input.source.as_deref())
             .map_err(tool_error)?;
         let mut splat = resolved.splat;
+        // The identity the edit started from: when the source was the displayed document the
+        // result replaces exactly that revision, so the edit keeps its identity and a stale
+        // edit is refused. A `.ply` source produces a document of its own.
+        let target = resolved.document.clone();
         let steps = edit::apply_edits(&mut splat, &input.ops).map_err(tool_error)?;
-        let (path, displayed) = edit::save_and_display(
+        let outcome = edit::save_and_display(
             &self.link,
             &splat,
             input.path.as_deref(),
             input.display.unwrap_or(true),
+            target.as_ref(),
         )
         .map_err(tool_error)?;
-        tool_json(&edit::edit_reply(&splat, steps, path, displayed))
+        tool_json(&edit::edit_reply(
+            &splat,
+            steps,
+            outcome.path,
+            outcome.displayed,
+            outcome.document,
+        ))
     }
 
     /// Shows an existing PLY file in the app.
@@ -198,8 +218,14 @@ impl SplatMcpServer {
             .and_then(|name| name.to_str())
             .unwrap_or("splat.ply")
             .to_owned();
-        author::display_splat(&self.link, &file_name, &bytes).map_err(tool_error)?;
-        tool_json(&author::splat_reply(&splat, Some(std::path::Path::new(&input.path)), true))
+        // Loading a file opens a document: the file is provenance, not identity.
+        let status = author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?;
+        tool_json(&author::splat_reply(
+            &splat,
+            Some(std::path::Path::new(&input.path)),
+            true,
+            Some(&status),
+        ))
     }
 
     /// Describes a splat: count, bounds, colour and opacity.

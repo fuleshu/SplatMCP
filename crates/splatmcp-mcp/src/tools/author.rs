@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 use splatmcp_bridge::protocol::ViewerStatus;
-use splatmcp_bridge::{LoadPlyRequest, Method};
+use splatmcp_bridge::{Method, load_ply_params, replace_ply_params};
 use splatmcp_core::validation::{IssueRecorder, ValidationIssue};
 use splatmcp_core::{
     MAX_POINTS, Shape, Splat, SplatParams, SplatPoint, build, splat_from_points,
@@ -16,6 +16,7 @@ use splatmcp_core::{
 use std::path::{Path, PathBuf};
 
 use crate::bridge::AppLink;
+use crate::tools::edit::DocumentIdentity;
 use crate::tools::{Factor, SplatReply};
 
 /// Default seed. Zero is a fine default because the generator is deterministic anyway.
@@ -243,20 +244,36 @@ pub fn write_splat_file(path: &str, bytes: &[u8]) -> Result<PathBuf, String> {
 }
 
 /// Sends PLY bytes to the desktop app and waits until the viewer shows them.
-pub fn display_splat(link: &AppLink, file_name: &str, bytes: &[u8]) -> Result<ViewerStatus, String> {
-    let request = LoadPlyRequest {
-        ply_base64: BASE64.encode(bytes),
-        file_name: Some(file_name.to_owned()),
-        frame: Some(true),
+///
+/// With no `target` the bytes become a new document: that is what creating a splat or loading
+/// a file means. With a `target` the load is an explicit replacement of that document at that
+/// revision, which is how an edit keeps the identity it edited - and how a stale edit is
+/// refused instead of overwriting newer work.
+pub fn display_splat(
+    link: &AppLink,
+    file_name: &str,
+    bytes: &[u8],
+    target: Option<&DocumentIdentity>,
+) -> Result<ViewerStatus, String> {
+    let encoded = BASE64.encode(bytes);
+    let params = match target {
+        Some(target) => replace_ply_params(encoded, &target.document_id, target.revision, Some(false)),
+        None => load_ply_params(encoded, Some(file_name.to_owned())),
     };
-    let params = serde_json::to_value(&request)
-        .map_err(|error| format!("could not encode the splat: {error}"))?;
     link.request_typed(Method::ViewerLoadPly, params)
 }
 
 /// Standard reply for a tool that produced a splat.
-pub fn splat_reply(splat: &Splat, path: Option<&Path>, displayed: bool) -> SplatReply {
-    SplatReply::new(splat, path, displayed)
+pub fn splat_reply(
+    splat: &Splat,
+    path: Option<&Path>,
+    displayed: bool,
+    status: Option<&ViewerStatus>,
+) -> SplatReply {
+    let document = status
+        .and_then(|status| status.document.as_ref())
+        .and_then(|summary| DocumentIdentity::of_summary(Some(summary)));
+    SplatReply::new(splat, path, displayed).with_document(document)
 }
 
 #[cfg(test)]
@@ -401,7 +418,7 @@ mod tests {
     #[test]
     fn the_reply_reports_the_summary_and_where_the_splat_went() {
         let splat = build_splat(&CreateInput::default()).unwrap();
-        let reply = splat_reply(&splat, Some(Path::new("C:/tmp/a.ply")), true);
+        let reply = splat_reply(&splat, Some(Path::new("C:/tmp/a.ply")), true, None);
         assert_eq!(reply.summary.point_count, 1000);
         assert!(reply.displayed);
         assert!(reply.path.as_deref().unwrap().ends_with("a.ply"));
@@ -412,11 +429,40 @@ mod tests {
         assert!(encoded.contains("\"displayed\":true"));
         assert!(!encoded.contains("0.8999999"), "{encoded}");
 
-        let bare = splat_reply(&splat, None, false);
+        let bare = splat_reply(&splat, None, false, None);
         let encoded = serde_json::to_string(&bare).unwrap();
         assert!(!encoded.contains("path"), "{encoded}");
         assert!(encoded.contains("\"displayed\":false"));
         assert!(encoded.contains("\"max_opacity\":0.9"), "{encoded}");
+    }
+
+    #[test]
+    fn a_reply_reports_the_identity_the_app_resolved() {
+        let splat = build_splat(&CreateInput::default()).unwrap();
+        let status = ViewerStatus {
+            viewer_ready: true,
+            loaded: true,
+            point_count: 1000,
+            canvas_width: 800,
+            canvas_height: 600,
+            camera: None,
+            document: Some(splatmcp_bridge::DocumentSummary {
+                document_id: "doc-4f2a-2".to_owned(),
+                revision: 3,
+                point_count: 1000,
+                ..splatmcp_bridge::DocumentSummary::default()
+            }),
+        };
+        let reply = splat_reply(&splat, None, true, Some(&status));
+        let document = reply.document.expect("the identity travels with the reply");
+        assert_eq!(document.document_id, "doc-4f2a-2");
+        assert_eq!(document.revision, 3);
+
+        // An app that reports no identity leaves the field out rather than inventing one.
+        let mut silent = status;
+        silent.document = None;
+        let reply = splat_reply(&splat, None, true, Some(&silent));
+        assert!(reply.document.is_none());
     }
     #[test]
     fn explicit_points_are_checked_before_they_are_clamped() {

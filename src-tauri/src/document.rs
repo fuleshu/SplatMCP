@@ -1,318 +1,404 @@
-//! The splat the app displays.
+//! The document service the desktop app owns.
 //!
-//! One document of record: the file the user opened, or the bytes an MCP tool or a Python
-//! job committed. Saving re-serialises through `splatmcp-core` instead of echoing the
-//! bytes that happened to be loaded.
+//! This module is a thin adapter: identity, revisions, compare-and-swap, snapshots and
+//! retention live in `splatmcp_core::document`, so the same behaviour is unit tested without
+//! Tauri, and the app adds only what is genuinely app-side - reading and writing files,
+//! parsing and serialising PLY, and the flat reply shape the frontend and the tool surface
+//! consume.
 //!
-//! # Identity and revisions
+//! Two rules are enforced here rather than trusted to callers:
 //!
-//! Every document carries a stable `document_id` and a `revision` that advances on every
-//! accepted change: a manual open, a bridge load, or a Python commit. A Python job states
-//! the revision it believes it is editing, and the commit only happens when that revision
-//! is still current, so a late job can never overwrite newer work.
-//!
-//! This is the minimal seam the generation service needs. Task #12 ("stable document
-//! identities, revisions and immutable snapshots") owns the full model - content hashes,
-//! immutable snapshots and a document registry - and will replace this counter without
-//! changing the service's contract.
+//! - **Parsing and serialising happen outside the store's lock.** A snapshot hands back an
+//!   `Arc<Splat>`, so a 500 000 gaussian document is read, written or inspected while the
+//!   store is free to serve the next request.
+//! - **A mutation states what it expects.** An anonymous change resolves to what is displayed
+//!   at request receipt and reports the identity it resolved to; a change that names a
+//!   document must name its revision too.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::path::Path;
 
 use serde::Serialize;
-use splatmcp_core::{Splat, read_ply, write_ply};
-use splatmcp_python::arrays::BoundsOut;
-use splatmcp_python::script::RecipeRecord;
-use splatmcp_python::{CommitOutcome, CommitRequest, DocumentIdentity};
+use splatmcp_core::document::{DocumentMetadata, DocumentStore, now_ms};
+use splatmcp_core::{Splat, SplatError, read_ply, write_ply};
 
-/// A splat plus the name it should be saved under and where it is in time.
-pub struct Document {
-    pub path: PathBuf,
-    pub splat: Splat,
-    /// Stable identity of this document across its revisions.
-    pub document_id: String,
-    /// Content revision, starting at 1 and advancing on every accepted change.
-    pub revision: u64,
-    /// Recipe that produced this revision, when a Python job produced it.
-    pub recipe: Option<RecipeRecord>,
-    /// Component the producing job replaced, when it named one.
-    pub component_id: Option<String>,
+pub use splatmcp_core::document::{
+    ArtifactChecksum, DocumentError, DocumentHandle, DocumentId, Expected, Mutation, MutationKind,
+    RetentionStats, Snapshot,
+};
+
+/// Everything the document service can fail with.
+///
+/// The distinction matters to a caller: a [`DocumentError`] is about *identity* - a stale
+/// revision, an expired snapshot, a document that is not displayed - and carries the code
+/// and the current handle a caller needs to reconcile. An invalid request is about the data
+/// or the environment and carries only a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceError {
+    Document(DocumentError),
+    Invalid(String),
 }
 
-impl Document {
-    /// Parses PLY bytes and validates them, so an unusable document never enters state.
-    ///
-    /// Identity and revision are assigned by [`AppState::replace`], which is the only place
-    /// that knows what came before.
-    pub fn from_ply_bytes(bytes: &[u8], path: PathBuf) -> Result<Self, String> {
-        let splat = read_ply(bytes).map_err(|error| error.to_string())?;
-        splat.validate().map_err(|error| error.to_string())?;
-        Ok(Self {
-            path,
-            splat,
-            document_id: String::new(),
-            revision: 0,
-            recipe: None,
-            component_id: None,
-        })
+impl ServiceError {
+    /// Stable machine readable code, for structured replies.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Document(error) => error.code(),
+            Self::Invalid(_) => "invalid_request",
+        }
     }
 
-    /// File name used by the save dialog and reported to the viewer.
-    pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("splat.ply")
-            .to_owned()
+    /// True when the failure is a concurrency outcome to reconcile.
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Document(error) if error.is_conflict())
     }
 
-    /// Canonical PLY bytes of the displayed splat.
-    pub fn ply_bytes(&self) -> Result<Vec<u8>, String> {
-        write_ply(&self.splat).map_err(|error| error.to_string())
+    /// Current identity and revision, when the store knows them.
+    pub fn current(&self) -> Option<&DocumentHandle> {
+        match self {
+            Self::Document(error) => error.current(),
+            Self::Invalid(_) => None,
+        }
     }
 
-    pub fn info(&self) -> SplatInfo {
-        SplatInfo {
-            path: self.path.to_string_lossy().to_string(),
-            file_name: self.file_name(),
-            point_count: self.splat.len(),
-            document_id: self.document_id.clone(),
-            revision: self.revision,
+    /// The document error behind this failure, when there is one.
+    pub fn document_error(&self) -> Option<&DocumentError> {
+        match self {
+            Self::Document(error) => Some(error),
+            Self::Invalid(_) => None,
         }
     }
 }
 
-/// Summary of a loaded splat, returned to the frontend after an open or a commit.
-#[derive(Serialize, Clone, Debug, PartialEq)]
-pub struct SplatInfo {
-    pub path: String,
-    pub file_name: String,
-    pub point_count: usize,
-    pub document_id: String,
-    pub revision: u64,
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Document(error) => write!(formatter, "{error}"),
+            Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
 }
 
-/// Identity of the displayed document, for tool replies and the panel.
-#[derive(Serialize, Clone, Debug, PartialEq)]
-pub struct DocumentIdentityInfo {
+impl std::error::Error for ServiceError {}
+
+impl From<DocumentError> for ServiceError {
+    fn from(error: DocumentError) -> Self {
+        Self::Document(error)
+    }
+}
+
+impl From<String> for ServiceError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<SplatError> for ServiceError {
+    fn from(error: SplatError) -> Self {
+        Self::Invalid(error.to_string())
+    }
+}
+
+impl From<ServiceError> for String {
+    fn from(error: ServiceError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Parses PLY bytes and validates them, so an unusable document never enters state.
+pub fn parse_ply(bytes: &[u8]) -> Result<Splat, String> {
+    let splat = read_ply(bytes).map_err(|error| error.to_string())?;
+    splat.validate().map_err(|error| error.to_string())?;
+    Ok(splat)
+}
+
+/// Canonical PLY bytes of a splat.
+///
+/// Takes the snapshot's content rather than the store, so the store's lock is not held while a
+/// large document is serialised.
+pub fn ply_bytes(splat: &Splat) -> Result<Vec<u8>, String> {
+    write_ply(splat).map_err(|error| error.to_string())
+}
+
+/// Flat description of a document revision, for the frontend and the panel.
+///
+/// The field names the window already reads (`file_name`, `point_count`) stay where they were;
+/// the identity fields are additive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SplatInfo {
     pub document_id: String,
     pub revision: u64,
     pub point_count: usize,
     pub file_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub component_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_operation: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    /// True when the revision carries a producer record, which a save writes beside the file.
+    pub has_recipe: bool,
 }
 
-/// Application state shared by the Tauri commands, the bridge handler and the Python host.
+impl SplatInfo {
+    /// Projects bounded metadata onto the flat reply shape.
+    pub fn of(metadata: &DocumentMetadata) -> Self {
+        Self {
+            document_id: metadata.handle.document_id.to_string(),
+            revision: metadata.handle.revision,
+            point_count: metadata.point_count,
+            file_name: metadata.provenance.file_name.clone(),
+            source_path: metadata.provenance.source_path.clone(),
+            component_id: metadata.provenance.component_id.clone(),
+            last_operation: metadata.provenance.last_operation.clone(),
+            created_at_ms: metadata.provenance.created_at_ms,
+            updated_at_ms: metadata.provenance.updated_at_ms,
+            has_recipe: metadata.provenance.has_recipe(),
+        }
+    }
+}
+
+/// What an export produced: the file, and the exact identity that was written to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportOutcome {
+    pub path: String,
+    pub document_id: String,
+    pub revision: u64,
+    /// `algorithm:hex` of the written bytes, so a caller can tell one encoding from another.
+    pub checksum: String,
+    pub bytes: usize,
+}
+
+/// Application state: the one authoritative document store this process owns.
 #[derive(Default)]
 pub struct AppState {
-    document: Mutex<Option<Document>>,
+    store: DocumentStore,
 }
 
 impl AppState {
-    /// Replaces the displayed document, advancing its revision.
+    /// Makes imported bytes a **new document**, at revision 1.
     ///
-    /// Loading the same file again keeps the document identity and moves to the next
-    /// revision; loading a different file starts a new document at revision 1. Either way a
-    /// job that expected the old revision can no longer commit.
-    pub fn replace(&self, mut document: Document) -> Result<SplatInfo, String> {
-        let mut guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        let (document_id, revision) = match guard.as_ref() {
-            Some(previous) if previous.path == document.path => {
-                (previous.document_id.clone(), previous.revision + 1)
-            }
-            _ => (next_document_id(), 1),
-        };
-        document.document_id = document_id;
-        document.revision = revision;
-        let info = document.info();
-        *guard = Some(document);
-        Ok(info)
+    /// Opening a file and importing a buffer both land here: two opens of the same path are
+    /// two documents, because a path is provenance and not identity.
+    pub fn open_ply(
+        &self,
+        bytes: &[u8],
+        mutation: Mutation,
+    ) -> Result<DocumentMetadata, ServiceError> {
+        let splat = parse_ply(bytes)?;
+        Ok(self.store.open(splat, mutation))
     }
 
-    /// Runs `read` against the document, or reports that nothing is loaded.
-    pub fn with_document<T>(&self, read: impl FnOnce(&Document) -> T) -> Result<T, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        let document = guard.as_ref().ok_or("no splat is loaded")?;
-        Ok(read(document))
-    }
-
-    /// Canonical PLY bytes of the displayed splat, or `None` when nothing is loaded.
-    pub fn ply_bytes(&self) -> Result<Option<Vec<u8>>, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        match guard.as_ref() {
-            Some(document) => document.ply_bytes().map(Some),
-            None => Ok(None),
-        }
-    }
-
-    /// Canonical PLY bytes of one exact revision.
+    /// Makes already parsed geometry a **new document**, at revision 1.
     ///
-    /// The viewer asks for the revision it was told about; a mismatch is reported instead of
-    /// silently displaying newer geometry.
-    pub fn ply_bytes_for_revision(&self, revision: u64) -> Result<Vec<u8>, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        let document = guard.as_ref().ok_or("no splat is loaded")?;
-        if document.revision != revision {
-            return Err(format!(
-                "the document is at revision {} but the viewer asked for revision {revision}; \
-                 reload or re-issue the job",
-                document.revision
+    /// This is the shape a generation job uses when it creates a document: the geometry
+    /// never travelled as a file, so there is nothing to parse and nothing to compare
+    /// against.
+    pub fn open_splat(
+        &self,
+        splat: Splat,
+        mutation: Mutation,
+    ) -> Result<DocumentMetadata, ServiceError> {
+        splat.validate()?;
+        Ok(self.store.open(splat, mutation))
+    }
+
+    /// Applies a content change under a compare-and-swap check.
+    pub fn commit(
+        &self,
+        expected: Expected,
+        splat: Splat,
+        mutation: Mutation,
+    ) -> Result<DocumentMetadata, ServiceError> {
+        splat.validate()?;
+        Ok(self.store.commit(expected, splat, mutation)?)
+    }
+
+    /// Parses and commits imported bytes as a new revision of the expected document.
+    pub fn replace_ply(
+        &self,
+        expected: Expected,
+        bytes: &[u8],
+        mutation: Mutation,
+    ) -> Result<DocumentMetadata, ServiceError> {
+        let splat = parse_ply(bytes)?;
+        Ok(self.store.commit(expected, splat, mutation)?)
+    }
+
+    /// Changes the named component of the displayed document.
+    pub fn set_component(
+        &self,
+        expected: Expected,
+        component_id: &str,
+        operation: &str,
+    ) -> Result<DocumentMetadata, ServiceError> {
+        if component_id.trim().is_empty() {
+            return Err(ServiceError::Invalid(
+                "component_id must not be blank".to_owned(),
             ));
         }
-        document.ply_bytes()
+        Ok(self
+            .store
+            .set_component(expected, component_id, operation)?)
     }
 
-    /// Name of the displayed file, used when the viewer asks about it.
-    pub fn file_name(&self) -> Result<Option<String>, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        Ok(guard.as_ref().map(Document::file_name))
-    }
-
-    /// Point count of the displayed splat, for the `document_get_ply` reply.
-    pub fn point_count(&self) -> Result<usize, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        Ok(guard
-            .as_ref()
-            .map(|document| document.splat.len())
-            .unwrap_or(0))
-    }
-
-    /// Recipe that produced the displayed revision, when a Python job produced it.
-    pub fn recipe(&self) -> Result<Option<RecipeRecord>, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        Ok(guard.as_ref().and_then(|document| document.recipe.clone()))
-    }
-
-    /// Identity of the displayed document, or `None` when nothing is loaded.
-    pub fn identity(&self) -> Result<Option<DocumentIdentityInfo>, String> {
-        let guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        Ok(guard.as_ref().map(|document| DocumentIdentityInfo {
-            document_id: document.document_id.clone(),
-            revision: document.revision,
-            point_count: document.splat.len(),
-            file_name: document.file_name(),
-            component_id: document.component_id.clone(),
-        }))
-    }
-
-    /// Commits a validated candidate as the next revision.
+    /// Reads a document's source file again, as a new revision of the same document.
     ///
-    /// The revision comparison and the swap happen under one lock, so two concurrent jobs
-    /// for the same revision produce one commit and one explicit conflict rather than a
-    /// silent last-writer-wins.
-    pub fn commit_candidate(&self, request: CommitRequest) -> Result<CommitOutcome, String> {
-        let mut guard = self
-            .document
-            .lock()
-            .map_err(|_| "splat state is locked".to_owned())?;
-        let current = guard.as_ref().map(|document| document.revision).unwrap_or(0);
-
-        if let Some(expected) = request.target.expected_revision {
-            if expected != current {
-                return Ok(CommitOutcome::Conflict {
-                    document_id: request
-                        .target
-                        .document_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_owned()),
-                    expected,
-                    actual: current,
-                });
-            }
-        } else if let Some(declared) = request.target.document_id.as_ref() {
-            // A caller naming a document must name its revision too; anything else would
-            // silently overwrite whatever it happens to be looking at.
-            let matches = guard
-                .as_ref()
-                .is_some_and(|document| &document.document_id == declared);
-            if !matches {
-                return Err(format!(
-                    "document {declared} is not the loaded document; call document_info for its \
-                     identity and revision"
-                ));
-            }
-        }
-
-        let point_count = request.splat.len();
-        let bounds = request.splat.bounds().map(BoundsOut::from);
-        let revision = current + 1;
-        let (document_id, path) = match guard.as_ref() {
-            Some(previous) => (previous.document_id.clone(), previous.path.clone()),
-            None => {
-                let file_name = request
-                    .target
-                    .file_name
-                    .clone()
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| "generated.ply".to_owned());
-                (next_document_id(), crate::paths::documents_dir().join(file_name))
-            }
+    /// `expected` selects the document and the revision to re-read; the file is read and parsed
+    /// **before** the commit, so a slow disk does not hold the store, and the commit is made
+    /// against the exact revision that was read - a change that landed meanwhile conflicts
+    /// instead of being lost.
+    pub fn reload(&self, expected: Expected) -> Result<DocumentMetadata, ServiceError> {
+        let snapshot = self.snapshot(expected)?;
+        let handle = snapshot.handle().clone();
+        let Some(source) = snapshot.provenance().source_path.clone() else {
+            return Err(ServiceError::Invalid(
+                "this document has no source file to reload; open a .ply or import one first"
+                    .to_owned(),
+            ));
         };
+        let bytes =
+            std::fs::read(&source).map_err(|error| format!("could not read {source}: {error}"))?;
+        drop(snapshot);
+        let splat = parse_ply(&bytes)?;
+        Ok(self.store.commit(
+            Expected::Handle(handle),
+            splat,
+            Mutation::reload("reload").source(source),
+        )?)
+    }
 
-        *guard = Some(Document {
-            path,
-            splat: request.splat,
-            document_id: document_id.clone(),
-            revision,
-            recipe: Some(request.provenance),
-            component_id: request.target.component_id.clone(),
-        });
+    /// The displayed revision, as an immutable snapshot.
+    pub fn active(&self) -> Result<Snapshot, ServiceError> {
+        Ok(self.store.snapshot(Expected::Any)?)
+    }
 
-        Ok(CommitOutcome::Committed {
-            identity: DocumentIdentity {
-                document_id,
-                revision,
-                point_count,
-                bounds,
-                component_id: request.target.component_id,
-            },
+    /// An exact revision, resolved by handle.
+    pub fn snapshot(&self, expected: Expected) -> Result<Snapshot, ServiceError> {
+        Ok(self.store.snapshot(expected)?)
+    }
+
+    /// Canonical PLY bytes of the displayed revision.
+    ///
+    /// The bytes are produced from the snapshot, after the store lock has been released.
+    pub fn active_ply_bytes(&self) -> Result<(Snapshot, Vec<u8>), ServiceError> {
+        let snapshot = self.active()?;
+        let bytes = ply_bytes(snapshot.splat())?;
+        Ok((snapshot, bytes))
+    }
+
+    /// Canonical PLY bytes of an exact revision.
+    pub fn ply_bytes_for(
+        &self,
+        handle: &DocumentHandle,
+    ) -> Result<(Snapshot, Vec<u8>), ServiceError> {
+        let snapshot = self.store.resolve(handle)?;
+        let bytes = ply_bytes(snapshot.splat())?;
+        Ok((snapshot, bytes))
+    }
+
+    /// Writes the expected revision to `path` and records the export.
+    ///
+    /// The revision is pinned for the duration, so retention cannot drop it between taking the
+    /// snapshot and recording what was written. The export does not advance the revision: the
+    /// geometry and the component metadata are the ones that were already there, and only the
+    /// artifact checksum is new.
+    pub fn export(&self, expected: Expected, path: &Path) -> Result<ExportOutcome, ServiceError> {
+        let snapshot = self.snapshot(expected)?;
+        let pin = self.store.pin(snapshot.handle())?;
+        let bytes = ply_bytes(snapshot.splat())?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(path, &bytes)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        let checksum = ArtifactChecksum::of(&bytes);
+        let metadata = self.store.record_export(
+            snapshot.handle(),
+            path.to_string_lossy().to_string(),
+            checksum,
+            now_ms(),
+        )?;
+        self.store.release(&pin);
+        Ok(ExportOutcome {
+            path: path.to_string_lossy().to_string(),
+            document_id: metadata.handle.document_id.to_string(),
+            revision: metadata.handle.revision,
+            checksum: format!("{}:{}", checksum.algorithm, checksum.hex()),
+            bytes: checksum.bytes,
         })
+    }
+
+    /// Bounded metadata of the displayed document.
+    pub fn metadata(&self) -> Option<DocumentMetadata> {
+        self.store.active_metadata()
+    }
+
+    /// What retention currently holds.
+    pub fn retention(&self) -> RetentionStats {
+        self.store.stats()
+    }
+
+    /// Producer record of the displayed revision, when it has one.
+    ///
+    /// Stored verbatim as JSON, so a save can write it beside the file without the store
+    /// knowing anything about recipes.
+    pub fn recipe(&self) -> Option<String> {
+        self.store
+            .active_metadata()
+            .and_then(|metadata| metadata.provenance.recipe)
+    }
+
+    /// Identity of the displayed document, as a handle.
+    pub fn active_handle(&self) -> Option<DocumentHandle> {
+        self.store.active_handle()
     }
 }
 
-/// Next document identity, unique within this process.
+/// Reads a `.ply` file and turns it into a mutation that opens it as a new document.
+pub fn open_mutation(path: &Path) -> Mutation {
+    Mutation::open(path.to_string_lossy().to_string())
+}
+
+/// Turns a bridge/tool target into the expectation the store checks.
 ///
-/// A process-local counter is enough for the commit contract: identity only has to tell
-/// this app's documents apart while it runs. Task #12 replaces it with a durable identity.
-fn next_document_id() -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    format!("doc-{}", NEXT.fetch_add(1, Ordering::SeqCst))
+/// A named document must also name the revision it expects: without one, the request could
+/// silently overwrite work that landed in between.
+pub fn expected_target(
+    document_id: Option<&str>,
+    expected_revision: Option<u64>,
+) -> Result<Expected, String> {
+    match (document_id, expected_revision) {
+        (Some(text), Some(revision)) => {
+            let document_id =
+                DocumentId::parse(text).ok_or_else(|| format!("'{text}' is not a document id"))?;
+            Ok(Expected::Handle(DocumentHandle::new(document_id, revision)))
+        }
+        (Some(text), None) => Err(format!(
+            "a change to document '{text}' also needs expected_revision, so concurrent edits \
+             are reported instead of overwritten"
+        )),
+        (None, Some(revision)) => Ok(Expected::Revision(revision)),
+        (None, None) => Ok(Expected::Any),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use splatmcp_core::{SplatPoint, write_ply};
-    use splatmcp_python::arrays::BatchMetadata;
-    use splatmcp_python::executor::SourceSnapshot;
-    use splatmcp_python::runtime::RuntimeFingerprint;
-    use splatmcp_python::service::TargetSpec;
+    use splatmcp_core::SplatPoint;
+
+    /// Flat description, as the commands report it.
+    fn info(state: &AppState) -> Option<SplatInfo> {
+        state.metadata().map(|metadata| SplatInfo::of(&metadata))
+    }
 
     fn ply_of(points: usize) -> Vec<u8> {
         let splat = Splat::from_points(
@@ -320,8 +406,8 @@ mod tests {
                 .map(|index| {
                     SplatPoint::new(
                         [index as f32, 0.0, 0.0],
-                        [0.1, 0.1, 0.1],
-                        [0.5, 0.5, 0.5],
+                        [0.1; 3],
+                        [0.5; 3],
                         1.0,
                         [1.0, 0.0, 0.0, 0.0],
                     )
@@ -331,204 +417,240 @@ mod tests {
         write_ply(&splat).unwrap()
     }
 
-    fn splat_of(points: usize) -> Splat {
-        read_ply(&ply_of(points)).unwrap()
-    }
-
-    fn commit_request(target: TargetSpec, points: usize) -> CommitRequest {
-        CommitRequest {
-            target,
-            splat: splat_of(points),
-            provenance: RecipeRecord::new(
-                &splatmcp_python::ScriptSnapshot::inline(
-                    "req",
-                    "def generate(ctx): pass",
-                    "generate",
-                    serde_json::json!({}),
-                    0,
-                )
-                .unwrap(),
-                "test",
-                RuntimeFingerprint {
-                    python_version: "3.13.2".to_owned(),
-                    python_home: "C:/runtime".to_owned(),
-                    packages: Vec::new(),
-                },
-            ),
-        }
-    }
-
-    #[test]
-    fn a_document_keeps_its_name_and_round_trips_through_ply() {
-        let state = AppState::default();
-        let document =
-            Document::from_ply_bytes(&ply_of(3), PathBuf::from("C:/tmp/thing.ply")).unwrap();
-        let info = state.replace(document).unwrap();
-        assert_eq!(info.file_name, "thing.ply");
-        assert_eq!(info.point_count, 3);
-        assert_eq!(info.revision, 1);
-        assert!(info.document_id.starts_with("doc-"));
-        let bytes = state.ply_bytes().unwrap().unwrap();
-        let reparsed = read_ply(&bytes).unwrap();
-        assert_eq!(reparsed.len(), 3);
-    }
-
     #[test]
     fn garbage_never_becomes_the_displayed_document() {
         let state = AppState::default();
-        assert!(Document::from_ply_bytes(b"not a ply", PathBuf::from("x.ply")).is_err());
-        assert!(state.ply_bytes().unwrap().is_none());
-        assert!(state.with_document(|_| ()).is_err());
+        assert!(
+            state
+                .open_ply(b"not a ply", Mutation::import("x.ply"))
+                .is_err()
+        );
+        assert!(state.active().is_err());
+        assert!(info(&state).is_none());
+        assert_eq!(state.retention().documents, 0);
     }
 
     #[test]
-    fn reloading_the_same_file_keeps_its_identity_and_advances_the_revision() {
+    fn opening_twice_is_two_documents_and_a_named_replacement_keeps_one() {
         let state = AppState::default();
-        let path = PathBuf::from("C:/tmp/same.ply");
-        let first = state
-            .replace(Document::from_ply_bytes(&ply_of(2), path.clone()).unwrap())
-            .unwrap();
-        let second = state
-            .replace(Document::from_ply_bytes(&ply_of(2), path.clone()).unwrap())
-            .unwrap();
-        assert_eq!(first.document_id, second.document_id);
-        assert_eq!(second.revision, 2);
+        let first = SplatInfo::of(
+            &state
+                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"))
+                .unwrap(),
+        );
+        let second = SplatInfo::of(
+            &state
+                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"))
+                .unwrap(),
+        );
 
-        // A different file is a different document.
-        let third = state
-            .replace(Document::from_ply_bytes(&ply_of(2), PathBuf::from("C:/tmp/other.ply")).unwrap())
-            .unwrap();
-        assert_ne!(third.document_id, second.document_id);
-        assert_eq!(third.revision, 1);
+        assert_ne!(
+            first.document_id, second.document_id,
+            "a path is not identity"
+        );
+        assert_eq!(second.revision, 1);
+        assert_eq!(second.file_name, "house.ply");
+        assert_eq!(second.source_path.as_deref(), Some("C:/tmp/house.ply"));
+
+        // An explicit replacement keeps the identity and moves one revision.
+        let replaced = SplatInfo::of(
+            &state
+                .replace_ply(
+                    Expected::Handle(DocumentHandle::new(
+                        DocumentId::parse(&second.document_id).unwrap(),
+                        second.revision,
+                    )),
+                    &ply_of(5),
+                    Mutation::edit("edit_splat"),
+                )
+                .unwrap(),
+        );
+        assert_eq!(replaced.document_id, second.document_id);
+        assert_eq!(replaced.revision, 2);
+        assert_eq!(replaced.point_count, 5);
+        assert_eq!(replaced.last_operation.as_deref(), Some("edit_splat"));
     }
 
     #[test]
-    fn a_commit_becomes_the_next_revision_and_reports_its_identity() {
+    fn a_stale_replacement_is_refused_and_leaves_the_document_alone() {
         let state = AppState::default();
+        let opened = state
+            .open_ply(&ply_of(3), Mutation::import("scene.ply"))
+            .unwrap();
+        let handle = opened.handle.clone();
         state
-            .replace(
-                Document::from_ply_bytes(&ply_of(2), PathBuf::from("C:/tmp/thing.ply")).unwrap(),
+            .replace_ply(
+                Expected::Handle(handle.clone()),
+                &ply_of(4),
+                Mutation::edit("edit"),
             )
             .unwrap();
-        let identity = state.identity().unwrap().unwrap();
-        let outcome = state
-            .commit_candidate(commit_request(
-                TargetSpec::component(&identity.document_id, "spire", identity.revision),
-                5,
-            ))
-            .unwrap();
-        match outcome {
-            CommitOutcome::Committed { identity } => {
-                assert_eq!(identity.revision, 2);
-                assert_eq!(identity.point_count, 5);
-                assert_eq!(identity.component_id.as_deref(), Some("spire"));
-                assert!(identity.bounds.is_some());
-            }
-            other => panic!("expected a commit, got {other:?}"),
-        }
-        let stored = state.identity().unwrap().unwrap();
-        assert_eq!(stored.revision, 2);
-        assert_eq!(stored.point_count, 5);
-    }
 
-    #[test]
-    fn a_stale_revision_conflicts_instead_of_overwriting() {
-        let state = AppState::default();
-        state
-            .replace(Document::from_ply_bytes(&ply_of(2), PathBuf::from("C:/tmp/thing.ply")).unwrap())
-            .unwrap();
-        let identity = state.identity().unwrap().unwrap();
-        // Another change lands first (a manual load advances the revision).
-        state
-            .replace(Document::from_ply_bytes(&ply_of(4), PathBuf::from("C:/tmp/thing.ply")).unwrap())
-            .unwrap();
-
-        let outcome = state
-            .commit_candidate(commit_request(
-                TargetSpec::component(&identity.document_id, "spire", identity.revision),
-                9,
-            ))
-            .unwrap();
-        match outcome {
-            CommitOutcome::Conflict { expected, actual, .. } => {
-                assert_eq!(expected, 1);
-                assert_eq!(actual, 2);
-            }
-            other => panic!("expected a conflict, got {other:?}"),
-        }
-        assert_eq!(state.point_count().unwrap(), 4, "the newer content stands");
-    }
-
-    #[test]
-    fn a_named_document_that_is_not_loaded_is_refused() {
-        let state = AppState::default();
-        state
-            .replace(Document::from_ply_bytes(&ply_of(2), PathBuf::from("C:/tmp/thing.ply")).unwrap())
-            .unwrap();
         let error = state
-            .commit_candidate(commit_request(TargetSpec::new_document(None), 3))
-            .and_then(|outcome| match outcome {
-                CommitOutcome::Committed { .. } => Ok(()),
-                other => Err(format!("unexpected {other:?}")),
-            });
-        // A new-document commit is allowed; a named document that is not loaded is not.
-        assert!(error.is_ok());
-
-        let mut request = commit_request(TargetSpec::new_document(None), 3);
-        request.target.document_id = Some("doc-does-not-exist".to_owned());
-        assert!(state.commit_candidate(request).is_err());
+            .replace_ply(Expected::Handle(handle), &ply_of(9), Mutation::edit("edit"))
+            .unwrap_err();
+        assert!(error.to_string().contains("revision conflict"), "{error}");
+        let current = info(&state).unwrap();
+        assert_eq!(current.revision, 2);
+        assert_eq!(current.point_count, 4);
     }
 
     #[test]
-    fn bytes_are_only_returned_for_the_current_revision() {
-        let state = AppState::default();
-        let info = state
-            .replace(Document::from_ply_bytes(&ply_of(3), PathBuf::from("C:/tmp/thing.ply")).unwrap())
-            .unwrap();
-        assert_eq!(state.ply_bytes_for_revision(info.revision).unwrap().len(), state.ply_bytes().unwrap().unwrap().len());
-        let error = state.ply_bytes_for_revision(info.revision + 1).unwrap_err();
-        assert!(error.contains("asked for revision"), "{error}");
+    fn a_named_document_without_a_revision_is_refused_before_anything_is_read() {
+        let error = expected_target(Some("doc-4f2a-1"), None).unwrap_err();
+        assert!(error.contains("expected_revision"), "{error}");
+        let error = expected_target(Some("C:/tmp/scene.ply"), Some(1)).unwrap_err();
+        assert!(error.contains("not a document id"), "{error}");
+
+        assert_eq!(expected_target(None, None).unwrap(), Expected::Any);
+        assert_eq!(
+            expected_target(None, Some(3)).unwrap(),
+            Expected::Revision(3)
+        );
+        let handle = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 7);
+        assert_eq!(
+            expected_target(Some("doc-4f2a-1"), Some(7)).unwrap(),
+            Expected::Handle(handle)
+        );
     }
 
     #[test]
-    fn a_job_can_snapshot_the_displayed_document_without_touching_it() {
-        // The snapshot the generation service takes is a detached copy; this exercises the
-        // same construction the app performs.
+    fn an_export_records_its_artifact_without_moving_the_revision() {
         let state = AppState::default();
-        let info = state
-            .replace(Document::from_ply_bytes(&ply_of(3), PathBuf::from("C:/tmp/thing.ply")).unwrap())
+        let opened = state
+            .open_ply(&ply_of(4), Mutation::import("scene.ply"))
             .unwrap();
-        let snapshot = state
-            .with_document(|document| SourceSnapshot {
-                document_id: document.document_id.clone(),
-                revision: document.revision,
-                component_id: Some("spire".to_owned()),
-                batch: splatmcp_python::arrays::GaussianBatch::from_splat(
-                    &document.splat,
-                    BatchMetadata::default(),
-                ),
-            })
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-export-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("scene-out.ply");
+
+        let outcome = state.export(Expected::Any, &path).unwrap();
+        assert_eq!(outcome.document_id, opened.handle.document_id.to_string());
+        assert_eq!(
+            outcome.revision, opened.handle.revision,
+            "an export is not a new revision"
+        );
+        assert!(outcome.checksum.starts_with("fnv1a64:"));
+        assert!(outcome.bytes > 0);
+        assert!(path.is_file());
+        // The file is a readable splat with the same gaussians.
+        let reloaded = parse_ply(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.len(), 4);
+
+        // The export is visible as provenance, newest first.
+        let metadata = state.metadata().unwrap();
+        let export = metadata.last_export().expect("recorded");
+        assert_eq!(export.path, path.to_string_lossy());
+        assert_eq!(export.revision, opened.handle.revision);
+
+        // A later change still moves exactly one revision.
+        let handle = state.active_handle().unwrap();
+        let advanced = state
+            .replace_ply(Expected::Handle(handle), &ply_of(6), Mutation::edit("edit"))
             .unwrap();
-        assert_eq!(snapshot.document_id, info.document_id);
-        assert_eq!(snapshot.revision, info.revision);
-        assert_eq!(snapshot.batch.len(), 3);
-        // Mutating the copy leaves the document alone.
-        let mut copy = snapshot.batch;
-        copy.positions[0] = [9.0, 9.0, 9.0];
-        assert_eq!(state.point_count().unwrap(), 3);
+        assert_eq!(advanced.handle.revision, opened.handle.revision + 1);
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
-    fn the_identity_report_matches_the_document() {
+    fn reload_reads_the_source_again_as_a_new_revision() {
         let state = AppState::default();
-        assert!(state.identity().unwrap().is_none());
-        let info = state
-            .replace(Document::from_ply_bytes(&ply_of(2), PathBuf::from("C:/tmp/thing.ply")).unwrap())
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("scene.ply");
+        std::fs::write(&path, ply_of(3)).unwrap();
+        let opened = state
+            .open_ply(
+                &std::fs::read(&path).unwrap(),
+                Mutation::open(path.to_string_lossy()),
+            )
             .unwrap();
-        let identity = state.identity().unwrap().unwrap();
-        assert_eq!(identity.document_id, info.document_id);
-        assert_eq!(identity.revision, info.revision);
-        assert_eq!(identity.point_count, 2);
-        assert_eq!(identity.file_name, "thing.ply");
+
+        // The file changes on disk; reload brings it in without changing identity.
+        std::fs::write(&path, ply_of(6)).unwrap();
+        let reloaded = SplatInfo::of(&state.reload(Expected::Any).unwrap());
+        assert_eq!(reloaded.document_id, opened.handle.document_id.to_string());
+        assert_eq!(reloaded.revision, opened.handle.revision + 1);
+        assert_eq!(reloaded.point_count, 6);
+        assert_eq!(reloaded.last_operation.as_deref(), Some("reload"));
+
+        // A document with no source cannot be reloaded, and says why.
+        let state = AppState::default();
+        state
+            .open_ply(&ply_of(2), Mutation::import("generated.ply"))
+            .unwrap();
+        let error = state.reload(Expected::Any).unwrap_err().to_string();
+        assert!(error.contains("no source file"), "{error}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_component_change_moves_the_revision_and_keeps_the_geometry() {
+        let state = AppState::default();
+        let opened = state
+            .open_ply(&ply_of(4), Mutation::import("scene.ply"))
+            .unwrap();
+        let geometry = state.active().unwrap();
+        let before = Arc::as_ptr(geometry.splat());
+
+        let info = SplatInfo::of(
+            &state
+                .set_component(Expected::Any, "roof", "set_component")
+                .unwrap(),
+        );
+        assert_eq!(info.revision, opened.handle.revision + 1);
+        assert_eq!(info.point_count, 4);
+        assert_eq!(info.component_id.as_deref(), Some("roof"));
+
+        // The content was shared, not copied: nothing moved in memory.
+        let after = state.active().unwrap();
+        assert_eq!(before, Arc::as_ptr(after.splat()));
+
+        let error = state
+            .set_component(Expected::Any, "   ", "set_component")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not be blank"), "{error}");
+
+        // An explicit expectation is checked before anything changes.
+        let stale = state
+            .set_component(
+                Expected::Revision(opened.handle.revision),
+                "roof",
+                "set_component",
+            )
+            .unwrap_err();
+        assert!(stale.is_conflict());
+        assert!(stale.to_string().contains("revision conflict"), "{stale}");
+    }
+
+    #[test]
+    fn a_retained_revision_stays_readable_after_the_display_moves_on() {
+        let state = AppState::default();
+        let first = state
+            .open_ply(&ply_of(3), Mutation::open("C:/tmp/first.ply"))
+            .unwrap();
+        let handle = first.handle.clone();
+        state
+            .open_ply(&ply_of(7), Mutation::open("C:/tmp/second.ply"))
+            .unwrap();
+
+        // The old revision still reads, exactly, and does not disturb what is displayed.
+        let (snapshot, bytes) = state.ply_bytes_for(&handle).unwrap();
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(parse_ply(&bytes).unwrap().len(), 3);
+        assert_eq!(info(&state).unwrap().point_count, 7);
+
+        // An unknown handle is reported as unknown, and an evicted one as expired.
+        let foreign = DocumentHandle::new(DocumentId::mint(0xdead, 1), 1);
+        assert!(
+            state
+                .ply_bytes_for(&foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("not available")
+        );
     }
 }

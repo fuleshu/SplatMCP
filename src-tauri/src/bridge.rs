@@ -13,15 +13,17 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{json, Value};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
-    BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest, Handler, LoadPlyRequest, Method,
-    InspectRequest, InspectResult, InspectionSummary, PythonCancelRequest, PythonJobQuery,
-    PythonRunRequest, ViewerStatus,
+    BridgeDescriptor, BridgeServer, BridgeService, CaptureRequest, DocumentPlyReply, DocumentReply,
+    DocumentSummary, GetPlyRequest, Handler, InspectRequest, InspectResult, InspectionSummary,
+    LoadPlyRequest, Method, PythonCancelRequest, PythonJobQuery, PythonRunRequest, ReloadRequest,
+    RetentionSummary, SetComponentRequest, ViewerStatus,
 };
 use tauri::{AppHandle, Manager};
 
+use splatmcp_core::Expected;
 use splatmcp_core::validation::ValidationLimits;
 
-use crate::document::{AppState, Document};
+use crate::document::{self, AppState, Mutation, MutationKind, SplatInfo};
 use crate::python::PythonHost;
 use crate::viewer::{Viewer, VIEWER_TIMEOUT};
 
@@ -71,8 +73,10 @@ impl Handler for AppBridge {
                 )
             }
             Method::ViewerLoadPly => self.load_ply(params),
-            Method::DocumentGetPly => self.document_ply(),
+            Method::DocumentGetPly => self.document_ply(params),
             Method::DocumentInspect => self.document_inspect(params),
+            Method::DocumentReload => self.document_reload(params),
+            Method::DocumentSetComponent => self.document_set_component(params),
             Method::PythonRuntimeInfo => Ok(self.python.runtime_info()),
             Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
@@ -100,10 +104,18 @@ impl Handler for AppBridge {
 }
 
 impl AppBridge {
-    /// Stores pushed bytes as the displayed document, then shows them in the viewer.
+    /// Stores pushed bytes as a document revision, then shows them in the viewer.
     ///
-    /// Parsing happens before the viewer is asked, so a malformed payload is rejected
-    /// while the window keeps showing whatever it showed before.
+    /// Two shapes of request, and the difference is identity:
+    ///
+    /// - no `document_id`: the bytes become a **new document** at revision 1 (opening or
+    ///   importing geometry);
+    /// - a `document_id` with `expected_revision`: an explicit **replacement** of that
+    ///   document, which keeps its identity and advances its revision by one. A stale
+    ///   revision is refused, and the displayed document is left exactly as it was.
+    ///
+    /// Parsing happens before the viewer is asked and before the store is touched, so a
+    /// malformed payload is rejected while the window keeps showing what it showed before.
     fn load_ply(&self, params: Value) -> Result<Value, String> {
         let request: LoadPlyRequest = serde_json::from_value(params)
             .map_err(|error| format!("invalid load_ply request: {error}"))?;
@@ -116,12 +128,23 @@ impl AppBridge {
             .clone()
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "splat.ply".to_owned());
-        let path = crate::paths::documents_dir().join(&file_name);
-        let document = Document::from_ply_bytes(&bytes, path)?;
-        let info = document.info();
+        let expected = document::expected_target(
+            request.document_id.as_deref(),
+            request.expected_revision,
+        )?;
 
         let state = self.app.state::<AppState>();
-        state.replace(document)?;
+        let metadata = match expected {
+            Expected::Any => state.open_ply(&bytes, Mutation::import(file_name))?,
+            target => state.replace_ply(
+                target,
+                &bytes,
+                Mutation::new(MutationKind::Edit)
+                    .operation("load_splat")
+                    .file_name(file_name),
+            )?,
+        };
+        let info = SplatInfo::of(&metadata);
 
         let value = self.viewer.request(
             Method::ViewerLoadPly,
@@ -132,7 +155,9 @@ impl AppBridge {
             .map_err(|error| format!("the viewer returned an unexpected reply: {error}"))?;
         status.point_count = info.point_count;
         status.loaded = true;
-        Ok(serde_json::to_value(status).map_err(|error| error.to_string())?)
+        // The reply identifies the revision the caller actually got.
+        status.document = Some(DocumentSummary::from(&metadata));
+        serde_json::to_value(status).map_err(|error| error.to_string())
     }
 
     /// A job's status, or the job history when no job id was given.
@@ -149,11 +174,12 @@ impl AppBridge {
         serde_json::to_value(view).map_err(|error| error.to_string())
     }
 
-    /// Bounded metadata of the displayed document.
+    /// Bounded metadata of a document revision.
     ///
-    /// This is what keeps an inspection cheap: the app owns the document, so it answers
-    /// with counts, bounds and distributions instead of serialising a PLY that the MCP
-    /// server would immediately have to parse again.
+    /// This is what keeps an inspection cheap: the app owns the document, so it answers with
+    /// counts, bounds and distributions instead of serialising a PLY that the MCP server
+    /// would immediately have to parse again. The snapshot is taken under the lock and the
+    /// inspection runs outside it, so a 500 000 gaussian document does not block the store.
     fn document_inspect(&self, params: Value) -> Result<Value, String> {
         let request: InspectRequest = if params.is_null() {
             InspectRequest::default()
@@ -162,37 +188,93 @@ impl AppBridge {
                 .map_err(|error| format!("invalid inspect request: {error}"))?
         };
         let state = self.app.state::<AppState>();
-        let inspection = state.with_document(|document| {
-            InspectionSummary::from(&document.splat.inspection(inspect_limits(&request)))
-        })?;
-        let identity = state.identity()?;
+        let expected = document::expected_target(
+            request.document_id.as_deref(),
+            request.revision,
+        )?;
+        let snapshot = state.snapshot(expected)?;
+        let limits = inspect_limits(&request);
+        let inspection = InspectionSummary::from(&snapshot.splat().inspection(limits));
         let result = InspectResult {
+            document: DocumentSummary::from(snapshot.metadata()),
             inspection,
-            file_name: identity.as_ref().map(|identity| identity.file_name.clone()),
-            document_id: identity
-                .as_ref()
-                .map(|identity| identity.document_id.clone()),
-            revision: identity.as_ref().map(|identity| identity.revision),
         };
         serde_json::to_value(result).map_err(|error| error.to_string())
     }
 
-    /// PLY bytes of the document the app displays.
-    fn document_ply(&self) -> Result<Value, String> {
-        let state = self.app.state::<AppState>();
-        let Some(bytes) = state.ply_bytes()? else {
-            return Err("no splat is loaded in the desktop app".to_owned());
+    /// Reads the source of a document again, as a new revision of it.
+    fn document_reload(&self, params: Value) -> Result<Value, String> {
+        let request: ReloadRequest = if params.is_null() {
+            ReloadRequest::default()
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid reload request: {error}"))?
         };
-        // Identity travels with the bytes: a Python edit has to quote the revision it is
-        // editing, and `splat_info` is where a caller reads it.
-        let identity = state.identity()?;
-        Ok(json!({
-            "ply_base64": BASE64.encode(bytes),
-            "file_name": state.file_name()?,
-            "point_count": state.point_count()?,
-            "document_id": identity.as_ref().map(|identity| identity.document_id.clone()),
-            "revision": identity.as_ref().map(|identity| identity.revision),
-        }))
+        let state = self.app.state::<AppState>();
+        let expected = match request.expected_revision {
+            Some(revision) => Expected::Revision(revision),
+            None => Expected::Any,
+        };
+        let metadata = state.reload(expected)?;
+        serde_json::to_value(DocumentReply {
+            document: DocumentSummary::from(&metadata),
+            retention: RetentionSummary::from(state.retention()),
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Changes the named component of the displayed document.
+    fn document_set_component(&self, params: Value) -> Result<Value, String> {
+        let request: SetComponentRequest = serde_json::from_value(params)
+            .map_err(|error| format!("invalid set_component request: {error}"))?;
+        let state = self.app.state::<AppState>();
+        let expected = match request.expected_revision {
+            Some(revision) => Expected::Revision(revision),
+            None => Expected::Any,
+        };
+        let operation = request
+            .operation
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "set_component".to_owned());
+        let metadata = state.set_component(expected, &request.component_id, &operation)?;
+        serde_json::to_value(DocumentReply {
+            document: DocumentSummary::from(&metadata),
+            retention: RetentionSummary::from(state.retention()),
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// PLY bytes of one revision of one document, with the identity they are of.
+    ///
+    /// The bytes are serialised from the snapshot after the store lock is released, and the
+    /// reply names the exact revision it resolved, so a caller can tell an expired handle
+    /// from a mismatch.
+    fn document_ply(&self, params: Value) -> Result<Value, String> {
+        let request: GetPlyRequest = if params.is_null() {
+            GetPlyRequest::default()
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid get_ply request: {error}"))?
+        };
+        let state = self.app.state::<AppState>();
+        let expected = document::expected_target(
+            request.document_id.as_deref(),
+            request.revision,
+        )?;
+        let (snapshot, bytes) = match expected {
+            Expected::Handle(handle) => state.ply_bytes_for(&handle)?,
+            target => {
+                let snapshot = state.snapshot(target)?;
+                let bytes = document::ply_bytes(snapshot.splat())?;
+                (snapshot, bytes)
+            }
+        };
+        let reply = DocumentPlyReply {
+            ply_base64: BASE64.encode(&bytes),
+            file_name: Some(snapshot.provenance().file_name.clone()),
+            document: DocumentSummary::from(snapshot.metadata()),
+        };
+        serde_json::to_value(reply).map_err(|error| error.to_string())
     }
 }
 
@@ -258,10 +340,10 @@ pub struct BridgeHostState(pub std::sync::Mutex<Option<BridgeHost>>);
 
 impl BridgeHostState {
     pub fn shutdown(&self) {
-        if let Ok(mut guard) = self.0.lock() {
-            if let Some(host) = guard.take() {
-                host.shutdown();
-            }
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(host) = guard.take()
+        {
+            host.shutdown();
         }
     }
 }
@@ -286,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_reply_reports_the_documents_point_count() {
+    fn a_load_reply_carries_the_identity_it_resolved() {
         let status = Status {
             viewer_ready: true,
             loaded: true,
@@ -294,27 +376,53 @@ mod tests {
             canvas_width: 1280,
             canvas_height: 720,
             camera: None,
+            document: None,
         };
-        // The handler overwrites the count with the parsed document's count.
+        // The handler overwrites the count and fills in the resolved identity.
         let mut adjusted = status.clone();
         adjusted.point_count = 189;
+        adjusted.document = Some(DocumentSummary {
+            document_id: "doc-1-2".to_owned(),
+            revision: 4,
+            point_count: 189,
+            file_name: "scene.ply".to_owned(),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            ..DocumentSummary::default()
+        });
         let encoded = serde_json::to_value(&adjusted).unwrap();
         assert_eq!(encoded["point_count"], 189);
+        assert_eq!(encoded["document"]["revision"], 4);
+        assert_eq!(encoded["document"]["point_count"], 189);
+
+        // A viewer that reports no identity is still readable, so an older frontend works.
+        let legacy: Status = serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert!(legacy.document.is_none());
     }
 
     #[test]
-    fn an_inspect_request_names_the_limit_it_applies() {
+    fn an_inspect_request_names_the_limit_it_applies_and_what_it_targets() {
         assert_eq!(
             inspect_limits(&InspectRequest::default()).applied_max_points(),
             Some(splatmcp_core::MAX_POINTS)
         );
         assert_eq!(
             inspect_limits(&InspectRequest {
-                max_points: Some(4)
+                max_points: Some(4),
+                ..InspectRequest::default()
             })
             .applied_max_points(),
             Some(4)
         );
+        // A named revision is an exact target; an absent one means the displayed document.
+        assert_eq!(
+            document::expected_target(Some("doc-4f2a-1"), Some(2)).unwrap(),
+            Expected::Handle(splatmcp_core::DocumentHandle::new(
+                splatmcp_core::DocumentId::mint(0x4f2a, 1),
+                2
+            ))
+        );
+        assert_eq!(document::expected_target(None, None).unwrap(), Expected::Any);
     }
 
     #[test]
@@ -322,19 +430,27 @@ mod tests {
         // The handler's own conversion, exercised without an app: the summary is bounded
         // metadata and the identity travels beside it.
         let splat = splatmcp_core::fixtures::axis_fixture();
-        let request = InspectRequest { max_points: Some(4) };
+        let request = InspectRequest {
+            max_points: Some(4),
+            ..InspectRequest::default()
+        };
         let inspection = InspectionSummary::from(&splat.inspection(inspect_limits(&request)));
+        let metadata = splatmcp_core::DocumentStore::with_session(
+            splatmcp_core::RetentionLimits::default(),
+            0x4f2a,
+        )
+        .open(splat.clone(), Mutation::import("axis.ply"));
         let result = InspectResult {
+            document: DocumentSummary::from(&metadata),
             inspection,
-            file_name: Some("axis.ply".to_owned()),
-            document_id: Some("doc-2".to_owned()),
-            revision: Some(7),
         };
         assert_eq!(result.inspection.point_count, splat.len());
         assert_eq!(result.inspection.point_limit, Some(4));
         assert!(!result.inspection.within_limits);
+        assert_eq!(result.document.revision, 1);
         let encoded = serde_json::to_string(&result).unwrap();
-        assert!(encoded.len() < 1400, "{} bytes", encoded.len());
-        assert!(encoded.contains("\"revision\":7"));
+        assert!(encoded.len() < 1600, "{} bytes", encoded.len());
+        assert!(encoded.contains("\"revision\":1"));
+        assert!(encoded.contains("axis.ply"));
     }
 }

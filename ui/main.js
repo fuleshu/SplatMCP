@@ -107,8 +107,11 @@ async function saveSplat() {
   }
   setBusy(true);
   try {
-    const path = await invoke("save_splat");
-    setStatus(path ? `Saved ${path}` : "Save cancelled.");
+    const saved = await invoke("save_splat");
+    // The reply names the revision that was written, not just the file it went to.
+    setStatus(
+      saved ? `Saved ${saved.path} (revision ${saved.revision})` : "Save cancelled.",
+    );
   } catch (error) {
     setStatus(`Save failed: ${error?.message || error}`);
   } finally {

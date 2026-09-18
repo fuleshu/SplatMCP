@@ -126,10 +126,14 @@ pub enum Method {
     ViewerCapture,
     /// Replaces the displayed splat from PLY bytes.
     ViewerLoadPly,
-    /// The PLY bytes of the document the app currently displays.
+    /// The PLY bytes of one revision of one document.
     DocumentGetPly,
-    /// Bounded metadata of the displayed document, without transferring its geometry.
+    /// Bounded metadata of a document revision, without transferring its geometry.
     DocumentInspect,
+    /// Reads the source of the displayed document again, as a new revision.
+    DocumentReload,
+    /// Changes the named component of the displayed document.
+    DocumentSetComponent,
     /// Readiness, versions and limits of the embedded Python runtime.
     PythonRuntimeInfo,
     /// Submit a Python generation job to the app's shared executor.
@@ -326,6 +330,11 @@ impl CaptureResult {
 }
 
 /// Parameters of `viewer.load_ply`.
+///
+/// With no `document_id` the bytes become a **new document** at revision 1, which is what
+/// opening or importing means: a file name is provenance, not identity. Naming a document
+/// together with the `expected_revision` makes the load an explicit *replacement* of that
+/// document, so an edit of what is displayed keeps its identity.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoadPlyRequest {
     pub ply_base64: String,
@@ -334,6 +343,12 @@ pub struct LoadPlyRequest {
     /// Re-frame the camera on the new splat; defaults to true in the viewer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<bool>,
+    /// Document to replace; omitted opens a new document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    /// Revision the caller expects that document to be at, for a replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
 }
 
 /// Result of `viewer.load_ply` and `viewer.status`.
@@ -348,6 +363,9 @@ pub struct ViewerStatus {
     pub canvas_height: u32,
     #[serde(default)]
     pub camera: Option<CameraState>,
+    /// Identity and provenance of what is displayed, filled in by the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<DocumentSummary>,
 }
 
 /// Distribution of one scalar over a document, for `document.inspect`.
@@ -490,25 +508,208 @@ impl Default for InspectionSummary {
     }
 }
 
+/// One accepted change to a document, as reported to a caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionSummary {
+    pub revision: u64,
+    /// `open`, `import`, `edit`, `component`, `job` or `reload`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    pub at_ms: u64,
+}
+
+/// One recorded export: where a revision was written, and which bytes went there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSummary {
+    pub path: String,
+    pub revision: u64,
+    pub at_ms: u64,
+    /// Artifact checksum of the written file, e.g. `fnv1a64:0f3a...`.
+    pub checksum: String,
+    pub bytes: usize,
+}
+
+/// What bounded retention currently holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionSummary {
+    pub documents: usize,
+    pub revisions: usize,
+    pub pins: usize,
+    pub bytes: usize,
+    pub max_revisions: usize,
+    pub max_bytes: usize,
+    /// True when held pins keep more than the configured budget alive.
+    pub over_budget: bool,
+}
+
+impl From<splatmcp_core::RetentionStats> for RetentionSummary {
+    fn from(stats: splatmcp_core::RetentionStats) -> Self {
+        Self {
+            documents: stats.documents,
+            revisions: stats.revisions,
+            pins: stats.pins,
+            bytes: stats.bytes,
+            max_revisions: stats.max_revisions,
+            max_bytes: stats.max_bytes,
+            over_budget: stats.over_budget(),
+        }
+    }
+}
+
+/// Identity, provenance and counters of one document revision.
+///
+/// Identity is [`Self::document_id`] plus [`Self::revision`]: an exported file's checksum
+/// identifies those bytes, never the document.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentSummary {
+    #[serde(default)]
+    pub document_id: String,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub point_count: usize,
+    /// Bounds padded by each gaussian's largest radius.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<BoundsSummary>,
+    /// Name the document is saved under; a name is not an identity.
+    #[serde(default)]
+    pub file_name: String,
+    /// File the geometry was read from, when it came from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    /// Operation or job that produced this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_operation: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    /// True when a producer record (a recipe) is attached.
+    pub has_recipe: bool,
+    /// Recent exports of this document, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<ExportSummary>,
+    /// Recent accepted changes, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<RevisionSummary>,
+    /// Revisions of this document that can still be resolved, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_revisions: Vec<u64>,
+}
+
+impl From<&splatmcp_core::DocumentMetadata> for DocumentSummary {
+    fn from(metadata: &splatmcp_core::DocumentMetadata) -> Self {
+        Self {
+            document_id: metadata.handle.document_id.to_string(),
+            revision: metadata.handle.revision,
+            point_count: metadata.point_count,
+            bounds: metadata.bounds.map(BoundsSummary::from),
+            file_name: metadata.provenance.file_name.clone(),
+            source_path: metadata.provenance.source_path.clone(),
+            component_id: metadata.provenance.component_id.clone(),
+            last_operation: metadata.provenance.last_operation.clone(),
+            created_at_ms: metadata.provenance.created_at_ms,
+            updated_at_ms: metadata.provenance.updated_at_ms,
+            has_recipe: metadata.provenance.has_recipe(),
+            exports: metadata
+                .provenance
+                .exports
+                .iter()
+                .map(|export| ExportSummary {
+                    path: export.path.clone(),
+                    revision: export.revision,
+                    at_ms: export.at_ms,
+                    checksum: format!("{}:{}", export.checksum.algorithm, export.checksum.hex()),
+                    bytes: export.checksum.bytes,
+                })
+                .collect(),
+            history: metadata
+                .history
+                .iter()
+                .map(|record| RevisionSummary {
+                    revision: record.revision,
+                    kind: record.kind.name().to_owned(),
+                    operation: record.operation.clone(),
+                    at_ms: record.at_ms,
+                })
+                .collect(),
+            retained_revisions: metadata.retained_revisions.clone(),
+        }
+    }
+}
+
 /// Parameters of `document.inspect`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+///
+/// Omitted target means the displayed document. A named `document_id` and `revision` are
+/// resolved exactly: a name that is not the displayed document, or a revision that is no
+/// longer retained, is refused rather than retargeted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InspectRequest {
     /// Largest gaussian count to accept. Omitted applies the core's own ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_points: Option<usize>,
-}
-
-/// Result of `document.inspect`: the bounded summary plus where it came from.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct InspectResult {
-    #[serde(flatten)]
-    pub inspection: InspectionSummary,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+}
+
+/// Result of `document.inspect`: what was inspected, and the bounded summary of it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectResult {
+    /// Identity and provenance of the revision these numbers describe.
+    #[serde(default)]
+    pub document: DocumentSummary,
+    /// Bounded metadata: distributions, contract diagnostics and buffer sizes.
+    pub inspection: InspectionSummary,
+}
+
+/// Parameters of `document.get_ply`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GetPlyRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+}
+
+/// Result of `document.get_ply`: bytes plus the identity they are of.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentPlyReply {
+    pub ply_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub document: DocumentSummary,
+}
+
+/// Parameters of `document.reload`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReloadRequest {
+    /// Revision the caller believes is displayed; omitted accepts whatever is displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+/// Parameters of `document.set_component`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SetComponentRequest {
+    pub component_id: String,
+    /// Revision the caller believes is displayed; omitted accepts whatever is displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+}
+
+/// Result of a document mutation: the revision that resulted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentReply {
+    pub document: DocumentSummary,
+    /// What retention holds after the change.
+    #[serde(default)]
+    pub retention: RetentionSummary,
 }
 
 /// Parameters of the `hello` handshake.
@@ -672,12 +873,33 @@ pub fn camera_param(value: Option<CameraRequest>) -> Value {
     }
 }
 
-/// Builds the params for `viewer.load_ply` from already encoded bytes.
+/// Builds the params for `viewer.load_ply` from already encoded bytes, as a new document.
 pub fn load_ply_params(ply_base64: impl Into<String>, file_name: Option<String>) -> Value {
     json!(LoadPlyRequest {
         ply_base64: ply_base64.into(),
         file_name,
         frame: Some(true),
+        document_id: None,
+        expected_revision: None,
+    })
+}
+
+/// Builds replacement params: the same document, if it is still at `expected_revision`.
+///
+/// This is what an edit of the displayed splat uses, so the identity survives the edit and a
+/// stale edit is refused instead of overwriting newer work.
+pub fn replace_ply_params(
+    ply_base64: impl Into<String>,
+    document_id: impl Into<String>,
+    expected_revision: u64,
+    frame: Option<bool>,
+) -> Value {
+    json!(LoadPlyRequest {
+        ply_base64: ply_base64.into(),
+        file_name: None,
+        frame,
+        document_id: Some(document_id.into()),
+        expected_revision: Some(expected_revision),
     })
 }
 
@@ -876,23 +1098,150 @@ mod tests {
 
         let request: InspectRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(request.max_points, None);
+        assert_eq!(request.document_id, None);
         let request = InspectRequest {
             max_points: Some(1000),
+            document_id: Some("doc-1-2".to_owned()),
+            revision: Some(3),
         };
         let round_tripped: InspectRequest =
             serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
         assert_eq!(round_tripped.max_points, Some(1000));
+        assert_eq!(round_tripped.revision, Some(3));
 
-        // A result flattens the summary into one object, so a reply reads as one record.
+        // A result nests the two summaries, so no field name appears twice.
         let result = InspectResult {
+            document: DocumentSummary {
+                document_id: "doc-1-2".to_owned(),
+                revision: 3,
+                point_count: summary.point_count,
+                bounds: summary.bounds,
+                file_name: "a.ply".to_owned(),
+                last_operation: Some("edit_splat".to_owned()),
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                retained_revisions: vec![3, 2],
+                ..DocumentSummary::default()
+            },
             inspection: summary.clone(),
-            file_name: Some("a.ply".to_owned()),
-            document_id: Some("doc-1".to_owned()),
-            revision: Some(3),
         };
         let encoded = serde_json::to_value(&result).unwrap();
-        assert_eq!(encoded["point_count"], summary.point_count);
-        assert_eq!(encoded["revision"], 3);
-        assert_eq!(encoded["file_name"], "a.ply");
+        assert_eq!(encoded["document"]["point_count"], summary.point_count);
+        assert_eq!(encoded["document"]["revision"], 3);
+        assert_eq!(encoded["document"]["file_name"], "a.ply");
+        assert_eq!(encoded["inspection"]["point_count"], summary.point_count);
+        let decoded: InspectResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn a_load_names_what_it_replaces_and_a_reply_says_what_it_resolved() {
+        // Opening: no target, so the bytes become a new document.
+        let open: LoadPlyRequest =
+            serde_json::from_value(serde_json::json!({"ply_base64": "AA=="})).unwrap();
+        assert_eq!(open.document_id, None);
+        assert_eq!(open.expected_revision, None);
+
+        // Replacing: the target and its revision travel with the bytes.
+        let replace: LoadPlyRequest = serde_json::from_value(serde_json::json!({
+            "ply_base64": "AA==",
+            "document_id": "doc-4f2a-1",
+            "expected_revision": 7,
+        }))
+        .unwrap();
+        assert_eq!(replace.document_id.as_deref(), Some("doc-4f2a-1"));
+        assert_eq!(replace.expected_revision, Some(7));
+
+        // The reply identifies the revision the caller actually got.
+        let status = ViewerStatus {
+            viewer_ready: true,
+            loaded: true,
+            point_count: 12,
+            canvas_width: 640,
+            canvas_height: 480,
+            camera: None,
+            document: Some(DocumentSummary {
+                document_id: "doc-4f2a-1".to_owned(),
+                revision: 8,
+                point_count: 12,
+                file_name: "scene.ply".to_owned(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                ..DocumentSummary::default()
+            }),
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["document"]["revision"], 8);
+        assert_eq!(encoded["point_count"], 12);
+
+        // An older app reports no identity at all, and that stays readable.
+        let legacy: ViewerStatus = serde_json::from_value(serde_json::json!({
+            "viewer_ready": true,
+            "loaded": true,
+            "point_count": 3,
+            "canvas_width": 10,
+            "canvas_height": 10,
+        }))
+        .unwrap();
+        assert!(legacy.document.is_none());
+    }
+
+    #[test]
+    fn the_document_service_methods_are_typed_and_additive() {
+        for (method, name) in [
+            (Method::DocumentGetPly, "\"document_get_ply\""),
+            (Method::DocumentInspect, "\"document_inspect\""),
+            (Method::DocumentReload, "\"document_reload\""),
+            (Method::DocumentSetComponent, "\"document_set_component\""),
+        ] {
+            assert_eq!(serde_json::to_string(&method).unwrap(), name);
+            assert!(!method.needs_viewer(), "{name} is served by the app");
+            assert!(!method.is_handshake());
+        }
+
+        // The version stays 1: these are additive document methods, and a client that never
+        // sends them cannot notice them.
+        assert_eq!(PROTOCOL_VERSION, 1);
+
+        let get: GetPlyRequest =
+            serde_json::from_value(serde_json::json!({"revision": 4})).unwrap();
+        assert_eq!(get.document_id, None);
+        assert_eq!(get.revision, Some(4));
+        let plain: GetPlyRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(plain.revision, None);
+
+        let reload: ReloadRequest =
+            serde_json::from_value(serde_json::json!({"expected_revision": 2})).unwrap();
+        assert_eq!(reload.expected_revision, Some(2));
+
+        let component: SetComponentRequest = serde_json::from_value(serde_json::json!({
+            "component_id": "roof",
+            "expected_revision": 2,
+        }))
+        .unwrap();
+        assert_eq!(component.component_id, "roof");
+        assert_eq!(component.operation, None);
+
+        let reply = DocumentReply {
+            document: DocumentSummary {
+                document_id: "doc-1-1".to_owned(),
+                revision: 3,
+                created_at_ms: 5,
+                updated_at_ms: 9,
+                ..DocumentSummary::default()
+            },
+            retention: RetentionSummary {
+                documents: 1,
+                revisions: 3,
+                pins: 0,
+                bytes: 168,
+                max_revisions: 8,
+                max_bytes: 1024,
+                over_budget: false,
+            },
+        };
+        let encoded = serde_json::to_value(&reply).unwrap();
+        assert_eq!(encoded["document"]["revision"], 3);
+        assert_eq!(encoded["retention"]["revisions"], 3);
     }
 }

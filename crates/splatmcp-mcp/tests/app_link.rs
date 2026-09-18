@@ -33,6 +33,13 @@ impl Handler for FakeApp {
                 canvas_width: 1600,
                 canvas_height: 947,
                 camera: None,
+                document: Some(splatmcp_bridge::DocumentSummary {
+                    document_id: "doc-1-1".to_owned(),
+                    revision: 2,
+                    point_count: 189,
+                    file_name: "scene.ply".to_owned(),
+                    ..splatmcp_bridge::DocumentSummary::default()
+                }),
             })),
             Method::ViewerGetCamera => Ok(json!({
                 "position": [2.0, 1.5, 3.7],

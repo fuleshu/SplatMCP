@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use splatmcp_python::arrays::{BatchMetadata, GaussianBatch};
+use splatmcp_python::arrays::{BatchMetadata, BoundsOut, GaussianBatch};
 use splatmcp_python::executor::{ExecutorConfig, SourceSnapshot};
 use splatmcp_python::runtime::{Limits, PythonRuntime, RuntimeRoots};
 use splatmcp_python::script::ScriptSnapshot;
@@ -28,7 +28,12 @@ use splatmcp_python::{
 use splatmcp_python::executor::{RunnerInfo, ScriptRunner};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::document::AppState;
+use splatmcp_core::Mutation;
+use splatmcp_core::document::{
+    DocumentError, DocumentHandle, DocumentId, DocumentMetadata, Expected,
+};
+
+use crate::document::{AppState, ServiceError, SplatInfo};
 use crate::viewer::VIEWER_WINDOW;
 
 /// Event the app emits when a revision is committed and should be displayed.
@@ -230,17 +235,25 @@ struct AppDocumentTarget {
 }
 
 impl DocumentTarget for AppDocumentTarget {
+    /// Reads one exact revision of one exact document, as a detached copy.
+    ///
+    /// The expectation is checked here rather than at commit time, so a job that names a
+    /// document which is no longer displayed - or a revision that has moved on - fails at
+    /// request receipt instead of computing a candidate that could never be applied.
     fn snapshot(&self, target: &TargetSpec) -> splatmcp_python::Result<SourceSnapshot> {
         let state = self.app.state::<AppState>();
-        state
-            .with_document(|document| SourceSnapshot {
-                document_id: document.document_id.clone(),
-                revision: document.revision,
-                component_id: target.component_id.clone(),
-                // A detached copy: the script cannot see or tear the live document.
-                batch: GaussianBatch::from_splat(&document.splat, BatchMetadata::default()),
-            })
-            .map_err(PythonError::DocumentConflict)
+        let expected = expected_for(target)?;
+        let snapshot = state
+            .snapshot(expected)
+            .map_err(|error| PythonError::DocumentConflict(error.to_string()))?;
+        Ok(SourceSnapshot {
+            document_id: snapshot.handle().document_id.to_string(),
+            revision: snapshot.handle().revision,
+            component_id: target.component_id.clone(),
+            // A detached copy: the script cannot see or tear the live document, and the
+            // copy stays readable for the life of the job.
+            batch: GaussianBatch::from_splat(snapshot.splat(), BatchMetadata::default()),
+        })
     }
 
     fn commit(&self, request: CommitRequest) -> splatmcp_python::Result<CommitOutcome> {
@@ -248,11 +261,51 @@ impl DocumentTarget for AppDocumentTarget {
         // here would make `display: false` mean nothing: the viewer would be told about the
         // revision and the user's model would change under them.
         let state = self.app.state::<AppState>();
-        state
-            .commit_candidate(request)
-            .map_err(PythonError::DocumentConflict)
-    }
+        let component = request.target.component_id.clone();
+        let operation = match &component {
+            Some(component) => format!("job ({component})"),
+            None => "job".to_owned(),
+        };
+        // The producer record travels verbatim as JSON: the store neither parses nor
+        // interprets a recipe, and a save can still write it beside the exported file.
+        let recipe = serde_json::to_string(&request.provenance).ok();
+        let with_component = |mutation: Mutation| match &component {
+            Some(component) => mutation.component(component.clone()),
+            None => mutation,
+        };
 
+        // A job that targets a new document has nothing to read and nothing to compare:
+        // its geometry becomes a document of its own, named as the request asked.
+        if request.target.is_new_document() {
+            let file_name = request
+                .target
+                .file_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "generated.ply".to_owned());
+            let metadata = state
+                .open_splat(
+                    request.splat,
+                    with_component(Mutation::job(&operation, recipe).file_name(file_name)),
+                )
+                .map_err(|error| PythonError::DocumentConflict(error.to_string()))?;
+            return Ok(CommitOutcome::Committed {
+                identity: identity_of(&metadata),
+            });
+        }
+
+        let expected = expected_for(&request.target)?;
+        let mutation = with_component(Mutation::job(&operation, recipe));
+        match state.commit(expected, request.splat, mutation) {
+            Ok(metadata) => Ok(CommitOutcome::Committed {
+                identity: identity_of(&metadata),
+            }),
+            Err(error) => match conflict_of(&error, &request.target) {
+                Some(conflict) => Ok(conflict),
+                None => Err(PythonError::DocumentConflict(error.to_string())),
+            },
+        }
+    }
     fn publish(
         &self,
         _target: &TargetSpec,
@@ -269,8 +322,8 @@ impl AppDocumentTarget {
     fn publish_revision(&self, identity: &DocumentIdentity, frame: bool) -> Result<(), String> {
         let state = self.app.state::<AppState>();
         let file_name = state
-            .file_name()
-            .map_err(|error| error.to_string())?
+            .metadata()
+            .map(|metadata| metadata.provenance.file_name)
             .unwrap_or_else(|| "splat.ply".to_owned());
         let payload = RevisionPayload {
             revision: identity.revision,
@@ -284,6 +337,58 @@ impl AppDocumentTarget {
             .emit_to(VIEWER_WINDOW, REVISION_EVENT, payload)
             .map_err(|error| format!("could not tell the viewer about revision {}: {error}", identity.revision))
     }
+}
+
+/// The expectation a job's target states, in the store's terms.
+///
+/// A job that names a document must state its revision: the generation service already
+/// enforces that for a Python recipe, and the same rule keeps any other caller from
+/// overwriting work it never read.
+fn expected_for(target: &TargetSpec) -> splatmcp_python::Result<Expected> {
+    match (target.document_id.as_deref(), target.expected_revision) {
+        (Some(text), Some(revision)) => {
+            let document_id = DocumentId::parse(text).ok_or_else(|| {
+                PythonError::DocumentConflict(format!("'{text}' is not a document id"))
+            })?;
+            Ok(Expected::Handle(DocumentHandle::new(document_id, revision)))
+        }
+        (Some(text), None) => Err(PythonError::DocumentConflict(format!(
+            "document '{text}' needs expected_revision, so concurrent changes are reported \
+             instead of overwritten"
+        ))),
+        (None, Some(revision)) => Ok(Expected::Revision(revision)),
+        (None, None) => Ok(Expected::Any),
+    }
+}
+
+/// Identity of a committed revision, in the generation service's vocabulary.
+fn identity_of(metadata: &DocumentMetadata) -> DocumentIdentity {
+    DocumentIdentity {
+        document_id: metadata.handle.document_id.to_string(),
+        revision: metadata.handle.revision,
+        point_count: metadata.point_count,
+        bounds: metadata.bounds.map(BoundsOut::from),
+        component_id: metadata.provenance.component_id.clone(),
+    }
+}
+
+/// Turns a stale revision into the explicit conflict the service reports.
+///
+/// Only a revision conflict becomes a `Conflict` outcome; every other failure - a document
+/// that is not displayed, an expired snapshot, an invalid id - is an error, because there is
+/// nothing to reconcile and the job must not look like it merely arrived late.
+fn conflict_of(error: &ServiceError, target: &TargetSpec) -> Option<CommitOutcome> {
+    let DocumentError::Conflict { expected, current } = error.document_error()? else {
+        return None;
+    };
+    Some(CommitOutcome::Conflict {
+        document_id: target
+            .document_id
+            .clone()
+            .unwrap_or_else(|| current.document_id.to_string()),
+        expected: expected.revision,
+        actual: current.revision,
+    })
 }
 
 /// Runner used when no usable runtime was found.
@@ -365,32 +470,50 @@ pub fn python_note_display_failed(
     host.0.note_display_failed(revision, message)
 }
 
-/// Tauri command: the exact PLY bytes of one revision.
+/// Tauri command: the exact PLY bytes of one revision of the displayed document.
 ///
-/// The viewer asks for the revision it was told about, so a mismatch is reported instead of
-/// silently displaying newer geometry.
+/// The viewer asks for the revision it was told about, so a mismatch or an evicted revision
+/// is reported instead of silently displaying newer geometry.
 #[tauri::command]
 pub fn splat_bytes_for_revision(
     revision: u64,
     state: tauri::State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let bytes = state.ply_bytes_for_revision(revision)?;
+    let handle = state
+        .active_handle()
+        .ok_or_else(|| "no splat is loaded".to_owned())?;
+    let (_, bytes) = state.ply_bytes_for(&DocumentHandle::new(handle.document_id, revision))?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-/// Tauri command: current document identity and revision, for the panel and for tool
-/// replies.
+/// Tauri command: the displayed document's identity, revision and provenance.
 #[tauri::command]
 pub fn document_info(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state.identity().map(|identity| match identity {
-        Some(identity) => json!({
-            "document_id": identity.document_id,
-            "revision": identity.revision,
-            "point_count": identity.point_count,
-            "file_name": identity.file_name,
-        }),
-        None => json!({ "loaded": false }),
-    })
+    match state.metadata() {
+        Some(metadata) => {
+            let info = SplatInfo::of(&metadata);
+            let mut value = serde_json::to_value(&info).map_err(|error| error.to_string())?;
+            if let Some(object) = value.as_object_mut() {
+                let retention = state.retention();
+                object.insert(
+                    "retained_revisions".to_owned(),
+                    json!(metadata.retained_revisions),
+                );
+                object.insert(
+                    "retention".to_owned(),
+                    json!({
+                        "documents": retention.documents,
+                        "revisions": retention.revisions,
+                        "bytes": retention.bytes,
+                        "pins": retention.pins,
+                        "over_budget": retention.over_budget(),
+                    }),
+                );
+            }
+            Ok(value)
+        }
+        None => Ok(json!({ "loaded": false })),
+    }
 }
 
 /// Tauri command: read a script file for the panel's editor.

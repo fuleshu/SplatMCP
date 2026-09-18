@@ -5,7 +5,7 @@ A 3D Gaussian Splat (3DGS) editor with an MCP server attached.
 - **Viewer / editor shell** — a Tauri 2 desktop app that opens `.ply` Gaussian splats, renders them with PlayCanvas, and re-exports them.
 - **MCP server** — a standalone `stdio` binary (`splatmcp-mcp`) built on the official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk) (`rmcp`), so any MCP client / agent harness can create, edit, look at and capture splats.
 - **Bridge** — `splatmcp-bridge`, a loopback request/response service the app hosts and the MCP server calls. It is what lets a stdio server move the camera of a window it did not start.
-- **Core library** — `splatmcp-core`, the in-memory splat model, PLY import/export, splat authoring and edit operations (fixed colour, SH degree 0 only; higher SH bands are dropped, never stored). Its versioned [Gaussian data and coordinate contract](docs/design/gaussian-contract.md) defines the axes, units, quaternion order, colour space and validation every other part follows.
+- **Core library** — `splatmcp-core`, the in-memory splat model, PLY import/export, splat authoring and edit operations (fixed colour, SH degree 0 only; higher SH bands are dropped, never stored). Its versioned [Gaussian data and coordinate contract](docs/design/gaussian-contract.md) defines the axes, units, quaternion order, colour space and validation every other part follows, and its [document identity, revisions and snapshots](docs/design/document-identity.md) define what a document id, a revision and a snapshot handle mean.
 - **Python generation** — `splatmcp-python`, an embedded CPython executor the app hosts. An agent or the desktop panel submits a compact NumPy recipe, the app builds the Gaussians locally and shows them as a new document revision. See [docs/design/python-generation.md](docs/design/python-generation.md).
 
 Everything is one Cargo workspace; there is no npm/Node build step (the frontend is plain ES modules with a vendored PlayCanvas build).
@@ -68,9 +68,9 @@ those bytes as binary data.
 | Tool | What it does |
 | --- | --- |
 | `create_splat` | build a splat from a shape (`sphere`, `cube`, `plane`, `line`, `shell`, `ring`, `grid`) or explicit points, optionally write a `.ply`, and show it |
-| `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) to the displayed splat, a `.ply`, or a new empty one, each with an optional box/attribute selection |
+| `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) to the displayed document, a `.ply`, or a new empty one, each with an optional box/attribute selection; reports the document id and revision the edit landed in |
 | `load_splat` | display an existing `.ply` and frame it |
-| `splat_info` | point count, bounds, mean colour, opacity range, scale/colour distributions, contract diagnostics and buffer sizes; reads the displayed document as bounded metadata, and shows the first *n* gaussians when asked |
+| `splat_info` | document id, revision, point count, bounds, mean colour, opacity range, scale/colour distributions, contract diagnostics and buffer sizes; reads the displayed document as bounded metadata, and shows the first *n* gaussians when asked |
 | `set_camera` | move the camera: `fit`, an explicit position, or orbit values |
 | `get_camera` | report position, target and field of view |
 | `get_screenshot` | render the window and return the frame as an image, optionally after moving the camera |
@@ -301,9 +301,12 @@ Still open:
   directory; any local process that can read that file can drive the viewer.
 - One document at a time: the app displays a single splat, and `viewer_load_ply` replaces
   it.
-- **Document identity and revision are process local.** A Python commit is atomic and
-  stale-revision safe, but identities are not durable yet and edits are not undoable; task
-  #12 owns durable identities and snapshots, task #13 owns transactions and undo.
+- **Document identity and revision are process local.** The app mints a session-stamped
+  document id, advances one monotonic revision per accepted change, resolves exact revisions
+  through bounded retention with explicit pin/release, and commits every change under a
+  compare-and-swap check - so a stale handle fails with `snapshot_expired` and a stale edit
+  with `document_conflict` instead of overwriting newer work. Identities are not durable
+  across restarts and edits are not undoable; task #13 owns transactions and undo.
 
 ## License
 

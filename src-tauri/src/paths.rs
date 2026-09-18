@@ -1,20 +1,11 @@
 //! App-side path helpers, shared with the bridge crate so both processes agree.
 //!
 //! `bridge.json` and `settings.json` live in the app data directory resolved by
-//! `splatmcp_bridge::paths`. Splats pushed over the bridge have no file of their own,
-//! so they are named inside a `documents` folder, which keeps the save dialog's default
-//! name and the reported file name honest.
+//! `splatmcp_bridge::paths`. Geometry that arrives over the bridge has no file of its own:
+//! it is a document with a file *name* for the save dialog, not a path, because a path is
+//! provenance rather than identity.
 
-use std::fs;
 use std::path::PathBuf;
-
-/// Directory used to name splats that arrived over the bridge instead of from disk.
-pub fn documents_dir() -> PathBuf {
-    let base = splatmcp_bridge::app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("documents");
-    let _ = fs::create_dir_all(&dir);
-    dir
-}
 
 /// Application data directory, shared with the bridge crate.
 pub fn app_data_dir() -> PathBuf {
@@ -37,13 +28,6 @@ pub fn settings_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pushed_documents_get_a_directory_inside_the_app_data() {
-        let dir = documents_dir();
-        assert!(dir.ends_with("documents"));
-        assert!(dir.is_dir(), "the documents directory should be created");
-    }
 
     #[test]
     fn settings_sits_next_to_the_bridge_descriptor() {

@@ -15,6 +15,8 @@ use serde::Serialize;
 use splatmcp_bridge::InspectionSummary;
 use splatmcp_core::{Bounds, Splat, SplatPoint};
 
+use crate::tools::edit::DocumentIdentity;
+
 /// A factor that may be given as one number or one per axis.
 ///
 /// Accepting both keeps the schema small and the call obvious: `"factor": 2` for a
@@ -116,6 +118,12 @@ impl SplatSummary {
 pub struct SplatReply {
     #[serde(flatten)]
     pub summary: SplatSummary,
+    /// Identity of the document revision the app now displays.
+    ///
+    /// Present when the app reported it, so a caller can quote the revision back instead of
+    /// guessing which document its edit landed in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<DocumentIdentity>,
     /// File the splat was written to, when the call asked for one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -127,9 +135,16 @@ impl SplatReply {
     pub fn new(splat: &Splat, path: Option<&std::path::Path>, displayed: bool) -> Self {
         Self {
             summary: SplatSummary::of(splat),
+            document: None,
             path: path.map(|path| path.to_string_lossy().to_string()),
             displayed,
         }
+    }
+
+    /// Same reply, reporting the identity the app resolved.
+    pub fn with_document(mut self, document: Option<DocumentIdentity>) -> Self {
+        self.document = document;
+        self
     }
 }
 
@@ -221,6 +236,30 @@ mod tests {
         assert_eq!(summary.point_count, 0);
         assert_eq!(summary.center, [0.0, 0.0, 0.0]);
         assert_eq!(summary.radius, 0.0);
+    }
+
+    #[test]
+    fn a_reply_can_name_the_document_it_landed_in() {
+        let splat = Splat::from_points(vec![SplatPoint::new(
+            [0.0; 3],
+            [0.1; 3],
+            [0.5; 3],
+            0.5,
+            [1.0, 0.0, 0.0, 0.0],
+        )]);
+        let plain = SplatReply::new(&splat, None, true);
+        let encoded = serde_json::to_string(&plain).unwrap();
+        assert!(!encoded.contains("document"), "{encoded}");
+
+        let named = plain.with_document(Some(DocumentIdentity {
+            document_id: "doc-1-2".to_owned(),
+            revision: 4,
+        }));
+        let encoded = serde_json::to_string(&named).unwrap();
+        assert!(
+            encoded.contains("\"document\":{\"document_id\":\"doc-1-2\",\"revision\":4}"),
+            "{encoded}"
+        );
     }
 
     #[test]

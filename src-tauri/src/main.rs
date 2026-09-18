@@ -1,11 +1,13 @@
 //! SplatMCP desktop shell.
 //!
-//! Opens the viewer window, hosts the loopback bridge that MCP tools call, and exposes
-//! the PLY import/export of [`splatmcp_core`] to the frontend as
-//! `open_splat` / `current_splat_bytes` / `save_splat`.
+//! Opens the viewer window, hosts the loopback bridge that MCP tools call, and exposes the
+//! document service of [`splatmcp_core`] to the frontend as `open_splat`,
+//! `current_splat_bytes`, `reload_splat` and `save_splat`.
 //!
-//! The MCP server itself is a separate process spawned by the MCP client. It finds this
-//! app through `bridge.json` in the app data directory; see `docs/design/milestone-4.md`.
+//! The document itself lives in [`document::AppState`], which owns the store of identities,
+//! revisions and snapshots; every command here resolves a target and reports the identity it
+//! used. The MCP server is a separate process spawned by the MCP client; it finds this app
+//! through `bridge.json` in the app data directory; see `docs/design/milestone-4.md`.
 
 mod bridge;
 mod document;
@@ -18,11 +20,14 @@ use std::sync::Arc;
 
 use document::AppState;
 use serde_json::Value;
+use splatmcp_core::Expected;
 use tauri::ipc::Response;
 use tauri::{Manager, State};
 use viewer::Viewer;
 
-/// Picks a PLY file, imports it and makes it the displayed splat.
+/// Picks a PLY file, imports it and makes it the displayed document.
+///
+/// Opening always creates a **new** document identity; the path is recorded as provenance.
 /// Returns `None` when the user cancels the dialog.
 #[tauri::command]
 fn open_splat(state: State<'_, AppState>) -> Result<Option<document::SplatInfo>, String> {
@@ -35,26 +40,37 @@ fn open_splat(state: State<'_, AppState>) -> Result<Option<document::SplatInfo>,
     };
 
     let bytes = std::fs::read(&path).map_err(|error| format!("could not read {path:?}: {error}"))?;
-    let splat = document::Document::from_ply_bytes(&bytes, path)?;
-    Ok(Some(state.replace(splat)?))
+    let metadata = state.open_ply(&bytes, document::open_mutation(&path))?;
+    Ok(Some(document::SplatInfo::of(&metadata)))
 }
 
-/// Raw PLY bytes of the displayed splat, handed to the PlayCanvas viewer.
+/// Reads the source file of the displayed document again, as a new revision.
+#[tauri::command]
+fn reload_splat(state: State<'_, AppState>) -> Result<document::SplatInfo, String> {
+    let metadata = state.reload(Expected::Any)?;
+    Ok(document::SplatInfo::of(&metadata))
+}
+
+/// Raw PLY bytes of the displayed revision, handed to the PlayCanvas viewer.
+///
+/// The bytes are serialised from a snapshot, so the document store is not held while a large
+/// document is written out.
 #[tauri::command]
 fn current_splat_bytes(state: State<'_, AppState>) -> Result<Response, String> {
-    let Some(bytes) = state.ply_bytes()? else {
-        return Err("no splat is loaded".to_owned());
-    };
+    let (_, bytes) = state.active_ply_bytes()?;
     Ok(Response::new(bytes))
 }
 
-/// Exports the displayed splat as PLY. Returns `None` when the user cancels.
+/// Exports the displayed revision as PLY. Returns `None` when the user cancels.
+///
+/// The reply names the exact identity that was written and the checksum of those bytes: a hash
+/// identifies the artifact, never the document.
 #[tauri::command]
-fn save_splat(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let (bytes, file_name) = state.with_document(|document| {
-        (document.ply_bytes(), document.file_name())
-    })?;
-    let bytes = bytes?;
+fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutcome>, String> {
+    let file_name = match state.metadata() {
+        Some(metadata) => metadata.provenance.file_name,
+        None => return Err("no splat is loaded".to_owned()),
+    };
 
     let Some(path) = rfd::FileDialog::new()
         .set_title("Save Gaussian Splat")
@@ -65,18 +81,19 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<String>, String> {
         return Ok(None);
     };
 
-    std::fs::write(&path, bytes).map_err(|error| format!("could not write {path:?}: {error}"))?;
+    let outcome = state.export(Expected::Any, &path)?;
 
-    // A PLY cannot hold recipe or component metadata, so a generated document's provenance
-    // is written next to it. Losing it must not fail a successful save.
-    let mut note = path.to_string_lossy().to_string();
-    if let Ok(Some(recipe)) = state.recipe() {
-        match splatmcp_python::script::RecipeRecord::write_sidecar(&path, &recipe) {
-            Ok(sidecar) => note = format!("{note} (recipe: {})", sidecar.display()),
+    // A PLY cannot hold recipe or component metadata, so a generated document's provenance is
+    // written next to it. Losing it must not fail a successful save.
+    if let Some(recipe) = state.recipe()
+        && let Ok(record) = serde_json::from_str::<splatmcp_python::script::RecipeRecord>(&recipe)
+    {
+        match splatmcp_python::script::RecipeRecord::write_sidecar(&path, &record) {
+            Ok(sidecar) => println!("splatmcp: wrote {}", sidecar.display()),
             Err(error) => eprintln!("splatmcp: could not write the recipe sidecar: {error}"),
         }
     }
-    Ok(Some(note))
+    Ok(Some(outcome))
 }
 
 /// Answers a bridge request that was forwarded into the webview.
@@ -100,6 +117,7 @@ fn main() {
         .manage(bridge::BridgeHostState(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             open_splat,
+            reload_splat,
             current_splat_bytes,
             save_splat,
             bridge_respond,
