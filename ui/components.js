@@ -12,9 +12,24 @@
 //!   made by an MCP client shows up here too.
 
 export const EDIT_REVISION_EVENT = "splat://edit-revision";
+/** Event the app emits when a selection is resolved, including one made over MCP. */
+export const SELECTION_EVENT = "splat://selection";
 
 const BOX_FIELDS = ["min_x", "min_y", "min_z", "max_x", "max_y", "max_z"];
 const FRAME_FIELDS = ["tx", "ty", "tz", "sx", "sy", "sz"];
+
+/** Decodes base64 into bytes, for the marker geometry the app builds. */
+function decodeBase64(base64) {
+  if (!base64) {
+    return new Uint8Array(0);
+  }
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
 
 /** Reads a field as a finite number, or returns null. */
 function numberOrNull(value) {
@@ -43,6 +58,15 @@ export class ComponentsPanel {
     this.selected = null;
     this.lastSelection = null;
     this.unlisten = null;
+    // The newest revision this panel has been asked to display. A slower load for an older
+    // revision must never replace a newer view, so every load carries the token it started with.
+    this.wantedRevision = 0;
+    this.loadToken = 0;
+    // The selection handle currently highlighted in the viewport, and the revision it was
+    // resolved against: a highlight belongs to one revision, so a newer one clears it rather
+    // than leaving markers where nothing is selected any more.
+    this.highlightHandle = null;
+    this.highlightRevision = null;
     this.nodes = {
       list: document.getElementById("component-list"),
       name: document.getElementById("component-name"),
@@ -93,11 +117,20 @@ export class ComponentsPanel {
       if (item) {
         this.selected = item.dataset.componentId;
         this.render();
+        // Highlighting a component is the same request as selecting its members: the viewport
+        // then shows the gaussians the app would edit, not just a row in a list.
+        this.select();
       }
     });
 
     this.unlisten = await this.listen(EDIT_REVISION_EVENT, (event) => {
       this.showRevision(event.payload);
+    });
+    this.unlistenSelection = await this.listen(SELECTION_EVENT, (event) => {
+      const payload = event?.payload;
+      if (payload?.handle_id) {
+        this.highlight(payload.handle_id, { announced: true });
+      }
     });
     await this.refresh();
     return this;
@@ -159,6 +192,12 @@ export class ComponentsPanel {
     }
   }
 
+  /** The note the app reported about authoring metadata, when it reported one. */
+  note(reply) {
+    const note = reply?.document?.authoring;
+    return note?.message ? `${note.status}: ${note.message}` : null;
+  }
+
   /** Reports an action's receipt: the revision, and display failure as failure. */
   describe(reply) {
     const revision = reply?.document?.revision ?? "?";
@@ -172,6 +211,9 @@ export class ComponentsPanel {
     }
     if (reply?.display?.status === "failed") {
       parts.push(`display failed: ${reply.display.message}`);
+    }
+    if (reply?.display?.status === "published") {
+      parts.push("published to the window (not acknowledged yet)");
     }
     for (const warning of reply?.warnings || []) {
       parts.push(warning);
@@ -239,6 +281,7 @@ export class ComponentsPanel {
         component_id: this.selected,
       });
       this.setStatus(`removed ${reply.component_id} (its gaussians stay) · ${this.describe(reply)}`);
+      await this.clearHighlight();
       await this.refresh();
     });
   }
@@ -251,6 +294,9 @@ export class ComponentsPanel {
       }
       const reply = await this.call("component_action", { action: "select", selection });
       this.lastSelection = selection;
+      if (reply.selection?.handle_id) {
+        await this.highlight(reply.selection.handle_id);
+      }
       const bounds = reply.selection?.bounds;
       const where = bounds
         ? ` bounds min ${bounds.min.map((v) => v.toFixed(2)).join(",")} radius ${bounds.radius.toFixed(3)}`
@@ -329,33 +375,131 @@ export class ComponentsPanel {
     });
   }
 
-  /** Loads the exact revision the app published, after an edit committed one. */
+  /**
+   * Loads the exact document revision the app published.
+   *
+   * Two rules, both about not lying to the user:
+   * - the bytes come from `splat_bytes_for_revision` for the *event's* document and revision,
+   *   never from "the current splat" - a newer document must not be shown under an old label;
+   * - a load that is overtaken by a newer one is dropped, so a slow fetch cannot replace a
+   *   newer view, and the revision is acknowledged to the app only after it is displayed.
+   */
   async showRevision(payload) {
     if (!payload || typeof payload.revision !== "number" || !this.viewer) {
       return;
     }
+    const documentId = payload.document_id;
+    if (typeof documentId !== "string" || documentId.length === 0) {
+      this.setStatus(
+        `revision ${payload.revision} was published without a document id, so it was not displayed`,
+      );
+      return;
+    }
+    const token = ++this.loadToken;
+    this.wantedRevision = payload.revision;
+    let bytes;
     try {
-      const raw = await this.invoke("current_splat_bytes");
-      const bytes =
-        raw instanceof Uint8Array
-          ? raw
-          : raw instanceof ArrayBuffer
-            ? new Uint8Array(raw)
-            : ArrayBuffer.isView(raw)
-              ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
-              : new Uint8Array(raw);
+      bytes = await this.fetchRevision(documentId, payload.revision);
+    } catch (error) {
+      await this.failDisplay(documentId, payload.revision, error);
+      return;
+    }
+    if (token !== this.loadToken) {
+      return;
+    }
+    try {
       const instance = await this.viewer();
       await instance.open({
         fileBytes: bytes,
         fileName: payload.file_name || "edit.ply",
         frame: payload.frame === true,
       });
+      if (this.highlightHandle && this.highlightRevision !== payload.revision) {
+        // The highlighted gaussians belonged to another revision; their markers would point at
+        // geometry that is no longer displayed.
+        await this.clearHighlight();
+      }
+      // The app called this revision `published`; displaying it is what makes it `done`.
+      await this.invoke("edit_note_displayed", { documentId, revision: payload.revision });
       this.setStatus(
         `${payload.file_name || "edit.ply"} - ${payload.point_count} gaussians (revision ${payload.revision})`,
       );
       await this.refresh();
     } catch (error) {
-      this.setStatus(`revision ${payload.revision} was committed but not displayed: ${error?.message || error}`);
+      await this.failDisplay(documentId, payload.revision, error);
+    }
+  }
+
+  /** Fetches one exact revision of one document, as bytes. */
+  async fetchRevision(documentId, revision) {
+    const response = await this.invoke("splat_bytes_for_revision", {
+      documentId,
+      revision,
+    });
+    if (response instanceof Uint8Array) {
+      return response;
+    }
+    if (response instanceof ArrayBuffer) {
+      return new Uint8Array(response);
+    }
+    if (ArrayBuffer.isView(response)) {
+      return new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
+    }
+    throw new Error("the app returned an unexpected byte payload");
+  }
+
+  /** Reports that a committed revision could not be displayed. */
+  async failDisplay(documentId, revision, error) {
+    const message = error?.message || String(error);
+    this.setStatus(`revision ${revision} was committed but not displayed: ${message}`);
+    try {
+      await this.invoke("edit_note_display_failed", { documentId, revision, message });
+    } catch (report) {
+      this.setStatus(`${message} (the failure could not be reported: ${report?.message || report})`);
+    }
+  }
+
+  /**
+   * Draws the gaussians a selection handle covers, using the app's own marker geometry.
+   *
+   * The markers are a PLY built from the resolved point ids, so what the viewport shows is the
+   * set a tool call reported - not a rectangle around it.
+   */
+  async highlight(handleId, { announced = false } = {}) {
+    if (!this.viewer) {
+      return;
+    }
+    try {
+      const marker = await this.invoke("selection_highlight", {
+        handleId,
+        maxMarkers: 2048,
+      });
+      const bytes = decodeBase64(marker?.ply_base64 || "");
+      const instance = await this.viewer();
+      await instance.setHighlight(bytes);
+      this.highlightHandle = handleId;
+      this.highlightRevision = marker?.revision ?? null;
+      const shown = marker?.shown ?? 0;
+      const count = marker?.count ?? shown;
+      const truncated = marker?.truncated ? ` (showing ${shown} of ${count})` : "";
+      this.setStatus(
+        `${announced ? "selection from MCP" : "selection"} ${handleId} highlighted: ` +
+          `${shown} marker${shown === 1 ? "" : "s"}${truncated} at revision ${marker?.revision}`,
+      );
+    } catch (error) {
+      this.setStatus(`could not highlight selection ${handleId}: ${error?.message || error}`);
+    }
+  }
+
+  /** Removes the viewport highlight. */
+  async clearHighlight() {
+    this.highlightHandle = null;
+    this.highlightRevision = null;
+    try {
+      const instance = await this.viewer?.();
+      instance?.clearHighlight?.();
+    } catch (error) {
+      this.setStatus(`could not clear the highlight: ${error?.message || error}`);
     }
   }
 
@@ -383,7 +527,11 @@ export class ComponentsPanel {
       list.append(item);
     }
     if (this.nodes.summary) {
-      this.nodes.summary.textContent = this.selected ? `selected ${this.selected}` : "no component selected";
+      const highlighted = this.highlightHandle
+        ? ` · highlight ${this.highlightHandle} @${this.highlightRevision}`
+        : "";
+      this.nodes.summary.textContent =
+        (this.selected ? `selected ${this.selected}` : "no component selected") + highlighted;
     }
   }
 }

@@ -334,7 +334,12 @@ impl Inner {
                 .entries
                 .iter()
                 .map(|entry| {
-                    entry.pins.len() + entry.older.iter().map(|older| older.pins.len()).sum::<usize>()
+                    entry.pins.len()
+                        + entry
+                            .older
+                            .iter()
+                            .map(|older| older.pins.len())
+                            .sum::<usize>()
                 })
                 .sum(),
             bytes: self.entries.iter().map(Entry::bytes).sum(),
@@ -815,10 +820,7 @@ impl DocumentStore {
     ///
     /// Use this when the pin covers a fallible sequence - serialising, writing a file,
     /// recording an export - so an early return cannot leak it.
-    pub fn pin_guarded(
-        &self,
-        handle: &DocumentHandle,
-    ) -> Result<PinGuard<'_>, DocumentError> {
+    pub fn pin_guarded(&self, handle: &DocumentHandle) -> Result<PinGuard<'_>, DocumentError> {
         Ok(PinGuard {
             store: self,
             pin: self.pin(handle)?,
@@ -1045,7 +1047,11 @@ mod tests {
 
         // Releasing one pin leaves the other reader protected.
         assert!(store.release(&a));
-        assert_eq!(store.stats().pins, 1, "one reader is still holding the revision");
+        assert_eq!(
+            store.stats().pins,
+            1,
+            "one reader is still holding the revision"
+        );
 
         // Releasing the same token again changes nothing: it was consumed above.
         assert!(!store.release(&a), "a released token cannot release again");
@@ -1086,7 +1092,11 @@ mod tests {
         }
 
         assert_eq!(fallible(&store, &opened.handle), Err("the write failed"));
-        assert_eq!(store.stats().pins, 0, "the guard released the pin on the way out");
+        assert_eq!(
+            store.stats().pins,
+            0,
+            "the guard released the pin on the way out"
+        );
 
         // A guard that is released explicitly does not release a second time on drop.
         {

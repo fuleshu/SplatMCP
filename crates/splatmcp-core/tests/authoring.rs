@@ -229,7 +229,7 @@ fn a_preview_is_inert_and_a_stale_preview_cannot_overwrite_a_newer_revision() {
         .unwrap();
     let error = scene
         .service
-        .commit_preview(outcome.preview_id, Expected::Any)
+        .commit_preview(outcome.preview_id, Expected::Any, None)
         .unwrap_err();
     assert!(matches!(error, TransactionError::PreviewConflict { .. }));
     assert_eq!(scene.splat().len(), 12, "the stale preview was not applied");
@@ -238,7 +238,7 @@ fn a_preview_is_inert_and_a_stale_preview_cannot_overwrite_a_newer_revision() {
     let fresh = scene.service.preview(Expected::Any, &batch).unwrap();
     let receipt = scene
         .service
-        .commit_preview(fresh.preview_id, Expected::Any)
+        .commit_preview(fresh.preview_id, Expected::Any, None)
         .unwrap();
     assert_eq!(receipt.preview.unwrap().preview_id, fresh.preview_id);
     assert_eq!(scene.splat().len(), 9);

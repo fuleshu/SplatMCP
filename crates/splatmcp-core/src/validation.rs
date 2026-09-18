@@ -810,11 +810,18 @@ mod tests {
         assert_eq!(recorder.listed(), 0);
         for index in 0..(MAX_REPORTED_ISSUES + 5) {
             recorder.record(
-                ValidationIssue::new("scale", None, ValidationReason::NonPositiveScale, "0").at(index),
+                ValidationIssue::new("scale", None, ValidationReason::NonPositiveScale, "0")
+                    .at(index),
             );
         }
         assert_eq!(recorder.listed(), MAX_REPORTED_ISSUES);
-        assert_eq!(recorder.clone().report(64, ValidationLimits::MATHEMATICAL).total_issues, MAX_REPORTED_ISSUES + 5);
+        assert_eq!(
+            recorder
+                .clone()
+                .report(64, ValidationLimits::MATHEMATICAL)
+                .total_issues,
+            MAX_REPORTED_ISSUES + 5
+        );
     }
 
     #[test]

@@ -24,8 +24,8 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use bridge::AppLink;
-use splatmcp_core::PlyImportPolicy;
 use splatmcp_bridge::Method;
+use splatmcp_core::PlyImportPolicy;
 use tools::{author, edit, python, viewer};
 
 /// Shared state of the MCP service: the link to the desktop app.
@@ -173,28 +173,40 @@ impl SplatMcpServer {
 
     /// Applies edit steps to a splat.
     #[tool(
-        description = "Edit a gaussian splat in place: translate, rotate, scale, set_radius, \
-                       and a .ply source is imported strictly unless repair:true is given; \
-                       adjust_color, set_color, set_opacity, duplicate, remove or merge, each with \
-                       an optional box or attribute selection. Works on the displayed splat by \
-                       default; returns per-step counts.",
+        description = "Edit a gaussian splat: translate, rotate, scale, set_radius, adjust_color, \
+                       set_color, set_opacity, duplicate, remove or merge, each with an optional \
+                       box, sphere, attribute, component, point-id or saved-selection target. The \
+                       displayed document is edited through the edit_batch transaction (stable \
+                       ids, one revision, components and undo preserved). A .ply or 'new' source \
+                       is a detached buffer and refuses document-only targets.",
         annotations(title = "Edit splat", read_only_hint = false, open_world_hint = false)
     )]
     async fn edit_splat(
         &self,
         Parameters(input): Parameters<edit::EditInput>,
     ) -> Result<CallToolResult, McpError> {
+        // The displayed document is edited *in the app*, through the shared transaction service:
+        // that is the only place its component membership, point identities, history and
+        // receipts live, so an edit routed anywhere else would quietly discard all of them.
+        if edit::is_displayed_source(input.source.as_deref()) {
+            let request = edit::edit_batch_request(&input).map_err(tool_error)?;
+            let params =
+                serde_json::to_value(&request).map_err(|error| tool_error(error.to_string()))?;
+            let reply = self
+                .link
+                .request(Method::DocumentEditBatch, params)
+                .map_err(tool_error)?;
+            return Ok(tool_text(reply));
+        }
+
         // A file source is imported under the policy the caller chose: strict by default,
         // so a damaged file is refused with indexed diagnostics instead of being edited as
         // if it were intact. The report travels back in the reply.
         let policy = PlyImportPolicy::from_repair_flag(input.repair);
-        let resolved =
-            edit::resolve_source(&self.link, input.source.as_deref(), policy).map_err(tool_error)?;
+        let resolved = edit::resolve_source(&self.link, input.source.as_deref(), policy)
+            .map_err(tool_error)?;
         let import = resolved.import.clone();
         let mut splat = resolved.splat;
-        // The identity the edit started from: when the source was the displayed document the
-        // result replaces exactly that revision, so the edit keeps its identity and a stale
-        // edit is refused. A `.ply` source produces a document of its own.
         let target = resolved.document.clone();
         let steps = edit::apply_edits(&mut splat, &input.ops).map_err(tool_error)?;
         let outcome = edit::save_and_display(
@@ -247,22 +259,24 @@ impl SplatMcpServer {
         // Loading a file opens a document: the file is provenance, not identity.
         let status =
             author::display_splat(&self.link, &file_name, &bytes, None).map_err(tool_error)?;
-        tool_json(&author::splat_reply(
-            &splat,
-            Some(std::path::Path::new(&input.path)),
-            true,
-            Some(&status),
+        tool_json(
+            &author::splat_reply(
+                &splat,
+                Some(std::path::Path::new(&input.path)),
+                true,
+                Some(&status),
+            )
+            .with_import(import),
         )
-        .with_import(import))
     }
 
     /// Applies an edit batch as one atomic, previewable and retry-safe transaction.
     #[tool(
-        description = "Apply several edit steps as ONE transaction: all of them commit as one new \
+        description = "Apply several edit steps as ONE transaction: all commit as one new \
                        revision or nothing changes. dry_run reports a preview without committing; \
-                       commit that candidate later with preview_id (refused if the document moved \
-                       on). operation_id makes a retry after a lost response safe. Undo/redo and \
-                       the history are shared with the window.",
+                       commit it later with preview_id (refused if the document moved on). \
+                       operation_id makes a retry safe; undo/redo and history are shared with the \
+                       window.",
         annotations(title = "Edit batch", read_only_hint = false, open_world_hint = false)
     )]
     async fn edit_batch(
@@ -378,8 +392,8 @@ impl SplatMcpServer {
             }
         }
         let policy = PlyImportPolicy::from_repair_flag(input.repair);
-        let resolved =
-            edit::resolve_source(&self.link, input.source.as_deref(), policy).map_err(tool_error)?;
+        let resolved = edit::resolve_source(&self.link, input.source.as_deref(), policy)
+            .map_err(tool_error)?;
         let reply = edit::info_reply_with_document(
             &resolved.splat,
             resolved.source,
@@ -566,13 +580,13 @@ mod tests {
     /// number, while a tool that is an order of magnitude larger than its peers - a schema
     /// that grew a point array, say - still fails the test.
     ///
-    /// The value tracks the largest schema the surface actually needs. It was raised from 1600
-    /// to 2100 when `edit_batch` and `splat_components` arrived: a batch carries a *nested* step
-    /// schema (operation plus selection) and the component tool carries a nested selection
-    /// filter, which no amount of flattened wording makes smaller - the measured listing is
-    /// 30 KB for fifteen tools, about 2 KB per tool. Trimming descriptions and field names was
-    /// done first; raising the number is the last resort, not the first.
-    const LISTING_BUDGET_BYTES_PER_TOOL: usize = 2100;
+    /// The value tracks the largest schema the surface actually needs, and was raised twice, both
+    /// times after trimming: to 2100 when `edit_batch` and `splat_components` arrived (a nested
+    /// step schema and a nested selection filter cannot be flattened away), and to 2200 when
+    /// `edit_splat` gained the same targeting and retry-safety fields as `edit_batch` - it now
+    /// accepts an `operation_id` and the full target vocabulary, which is exactly what stopped it
+    /// from silently editing the wrong gaussians. The measured listing is 31 KB for fifteen tools.
+    const LISTING_BUDGET_BYTES_PER_TOOL: usize = 2200;
 
     #[test]
     fn the_tool_listing_stays_within_its_context_budget() {

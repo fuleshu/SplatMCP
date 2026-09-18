@@ -31,38 +31,6 @@ fn outcome_bytes(outcome: &document::ExportOutcome) -> usize {
     outcome.bytes
 }
 
-/// Reports authoring metadata that exists next to a just-opened file but does not describe it.
-///
-/// Opening always mints a **new** document identity, so a sidecar written for an earlier session
-/// can never match by accident; when one is present the reason is printed rather than silently
-/// attaching ids that would mean something else.
-fn warn_about_sidecar(path: &std::path::Path, metadata: &document::DocumentMetadata, bytes: &[u8]) {
-    let artifact = document::ArtifactChecksum::of(bytes);
-    let artifact = format!("{}:{}", artifact.algorithm, artifact.hex());
-    match authoring::lookup(
-        path,
-        metadata.handle.document_id.as_str(),
-        metadata.handle.revision,
-        &artifact,
-        metadata.point_count,
-    ) {
-        authoring::SidecarLookup::Absent => {}
-        authoring::SidecarLookup::Attached(_) => {
-            println!(
-                "splatmcp: authoring metadata attached to {}",
-                path.display()
-            );
-        }
-        authoring::SidecarLookup::Refused(reason) => {
-            eprintln!(
-                "splatmcp: ignoring the authoring sidecar of {}: {reason}",
-                path.display()
-            );
-            eprintln!("splatmcp: component metadata is not attached by file name");
-        }
-    }
-}
-
 /// Picks a PLY file, imports it and makes it the displayed document.
 
 ///
@@ -90,8 +58,13 @@ fn open_splat(state: State<'_, AppState>) -> Result<Option<document::SplatInfo>,
     if !imported.report.is_lossless() {
         println!("splatmcp: import report: {}", imported.report.summary());
     }
-    warn_about_sidecar(&path, &imported.metadata, &bytes);
-    Ok(Some(document::SplatInfo::of(&imported.metadata)))
+    // Component metadata is restored here, from the sidecar that describes exactly these bytes:
+    // the note (a restore, or the reason nothing was attached) travels in the reply.
+    let note = bridge::restore_note(&state, &path, &imported, &bytes);
+    Ok(Some(document::SplatInfo::of_with_note(
+        &imported.metadata,
+        note,
+    )))
 }
 
 /// Reads the source file of the displayed document again, as a new revision.
@@ -140,15 +113,15 @@ fn save_splat(state: State<'_, AppState>) -> Result<Option<document::ExportOutco
     // membership and their frames against this exact artifact, and a plain export keeps the
     // documented "geometry only" guarantee. Failing to write either sidecar must not fail a
     // successful save.
-    if let Ok((handle, components)) = state.authoring_snapshot(Expected::Any)
-        && !components.is_empty()
+    if let Ok((handle, layer)) = state.authoring_snapshot(Expected::Any)
+        && !layer.components().is_empty()
     {
         let record = authoring::record(
             handle.document_id.as_str(),
             handle.revision,
             &outcome.checksum,
             outcome_bytes(&outcome),
-            &components,
+            &layer,
         );
         match authoring::write(&path, &record) {
             Ok(sidecar) => println!("splatmcp: wrote {}", sidecar.display()),
@@ -230,6 +203,73 @@ fn edit_redo(app: tauri::AppHandle, request: Option<Value>) -> Result<Value, Str
     bridge::AppBridge::for_commands(&app).document_undo(request.unwrap_or(Value::Null), false)
 }
 
+/// Records that the window displayed one exact revision.
+///
+/// A commit reports `published` until this arrives: the app announcing a revision proves the
+/// announcement, not the picture, and this is the acknowledgement that closes that gap.
+#[tauri::command]
+fn edit_note_displayed(
+    state: State<'_, AppState>,
+    document_id: String,
+    revision: u64,
+) -> Result<bool, String> {
+    let handle = document::handle_of(&document_id, revision)?;
+    Ok(state.note_side_effect(
+        &handle,
+        splatmcp_core::ReceiptSlot::Display,
+        splatmcp_core::SideEffect::Done,
+    ))
+}
+
+/// Records that the window could not display one exact revision.
+#[tauri::command]
+fn edit_note_display_failed(
+    state: State<'_, AppState>,
+    document_id: String,
+    revision: u64,
+    message: String,
+) -> Result<bool, String> {
+    let handle = document::handle_of(&document_id, revision)?;
+    Ok(state.note_side_effect(
+        &handle,
+        splatmcp_core::ReceiptSlot::Display,
+        splatmcp_core::SideEffect::Failed(message),
+    ))
+}
+
+/// Bounded markers that show where a selection handle's gaussians are.
+///
+/// The reply carries a small PLY of bright markers at exactly those positions, in document
+/// space, so the window draws the *same* gaussians a tool call selected instead of a second
+/// opinion about "the selection".
+#[tauri::command]
+fn selection_highlight(
+    state: State<'_, AppState>,
+    handle_id: u64,
+    max_markers: Option<usize>,
+) -> Result<Value, String> {
+    let limit = max_markers.unwrap_or(512).clamp(1, 4096);
+    let markers = state
+        .selection_markers(handle_id, limit)
+        .map_err(|error| error.to_string())?;
+    let ply = state
+        .marker_ply_bytes(&markers)
+        .map_err(|error| error.to_string())?;
+    let mut value = serde_json::to_value(&markers).map_err(|error| error.to_string())?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("marker_count".to_owned(), json!(markers.shown));
+        object.insert("truncated".to_owned(), json!(markers.truncated()));
+        object.insert("ply_base64".to_owned(), json!(base64_of(&ply)));
+    }
+    Ok(value)
+}
+
+/// Base64 of a byte buffer, for a JSON reply that carries bytes.
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// Answers a bridge request that was forwarded into the webview.
 
 #[tauri::command]
@@ -274,7 +314,10 @@ fn main() {
             commit_preview,
             edit_history,
             edit_undo,
-            edit_redo
+            edit_redo,
+            edit_note_displayed,
+            edit_note_display_failed,
+            selection_highlight
         ])
         .setup(|app| {
             let handle = app.handle().clone();

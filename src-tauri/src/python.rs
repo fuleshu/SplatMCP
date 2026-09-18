@@ -254,7 +254,9 @@ impl DocumentTarget for AppDocumentTarget {
     fn snapshot(&self, target: &TargetSpec) -> splatmcp_python::Result<SourceSnapshot> {
         let state = self.app.state::<AppState>();
         let expected = expected_for(target)?;
-        let snapshot = state.snapshot(expected).map_err(|error| python_error(&error))?;
+        let snapshot = state
+            .snapshot(expected)
+            .map_err(|error| python_error(&error))?;
         Ok(SourceSnapshot {
             document_id: snapshot.handle().document_id.to_string(),
             revision: snapshot.handle().revision,
@@ -361,8 +363,9 @@ impl AppDocumentTarget {
 fn expected_for(target: &TargetSpec) -> splatmcp_python::Result<Expected> {
     match (target.document_id.as_deref(), target.expected_revision) {
         (Some(text), Some(revision)) => {
-            let document_id = DocumentId::parse(text)
-                .ok_or_else(|| PythonError::UnknownDocument(format!("'{text}' is not a document id")))?;
+            let document_id = DocumentId::parse(text).ok_or_else(|| {
+                PythonError::UnknownDocument(format!("'{text}' is not a document id"))
+            })?;
             Ok(Expected::Handle(DocumentHandle::new(document_id, revision)))
         }
         (Some(text), None) => Err(PythonError::DocumentConflict(format!(
@@ -503,19 +506,19 @@ pub fn python_note_display_failed(
     host.0.note_display_failed(revision, message)
 }
 
-/// Tauri command: the exact PLY bytes of one revision of the displayed document.
+/// Tauri command: the exact PLY bytes of one revision of one named document.
 ///
-/// The viewer asks for the revision it was told about, so a mismatch or an evicted revision
-/// is reported instead of silently displaying newer geometry.
+/// The viewer asks for the revision it was told about, by identity: a revision that belongs to
+/// another document, or one that has been evicted, is reported instead of quietly returning
+/// whatever is displayed now.
 #[tauri::command]
 pub fn splat_bytes_for_revision(
+    document_id: String,
     revision: u64,
     state: tauri::State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let handle = state
-        .active_handle()
-        .ok_or_else(|| "no splat is loaded".to_owned())?;
-    let (_, bytes) = state.ply_bytes_for(&DocumentHandle::new(handle.document_id, revision))?;
+    let handle = crate::document::handle_of(&document_id, revision)?;
+    let (_, bytes) = state.ply_bytes_for(&handle)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -627,7 +630,10 @@ mod tests {
             expected_revision: Some(1),
             file_name: None,
         };
-        assert_eq!(expected_for(&target).unwrap_err().code(), "unknown_document");
+        assert_eq!(
+            expected_for(&target).unwrap_err().code(),
+            "unknown_document"
+        );
     }
 
     #[test]

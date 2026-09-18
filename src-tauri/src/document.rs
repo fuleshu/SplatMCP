@@ -16,15 +16,16 @@
 //!   document must name its revision too.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use splatmcp_core::components::AuthoringSet;
 use splatmcp_core::document::{DocumentStore, now_ms};
 use splatmcp_core::{
-    ComponentId, ComponentList, EditBatch, HistoryReport, LocalTransform, PreviewReport,
-    SelectionQuery, SideEffect, Splat, SplatError, TransactionError, TransactionLimits,
-    PlyImportPolicy, PlyReport, TransactionReceipt, TransactionService, read_ply_with_policy,
-    write_ply,
+    ComponentId, ComponentList, EditBatch, HistoryReport, LocalTransform, PlyImportPolicy,
+    PlyReport, PreviewReport, ReceiptSlot, SelectionQuery, SideEffect, Splat, SplatError,
+    TransactionError, TransactionLimits, TransactionReceipt, TransactionService,
+    read_ply_with_policy, write_ply,
 };
 
 pub use splatmcp_core::document::{
@@ -32,6 +33,11 @@ pub use splatmcp_core::document::{
     Mutation, MutationKind, RetentionStats, Snapshot,
 };
 pub use splatmcp_core::{Bounds, Component, PointId, SelectionHandle};
+
+/// Colour of a selection marker: unmistakably not scene geometry.
+pub const HIGHLIGHT_COLOR: [f32; 3] = [1.0, 0.05, 0.6];
+/// Opacity of a selection marker: fully opaque, so it is visible inside a dense cloud.
+pub const HIGHLIGHT_OPACITY: f32 = 1.0;
 
 /// Everything the document service can fail with.
 ///
@@ -131,8 +137,7 @@ pub struct ImportedDocument {
 /// accepts it and reports what was changed. Either way the report travels back with the
 /// geometry, so an import never silently changes a caller's data.
 pub fn parse_ply(bytes: &[u8], policy: PlyImportPolicy) -> Result<Imported, String> {
-    let (splat, report) =
-        read_ply_with_policy(bytes, policy).map_err(|error| error.to_string())?;
+    let (splat, report) = read_ply_with_policy(bytes, policy).map_err(|error| error.to_string())?;
     splat.validate().map_err(|error| error.to_string())?;
     Ok(Imported { splat, report })
 }
@@ -165,12 +170,25 @@ pub struct SplatInfo {
     pub updated_at_ms: u64,
     /// True when the revision carries a producer record, which a save writes beside the file.
     pub has_recipe: bool,
+    /// What happened to authoring metadata that sits beside this document's file, reported on
+    /// the reply that opened it: a restore, or the reason nothing was attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring: Option<splatmcp_bridge::AuthoringNote>,
 }
 
 impl SplatInfo {
     /// Projects bounded metadata onto the flat reply shape.
     pub fn of(metadata: &DocumentMetadata) -> Self {
+        Self::of_with_note(metadata, None)
+    }
+
+    /// Same, with the note about this document's authoring metadata.
+    pub fn of_with_note(
+        metadata: &DocumentMetadata,
+        authoring: Option<splatmcp_bridge::AuthoringNote>,
+    ) -> Self {
         Self {
+            authoring,
             document_id: metadata.handle.document_id.to_string(),
             revision: metadata.handle.revision,
             point_count: metadata.point_count,
@@ -206,6 +224,10 @@ pub struct ExportOutcome {
 pub struct AppState {
     store: Arc<DocumentStore>,
     transactions: TransactionService,
+    /// A note about authoring metadata that the *next* reply describing this revision must
+    /// carry: what was restored from a sidecar, or why one was refused. Held once, so a warning
+    /// reaches a caller instead of only a console nobody is watching.
+    authoring_note: Mutex<Option<(DocumentHandle, splatmcp_bridge::AuthoringNote)>>,
 }
 
 impl Default for AppState {
@@ -216,6 +238,7 @@ impl Default for AppState {
         Self {
             store,
             transactions,
+            authoring_note: Mutex::new(None),
         }
     }
 }
@@ -461,10 +484,17 @@ pub struct OutcomeInfo {
 
 impl OutcomeInfo {
     /// Projects a core side-effect outcome.
+    ///
+    /// `published` means the revision was announced to the window and is waiting for its
+    /// acknowledgement: it is reported in those words, because an announcement is not a render.
     pub fn of(side: &SideEffect) -> Self {
         match side {
             SideEffect::NotRequested => Self {
                 status: "not_requested",
+                message: None,
+            },
+            SideEffect::Published => Self {
+                status: "published",
                 message: None,
             },
             SideEffect::Done => Self {
@@ -540,9 +570,57 @@ pub struct BatchOutcome {
 }
 
 impl BatchOutcome {
-    fn of(receipt: &TransactionReceipt, metadata: &DocumentMetadata) -> Self {
+    /// The recorded document, for publication: a replay announces the revision it produced.
+    pub fn recorded(&self) -> splatmcp_core::ReceiptDocument {
+        splatmcp_core::ReceiptDocument {
+            document_id: DocumentId::parse(&self.document.document_id)
+                .unwrap_or_else(|| DocumentId::mint(0, 0)),
+            revision: self.document.revision,
+            point_count: self.document.point_count,
+            file_name: self.document.file_name.clone(),
+        }
+    }
+
+    /// The recorded document as a wire summary, so a replay reports what it produced.
+    pub fn summary(&self) -> splatmcp_bridge::DocumentSummary {
+        splatmcp_bridge::DocumentSummary::recorded(
+            &self.document.document_id,
+            self.document.revision,
+            self.document.point_count,
+            &self.document.file_name,
+        )
+    }
+
+    /// The exact revision this outcome records.
+    ///
+    /// `None` only when the recorded identity is not a document id at all, which cannot happen
+    /// for a receipt the service produced; a caller then reports the outcome without acting on
+    /// it rather than inventing an identity.
+    pub fn handle(&self) -> Option<DocumentHandle> {
+        let document_id = DocumentId::parse(&self.document.document_id)?;
+        Some(DocumentHandle::new(document_id, self.document.revision))
+    }
+
+    /// Builds the reply shape from the receipt itself.
+    ///
+    /// Deliberately *not* from the store: a replayed receipt reports the document, revision and
+    /// point count its request produced, even when the displayed document has moved on or that
+    /// revision is no longer retained.
+    fn of(receipt: &TransactionReceipt) -> Self {
         Self {
-            document: SplatInfo::of(metadata),
+            document: SplatInfo {
+                document_id: receipt.recorded.document_id.to_string(),
+                revision: receipt.recorded.revision,
+                point_count: receipt.recorded.point_count,
+                file_name: receipt.recorded.file_name.clone(),
+                source_path: None,
+                component_id: None,
+                last_operation: receipt.operation_id.clone(),
+                created_at_ms: receipt.at_ms,
+                updated_at_ms: receipt.at_ms,
+                has_recipe: false,
+                authoring: None,
+            },
             committed: receipt.committed,
             replayed: receipt.replayed,
             point_count: receipt.point_count,
@@ -649,6 +727,31 @@ pub struct ComponentChangeInfo {
     pub rebuilt: bool,
 }
 
+/// Bounded positions of a resolved selection, for a viewer highlight.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SelectionMarkers {
+    pub handle_id: u64,
+    /// Revision the selection was resolved against.
+    pub revision: u64,
+    /// Gaussians the selection covers.
+    pub count: usize,
+    /// Markers actually returned, which is `count` unless the bound cut it short.
+    pub shown: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<BoundsInfo>,
+    /// World-space positions of the selected gaussians, in document space.
+    pub positions: Vec<[f32; 3]>,
+    /// Gaussians in the document the selection belongs to, so a caller can see a mismatch.
+    pub document_points: usize,
+}
+
+impl SelectionMarkers {
+    /// True when only part of the selection is described.
+    pub fn truncated(&self) -> bool {
+        self.shown < self.count
+    }
+}
+
 /// A resolved, revision-bound selection.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SelectionInfo {
@@ -692,6 +795,9 @@ impl AppState {
     }
 
     /// Applies an edit batch atomically and returns the receipt.
+    ///
+    /// The reply is built from the receipt, never from "what is displayed now": a retry reports
+    /// the outcome of the request it repeats.
     pub fn commit_batch(
         &self,
         expected: Expected,
@@ -703,8 +809,7 @@ impl AppState {
             batch,
             Mutation::edit(operation).file_name(self.active_file_name()),
         )?;
-        let metadata = self.store.metadata_for(&receipt.document)?;
-        Ok(BatchOutcome::of(&receipt, &metadata))
+        Ok(BatchOutcome::of(&receipt))
     }
 
     /// Commits the candidate a preview retained, if it is still the current revision.
@@ -712,10 +817,48 @@ impl AppState {
         &self,
         preview_id: u64,
         expected: Expected,
+        operation_id: Option<String>,
     ) -> Result<BatchOutcome, TransactionError> {
-        let receipt = self.transactions.commit_preview(preview_id, expected)?;
-        let metadata = self.store.metadata_for(&receipt.document)?;
-        Ok(BatchOutcome::of(&receipt, &metadata))
+        let receipt = self
+            .transactions
+            .commit_preview(preview_id, expected, operation_id)?;
+        Ok(BatchOutcome::of(&receipt))
+    }
+
+    /// Records an acknowledged export or display outcome onto a revision's receipt.
+    pub fn note_side_effect(
+        &self,
+        handle: &DocumentHandle,
+        slot: ReceiptSlot,
+        side: SideEffect,
+    ) -> bool {
+        self.transactions.note_side_effect(handle, slot, side)
+    }
+
+    /// Writes a revision to `path` and records the export against its receipt.
+    ///
+    /// The revision is exported by handle, so a replay of the original request re-exports that
+    /// request's revision rather than whatever is displayed.
+    pub fn export_revision(
+        &self,
+        handle: &DocumentHandle,
+        path: &Path,
+    ) -> Result<SideEffect, ServiceError> {
+        match self.export(Expected::Handle(handle.clone()), path) {
+            Ok(_) => {
+                self.note_side_effect(handle, ReceiptSlot::Export, SideEffect::Done);
+                Ok(SideEffect::Done)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.note_side_effect(
+                    handle,
+                    ReceiptSlot::Export,
+                    SideEffect::Failed(message.clone()),
+                );
+                Ok(SideEffect::Failed(message))
+            }
+        }
     }
 
     /// PLY bytes of a preview candidate, so it can be rendered or exported without replacing
@@ -731,15 +874,13 @@ impl AppState {
     /// Undoes the newest step of the displayed document as a new revision.
     pub fn undo(&self, expected: Expected) -> Result<BatchOutcome, TransactionError> {
         let receipt = self.transactions.undo(expected)?;
-        let metadata = self.store.metadata_for(&receipt.document)?;
-        Ok(BatchOutcome::of(&receipt, &metadata))
+        Ok(BatchOutcome::of(&receipt))
     }
 
     /// Redoes the newest undone step as a new revision.
     pub fn redo(&self, expected: Expected) -> Result<BatchOutcome, TransactionError> {
         let receipt = self.transactions.redo(expected)?;
-        let metadata = self.store.metadata_for(&receipt.document)?;
-        Ok(BatchOutcome::of(&receipt, &metadata))
+        Ok(BatchOutcome::of(&receipt))
     }
 
     /// Undo/redo availability and the retained steps.
@@ -753,6 +894,113 @@ impl AppState {
         Ok(history_info(&report, &metadata))
     }
 
+    /// Sets the one-shot authoring note the next reply about this revision must carry.
+    pub fn set_authoring_note(
+        &self,
+        handle: &DocumentHandle,
+        note: splatmcp_bridge::AuthoringNote,
+    ) {
+        if let Ok(mut guard) = self.authoring_note.lock() {
+            *guard = Some((handle.clone(), note));
+        }
+    }
+
+    /// Takes the authoring note for a revision, if one is waiting for it.
+    pub fn take_authoring_note(
+        &self,
+        handle: &DocumentHandle,
+    ) -> Option<splatmcp_bridge::AuthoringNote> {
+        let mut guard = self.authoring_note.lock().ok()?;
+        match guard.as_ref() {
+            Some((pending, _)) if pending == handle => guard.take().map(|(_, note)| note),
+            _ => None,
+        }
+    }
+
+    /// Installs a restored authoring layer for a revision.
+    ///
+    /// The layer is remapped by the caller (its ids belong to the file it was saved with, not to
+    /// this freshly opened document) and must describe exactly this revision's gaussians.
+    pub fn install_authoring(
+        &self,
+        handle: &DocumentHandle,
+        set: AuthoringSet,
+    ) -> Result<usize, TransactionError> {
+        self.transactions.install_authoring(handle, set)
+    }
+
+    /// PLY bytes of bright markers at a selection's positions, for the viewer highlight.
+    ///
+    /// Authored in document space, exactly like the document's own PLY, so the viewer applies
+    /// the same space change and the markers land on their gaussians. The marker radius scales
+    /// with the selection so a highlight is visible on a small component and on a large one.
+    pub fn marker_ply_bytes(&self, markers: &SelectionMarkers) -> Result<Vec<u8>, ServiceError> {
+        if markers.positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scale = markers
+            .bounds
+            .map(|bounds| bounds.radius.max(1e-4))
+            .unwrap_or(1.0);
+        let radius = (scale * 0.02).max(1e-4);
+        let splat = Splat::from_points(
+            markers
+                .positions
+                .iter()
+                .map(|position| {
+                    splatmcp_core::SplatPoint::new(
+                        *position,
+                        [radius; 3],
+                        HIGHLIGHT_COLOR,
+                        HIGHLIGHT_OPACITY,
+                        splatmcp_core::contract::IDENTITY_QUATERNION,
+                    )
+                })
+                .collect(),
+        );
+        ply_bytes(&splat).map_err(ServiceError::Invalid)
+    }
+
+    /// World positions of the gaussians a selection handle resolved to, bounded.
+    ///
+    /// This is what a viewer highlight is drawn from, so a window and a tool call show the same
+    /// gaussians instead of two opinions about "the selection".
+    pub fn selection_markers(
+        &self,
+        handle_id: u64,
+        max: usize,
+    ) -> Result<SelectionMarkers, TransactionError> {
+        let selection =
+            self.transactions
+                .selection(handle_id)
+                .ok_or(TransactionError::Selection(
+                    splatmcp_core::SelectionError::Invalid(format!(
+                        "selection handle {handle_id} is no longer retained; select again"
+                    )),
+                ))?;
+        let document = selection
+            .document
+            .clone()
+            .ok_or_else(|| TransactionError::Document(DocumentError::NoDocument))?;
+        let revision = DocumentHandle::new(document, selection.revision);
+        let snapshot = self.store.resolve(&revision)?;
+        let points = self
+            .transactions
+            .selected_points(handle_id, max)?
+            .into_iter()
+            .map(|point| point.position)
+            .collect::<Vec<_>>();
+        Ok(SelectionMarkers {
+            handle_id,
+            revision: selection.revision,
+            count: selection.count,
+            shown: points.len(),
+            bounds: selection.bounds.map(BoundsInfo::from),
+            positions: points,
+            document_points: snapshot.splat().len(),
+        })
+    }
+
     /// The full authoring layer of a revision: components with their membership and frames.
     ///
     /// This is what a versioned sidecar records; a reply to a tool call reports counts instead,
@@ -760,9 +1008,8 @@ impl AppState {
     pub fn authoring_snapshot(
         &self,
         expected: Expected,
-    ) -> Result<(DocumentHandle, Vec<Component>), TransactionError> {
-        let list = self.transactions.components(expected)?;
-        Ok((list.document, list.components))
+    ) -> Result<(DocumentHandle, AuthoringSet), TransactionError> {
+        self.transactions.authoring_layer(expected)
     }
 
     /// Reads the component membership and the components of a revision.
@@ -840,8 +1087,7 @@ impl AppState {
         let receipt = self
             .transactions
             .apply_component_transform(expected, component)?;
-        let metadata = self.store.metadata_for(&receipt.document)?;
-        Ok(BatchOutcome::of(&receipt, &metadata))
+        Ok(BatchOutcome::of(&receipt))
     }
 
     /// Resolves a selection query and retains it as a revision-bound handle.
@@ -911,6 +1157,13 @@ fn component_list_info(list: &ComponentList, metadata: &DocumentMetadata) -> Com
         components: list.components.iter().map(ComponentInfo::of).collect(),
         rebuilt: list.rebuilt,
     }
+}
+
+/// Parses a document id and revision into a handle, or explains why not.
+pub fn handle_of(document_id: &str, revision: u64) -> Result<DocumentHandle, String> {
+    let document_id = DocumentId::parse(document_id)
+        .ok_or_else(|| format!("'{document_id}' is not a document id"))?;
+    Ok(DocumentHandle::new(document_id, revision))
 }
 
 /// The exact handle a flat reply describes, for a follow-up call that must name it.
@@ -985,7 +1238,11 @@ mod tests {
         let state = AppState::default();
         assert!(
             state
-                .open_ply(b"not a ply", Mutation::import("x.ply"), PlyImportPolicy::Strict)
+                .open_ply(
+                    b"not a ply",
+                    Mutation::import("x.ply"),
+                    PlyImportPolicy::Strict
+                )
                 .is_err()
         );
         assert!(state.active().is_err());
@@ -998,13 +1255,23 @@ mod tests {
         let state = AppState::default();
         let first = SplatInfo::of(
             &state
-                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"), PlyImportPolicy::Strict)
-                .unwrap().metadata,
+                .open_ply(
+                    &ply_of(3),
+                    Mutation::open("C:/tmp/house.ply"),
+                    PlyImportPolicy::Strict,
+                )
+                .unwrap()
+                .metadata,
         );
         let second = SplatInfo::of(
             &state
-                .open_ply(&ply_of(3), Mutation::open("C:/tmp/house.ply"), PlyImportPolicy::Strict)
-                .unwrap().metadata,
+                .open_ply(
+                    &ply_of(3),
+                    Mutation::open("C:/tmp/house.ply"),
+                    PlyImportPolicy::Strict,
+                )
+                .unwrap()
+                .metadata,
         );
 
         assert_ne!(
@@ -1026,8 +1293,9 @@ mod tests {
                     &ply_of(5),
                     Mutation::edit("edit_splat"),
                     PlyImportPolicy::Strict,
-            )
-                .unwrap().metadata,
+                )
+                .unwrap()
+                .metadata,
         );
         assert_eq!(replaced.document_id, second.document_id);
         assert_eq!(replaced.revision, 2);
@@ -1058,18 +1326,32 @@ mod tests {
 
         // The default: refuse, with the index and the reason, and change nothing.
         let error = state
-            .open_ply(&damaged, Mutation::import("damaged.ply"), PlyImportPolicy::Strict)
+            .open_ply(
+                &damaged,
+                Mutation::import("damaged.ply"),
+                PlyImportPolicy::Strict,
+            )
             .map(|_| ())
             .map_err(|error| error.to_string())
             .unwrap_err();
         assert!(error.contains("point 0 rotation"), "{error}");
         assert!(error.contains("[0, 0, 0, 0]"), "{error}");
-        assert!(error.contains("repair"), "the refusal says what to do: {error}");
-        assert!(state.metadata().is_none(), "a refused import leaves nothing behind");
+        assert!(
+            error.contains("repair"),
+            "the refusal says what to do: {error}"
+        );
+        assert!(
+            state.metadata().is_none(),
+            "a refused import leaves nothing behind"
+        );
 
         // The explicit opt-in: load it, and report every change.
         let imported = state
-            .open_ply(&damaged, Mutation::import("damaged.ply"), PlyImportPolicy::Repair)
+            .open_ply(
+                &damaged,
+                Mutation::import("damaged.ply"),
+                PlyImportPolicy::Repair,
+            )
             .unwrap();
         assert_eq!(imported.metadata.point_count, 2);
         assert_eq!(imported.report.total_repairs, 1);
@@ -1080,24 +1362,43 @@ mod tests {
         let summary = splatmcp_bridge::PlyImportSummary::of(&imported.report).unwrap();
         assert_eq!(summary.policy, "repair");
         assert!(!summary.lossless);
-        assert!(summary.changed.iter().any(|entry| entry.contains("point 0 rotation")));
+        assert!(
+            summary
+                .changed
+                .iter()
+                .any(|entry| entry.contains("point 0 rotation"))
+        );
         assert_eq!(summary.changed_count, 1);
     }
 
     #[test]
     fn a_failed_export_releases_its_pin() {
         let state = AppState::default();
-        state.open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict).unwrap();
-        let directory = std::env::temp_dir().join(format!("splatmcp-export-dir-{}", std::process::id()));
+        state
+            .open_ply(
+                &ply_of(4),
+                Mutation::import("scene.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-export-dir-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
 
         // A directory cannot be written as a file, so the export fails *after* the pin was
         // taken. The pin must be gone again, or repeated failures would keep whole scenes
         // alive past the retention budget.
         assert_eq!(state.retention().pins, 0);
-        let error = state.export(Expected::Any, &directory).unwrap_err().to_string();
+        let error = state
+            .export(Expected::Any, &directory)
+            .unwrap_err()
+            .to_string();
         assert!(!error.is_empty());
-        assert_eq!(state.retention().pins, 0, "a failed export must not leak a pin");
+        assert_eq!(
+            state.retention().pins,
+            0,
+            "a failed export must not leak a pin"
+        );
 
         // The successful path takes and releases one too.
         let path = directory.join("out.ply");
@@ -1111,8 +1412,13 @@ mod tests {
     fn a_stale_replacement_is_refused_and_leaves_the_document_alone() {
         let state = AppState::default();
         let opened = state
-            .open_ply(&ply_of(3), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .open_ply(
+                &ply_of(3),
+                Mutation::import("scene.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
         let handle = opened.handle.clone();
         state
             .replace_ply(
@@ -1121,10 +1427,16 @@ mod tests {
                 Mutation::edit("edit"),
                 PlyImportPolicy::Strict,
             )
-            .unwrap().metadata;
+            .unwrap()
+            .metadata;
 
         let error = state
-            .replace_ply(Expected::Handle(handle), &ply_of(9), Mutation::edit("edit"), PlyImportPolicy::Strict)
+            .replace_ply(
+                Expected::Handle(handle),
+                &ply_of(9),
+                Mutation::edit("edit"),
+                PlyImportPolicy::Strict,
+            )
             .map(|_| ())
             .unwrap_err()
             .to_string();
@@ -1157,8 +1469,13 @@ mod tests {
     fn an_export_records_its_artifact_without_moving_the_revision() {
         let state = AppState::default();
         let opened = state
-            .open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .open_ply(
+                &ply_of(4),
+                Mutation::import("scene.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
         let directory =
             std::env::temp_dir().join(format!("splatmcp-export-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -1174,7 +1491,9 @@ mod tests {
         assert!(outcome.bytes > 0);
         assert!(path.is_file());
         // The file is a readable splat with the same gaussians.
-        let reloaded = parse_ply(&std::fs::read(&path).unwrap(), PlyImportPolicy::Strict).unwrap().splat;
+        let reloaded = parse_ply(&std::fs::read(&path).unwrap(), PlyImportPolicy::Strict)
+            .unwrap()
+            .splat;
         assert_eq!(reloaded.len(), 4);
 
         // The export is visible as provenance, newest first.
@@ -1186,8 +1505,14 @@ mod tests {
         // A later change still moves exactly one revision.
         let handle = state.active_handle().unwrap();
         let advanced = state
-            .replace_ply(Expected::Handle(handle), &ply_of(6), Mutation::edit("edit"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .replace_ply(
+                Expected::Handle(handle),
+                &ply_of(6),
+                Mutation::edit("edit"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
         assert_eq!(advanced.handle.revision, opened.handle.revision + 1);
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -1206,11 +1531,17 @@ mod tests {
                 Mutation::open(path.to_string_lossy()),
                 PlyImportPolicy::Strict,
             )
-            .unwrap().metadata;
+            .unwrap()
+            .metadata;
 
         // The file changes on disk; reload brings it in without changing identity.
         std::fs::write(&path, ply_of(6)).unwrap();
-        let reloaded = SplatInfo::of(&state.reload(Expected::Any, PlyImportPolicy::Strict).unwrap().metadata);
+        let reloaded = SplatInfo::of(
+            &state
+                .reload(Expected::Any, PlyImportPolicy::Strict)
+                .unwrap()
+                .metadata,
+        );
         assert_eq!(reloaded.document_id, opened.handle.document_id.to_string());
         assert_eq!(reloaded.revision, opened.handle.revision + 1);
         assert_eq!(reloaded.point_count, 6);
@@ -1219,7 +1550,11 @@ mod tests {
         // A document with no source cannot be reloaded, and says why.
         let state = AppState::default();
         state
-            .open_ply(&ply_of(2), Mutation::import("generated.ply"), PlyImportPolicy::Strict)
+            .open_ply(
+                &ply_of(2),
+                Mutation::import("generated.ply"),
+                PlyImportPolicy::Strict,
+            )
             .unwrap();
         let error = state
             .reload(Expected::Any, PlyImportPolicy::Strict)
@@ -1234,8 +1569,13 @@ mod tests {
     fn a_component_change_moves_the_revision_and_keeps_the_geometry() {
         let state = AppState::default();
         let opened = state
-            .open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .open_ply(
+                &ply_of(4),
+                Mutation::import("scene.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
         let geometry = state.active().unwrap();
         let before = Arc::as_ptr(geometry.splat());
 
@@ -1270,11 +1610,185 @@ mod tests {
         assert!(stale.to_string().contains("revision conflict"), "{stale}");
     }
 
+    #[test]
+    fn a_replayed_batch_reports_the_recorded_outcome_not_the_current_document() {
+        let state = scene_state();
+        let batch = splatmcp_core::EditBatch::new(vec![splatmcp_core::BatchStep::new(
+            splatmcp_core::EditOp::Duplicate {
+                by: [0.0, 0.0, 1.0],
+            },
+        )])
+        .with_operation_id("recipe-replay");
+        let first = state
+            .commit_batch(Expected::Any, &batch, "edit_splat")
+            .unwrap();
+        assert_eq!(first.point_count, 8);
+        assert_eq!(first.document.point_count, 8);
+        assert_eq!(first.document.revision, 2);
+
+        // The document moves on: a later edit and an undo/redo cycle.
+        state
+            .commit_batch(
+                Expected::Any,
+                &splatmcp_core::EditBatch::new(vec![splatmcp_core::BatchStep::with_targets(
+                    splatmcp_core::EditOp::Remove,
+                    splatmcp_core::BatchTargets::from_selection(splatmcp_core::Selection {
+                        first: Some(3),
+                        ..splatmcp_core::Selection::default()
+                    }),
+                )]),
+                "edit_splat",
+            )
+            .unwrap();
+        assert_eq!(state.metadata().unwrap().point_count, 5);
+
+        let retry = state
+            .commit_batch(Expected::Any, &batch, "edit_splat")
+            .unwrap();
+        assert!(retry.replayed);
+        // The reply repeats the original outcome: revision 2 and eight gaussians, not the
+        // revision and count that happen to be displayed now.
+        assert_eq!(retry.document.revision, 2);
+        assert_eq!(retry.document.point_count, 8);
+        assert_eq!(retry.point_count, first.point_count);
+        assert_eq!(retry.steps, first.steps);
+        let summary = retry.summary();
+        assert_eq!(summary.revision, 2);
+        assert_eq!(summary.point_count, 8);
+        assert_eq!(state.metadata().unwrap().handle.revision, 3);
+    }
+
+    #[test]
+    fn a_recorded_display_outcome_is_replayed_and_published_is_not_done() {
+        let state = scene_state();
+        let batch = splatmcp_core::EditBatch::new(vec![splatmcp_core::BatchStep::new(
+            splatmcp_core::EditOp::Translate {
+                by: [1.0, 0.0, 0.0],
+            },
+        )])
+        .with_operation_id("recipe-display");
+        let first = state
+            .commit_batch(Expected::Any, &batch, "edit_splat")
+            .unwrap();
+        let handle = first.handle().unwrap();
+        // The window has not acknowledged anything yet.
+        assert_eq!(first.display.status, "not_requested");
+        state.note_side_effect(
+            &handle,
+            splatmcp_core::ReceiptSlot::Display,
+            splatmcp_core::SideEffect::Published,
+        );
+        let retry = state
+            .commit_batch(Expected::Any, &batch, "edit_splat")
+            .unwrap();
+        assert!(retry.replayed);
+        assert_eq!(retry.display.status, "published");
+        assert!(
+            !retry.display.status.eq("done"),
+            "an announcement is not a finished render"
+        );
+
+        // The window's acknowledgement is what turns it into done, and the retry then says so.
+        state.note_side_effect(
+            &handle,
+            splatmcp_core::ReceiptSlot::Display,
+            splatmcp_core::SideEffect::Done,
+        );
+        let retry = state
+            .commit_batch(Expected::Any, &batch, "edit_splat")
+            .unwrap();
+        assert_eq!(retry.display.status, "done");
+    }
+
+    #[test]
+    fn a_preview_commit_with_an_operation_id_can_be_retried() {
+        let state = scene_state();
+        let batch = splatmcp_core::EditBatch::new(vec![splatmcp_core::BatchStep::with_targets(
+            splatmcp_core::EditOp::Remove,
+            splatmcp_core::BatchTargets::from_selection(splatmcp_core::Selection {
+                first: Some(1),
+                ..splatmcp_core::Selection::default()
+            }),
+        )]);
+        let preview = state.preview_batch(Expected::Any, &batch).unwrap();
+        let first = state
+            .commit_preview(
+                preview.preview_id,
+                Expected::Any,
+                Some("commit-1".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(first.point_count, 3);
+        assert_eq!(first.document.revision, 2);
+
+        let retry = state
+            .commit_preview(
+                preview.preview_id,
+                Expected::Any,
+                Some("commit-1".to_owned()),
+            )
+            .unwrap();
+        assert!(retry.replayed);
+        assert_eq!(retry.document.revision, 2);
+        assert_eq!(retry.point_count, 3);
+        assert_eq!(
+            state.metadata().unwrap().handle.revision,
+            2,
+            "a replayed commit does not commit again"
+        );
+    }
+
+    #[test]
+    fn a_selection_highlight_describes_the_same_gaussians_a_tool_call_selected() {
+        let state = scene_state();
+        let selection = state
+            .select_points(
+                Expected::Any,
+                &splatmcp_core::SelectionQuery {
+                    first: Some(2),
+                    ..splatmcp_core::SelectionQuery::all()
+                },
+            )
+            .unwrap();
+        let markers = state.selection_markers(selection.handle_id, 8).unwrap();
+        assert_eq!(markers.handle_id, selection.handle_id);
+        assert_eq!(markers.count, 2);
+        assert_eq!(markers.shown, 2);
+        assert!(!markers.truncated());
+        assert_eq!(markers.revision, selection.revision);
+        assert_eq!(markers.positions.len(), 2);
+        assert_eq!(markers.positions[0], [0.0, 0.0, 0.0]);
+
+        // The markers are ordinary gaussians in a PLY the viewer already knows how to draw.
+        let bytes = state.marker_ply_bytes(&markers).unwrap();
+        let splat =
+            splatmcp_core::read_ply_with_policy(&bytes, splatmcp_core::PlyImportPolicy::Strict)
+                .unwrap()
+                .0;
+        assert_eq!(splat.len(), 2);
+        // The PLY round trip is 8-bit per channel, so the marker colour comes back within one
+        // step of the constant; what matters is that it is unmistakably the highlight colour.
+        let [r, g, b] = splat.points[0].color;
+        assert!((r - super::HIGHLIGHT_COLOR[0]).abs() < 0.01);
+        assert!((g - super::HIGHLIGHT_COLOR[1]).abs() < 0.01);
+        assert!((b - super::HIGHLIGHT_COLOR[2]).abs() < 0.01);
+        assert!(splat.points.iter().all(|point| point.opacity > 0.99));
+
+        // A bounded highlight says so instead of pretending it drew everything.
+        let markers = state.selection_markers(selection.handle_id, 1).unwrap();
+        assert!(markers.truncated());
+    }
+
     fn scene_state() -> AppState {
         let state = AppState::default();
         state
-            .open_ply(&ply_of(4), Mutation::import("scene.ply"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .open_ply(
+                &ply_of(4),
+                Mutation::import("scene.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
         state
     }
 
@@ -1342,7 +1856,7 @@ mod tests {
             )
             .unwrap();
         let error = state
-            .commit_preview(preview.preview_id, Expected::Any)
+            .commit_preview(preview.preview_id, Expected::Any, None)
             .unwrap_err();
         assert_eq!(error.code(), "preview_conflict");
         assert_eq!(state.metadata().unwrap().handle.revision, 2);
@@ -1395,17 +1909,33 @@ mod tests {
     fn a_retained_revision_stays_readable_after_the_display_moves_on() {
         let state = AppState::default();
         let first = state
-            .open_ply(&ply_of(3), Mutation::open("C:/tmp/first.ply"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .open_ply(
+                &ply_of(3),
+                Mutation::open("C:/tmp/first.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
         let handle = first.handle.clone();
         state
-            .open_ply(&ply_of(7), Mutation::open("C:/tmp/second.ply"), PlyImportPolicy::Strict)
-            .unwrap().metadata;
+            .open_ply(
+                &ply_of(7),
+                Mutation::open("C:/tmp/second.ply"),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap()
+            .metadata;
 
         // The old revision still reads, exactly, and does not disturb what is displayed.
         let (snapshot, bytes) = state.ply_bytes_for(&handle).unwrap();
         assert_eq!(snapshot.len(), 3);
-        assert_eq!(parse_ply(&bytes, PlyImportPolicy::Strict).unwrap().splat.len(), 3);
+        assert_eq!(
+            parse_ply(&bytes, PlyImportPolicy::Strict)
+                .unwrap()
+                .splat
+                .len(),
+            3
+        );
         assert_eq!(info(&state).unwrap().point_count, 7);
 
         // An unknown handle is reported as unknown, and an evicted one as expired.

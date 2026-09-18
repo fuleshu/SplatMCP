@@ -579,6 +579,22 @@ impl From<splatmcp_core::RetentionStats> for RetentionSummary {
     }
 }
 
+/// What happened to the authoring metadata beside a document's file.
+///
+/// Reported on the reply that opened the document, so a mismatch is *told* to whoever asked
+/// rather than only printed: a warning nobody reads is not a warning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoringNote {
+    /// `restored` or `refused`.
+    pub status: String,
+    /// One line a person or a model can read.
+    pub message: String,
+    /// Components restored, when any were.
+    pub components: usize,
+    /// Members restored, when any were.
+    pub members: usize,
+}
+
 /// Identity, provenance and counters of one document revision.
 ///
 /// Identity is [`Self::document_id`] plus [`Self::revision`]: an exported file's checksum
@@ -618,6 +634,34 @@ pub struct DocumentSummary {
     /// Revisions of this document that can still be resolved, newest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_revisions: Vec<u64>,
+    /// A one-shot note about this document's authoring metadata: what was restored, or why a
+    /// sidecar beside its file was refused. Reported once, on the reply that opens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoring: Option<AuthoringNote>,
+}
+
+impl DocumentSummary {
+    /// The summary of a *recorded* outcome: what a commit produced, not what is displayed now.
+    ///
+    /// Used when a receipt is replayed, so a retry reports the document, revision and point
+    /// count its request actually produced instead of whatever happens to be current.
+    pub fn recorded(document_id: &str, revision: u64, point_count: usize, file_name: &str) -> Self {
+        Self {
+            document_id: document_id.to_owned(),
+            revision,
+            point_count,
+            file_name: file_name.to_owned(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Attaches a one-shot note about authoring metadata, when there is one.
+    pub fn with_authoring(mut self, note: Option<AuthoringNote>) -> Self {
+        self.authoring = note;
+        self
+    }
 }
 
 impl From<&splatmcp_core::DocumentMetadata> for DocumentSummary {
@@ -634,6 +678,9 @@ impl From<&splatmcp_core::DocumentMetadata> for DocumentSummary {
             created_at_ms: metadata.provenance.created_at_ms,
             updated_at_ms: metadata.provenance.updated_at_ms,
             has_recipe: metadata.provenance.has_recipe(),
+            // Filled by the app when it has something to say about authoring metadata; a
+            // summary built straight from the store has nothing pending.
+            authoring: None,
             exports: metadata
                 .provenance
                 .exports
@@ -921,6 +968,12 @@ pub struct EditBatchRequest {
     /// True to show the committed revision in the viewer. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<bool>,
+    /// Write the committed revision to this `.ply` path as well.
+    ///
+    /// Export happens *after* the commit and is reported separately: a commit that could not be
+    /// written to disk is still a commit, and a retry must not re-apply it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_path: Option<String>,
     pub steps: Vec<BatchOpParams>,
 }
 
@@ -934,6 +987,10 @@ pub struct CommitPreviewRequest {
     pub expected_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<bool>,
+    /// Makes the commit retry-safe: an identical resend replays the recorded receipt instead of
+    /// reporting that the consumed candidate has expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 /// Parameters of the document history and undo/redo methods.
@@ -1680,12 +1737,20 @@ mod tests {
             import: Some(summary.clone()),
             ..ViewerStatus::default()
         };
-        assert_eq!(serde_json::to_value(&status).unwrap()["import"]["policy"], "repair");
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["import"]["policy"],
+            "repair"
+        );
         let reply = DocumentReply {
             import: Some(summary),
             ..DocumentReply::default()
         };
-        assert!(serde_json::to_value(&reply).unwrap().get("import").is_some());
+        assert!(
+            serde_json::to_value(&reply)
+                .unwrap()
+                .get("import")
+                .is_some()
+        );
     }
 
     #[test]

@@ -226,7 +226,7 @@ export class PythonPanel {
     this.pendingRevision = payload.revision;
     let bytes;
     try {
-      bytes = await this.fetchRevision(payload.revision);
+      bytes = await this.fetchRevision(payload.document_id, payload.revision);
     } catch (error) {
       await this.failDisplay(payload.revision, error?.message || String(error));
       return;
@@ -251,8 +251,17 @@ export class PythonPanel {
     }
   }
 
-  async fetchRevision(revision) {
-    const response = await this.invoke("splat_bytes_for_revision", { revision });
+  /**
+   * Fetches the exact revision of the exact document the event named.
+   *
+   * Both values are required: asking for "revision 8" without saying *of what* is how a viewer
+   * ends up showing newer geometry under an old label.
+   */
+  async fetchRevision(documentId, revision) {
+    const response = await this.invoke("splat_bytes_for_revision", {
+      documentId,
+      revision,
+    });
     if (response instanceof Uint8Array) {
       return response;
     }

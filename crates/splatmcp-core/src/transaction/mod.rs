@@ -388,7 +388,13 @@ pub struct PreviewCommit {
 pub enum SideEffect {
     /// The caller did not ask for it.
     NotRequested,
-    /// It happened.
+    /// The revision was handed to the renderer, which has not acknowledged it yet.
+    ///
+    /// Deliberately *not* [`SideEffect::Done`]: an event that left the app successfully says
+    /// nothing about whether anything was drawn, so a receipt never claims a revision was
+    /// presented when all that happened is that it was announced.
+    Published,
+    /// It happened and was acknowledged.
     Done,
     /// It failed, and the message says why. The commit, if any, still stands.
     Failed(String),
@@ -403,6 +409,38 @@ impl SideEffect {
     pub fn is_done(&self) -> bool {
         matches!(self, Self::Done)
     }
+
+    /// True when the revision was announced but not acknowledged yet.
+    pub fn is_published(&self) -> bool {
+        matches!(self, Self::Published)
+    }
+
+    /// True when the caller asked for it at all.
+    pub fn is_requested(&self) -> bool {
+        !matches!(self, Self::NotRequested)
+    }
+}
+
+/// The document a receipt describes, recorded at commit time.
+///
+/// A receipt is replayed long after the fact - possibly after the document has been replaced or
+/// the revision evicted - so it carries its own copy of what it produced instead of resolving
+/// *current* state when it is read back. That is the difference between "here is what your edit
+/// did" and "here is what happens to be displayed now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptDocument {
+    pub document_id: DocumentId,
+    pub revision: u64,
+    pub point_count: usize,
+    /// File the document was saved under when the commit happened.
+    pub file_name: String,
+}
+
+impl ReceiptDocument {
+    /// The exact handle this receipt produced.
+    pub fn handle(&self) -> DocumentHandle {
+        DocumentHandle::new(self.document_id.clone(), self.revision)
+    }
 }
 
 /// What a committed batch produced: identity, per-step counts and separate side effects.
@@ -412,6 +450,8 @@ pub struct TransactionReceipt {
     pub operation_id: Option<String>,
     /// Hash of the canonical request this receipt answers.
     pub request_hash: u64,
+    /// What the commit produced, recorded rather than re-resolved on read.
+    pub recorded: ReceiptDocument,
     /// The revision the commit produced.
     pub document: DocumentHandle,
     /// Always true for a receipt; kept explicit so a caller never infers it.
@@ -448,9 +488,17 @@ impl TransactionReceipt {
     }
 
     /// The same receipt, marked as a replay.
+    ///
+    /// A replay keeps the recorded document, counts and side effects and only changes this flag:
+    /// re-running the request changed nothing, so nothing about the outcome may differ.
     pub fn replayed(mut self) -> Self {
         self.replayed = true;
         self
+    }
+
+    /// The revision this receipt produced, as a handle.
+    pub fn handle(&self) -> DocumentHandle {
+        self.recorded.handle()
     }
 }
 
@@ -720,6 +768,17 @@ enum LedgerLookup {
     Expired,
 }
 
+/// Where a side effect is recorded back onto a receipt.
+///
+/// Addressed by the *revision the receipt produced*, because that is what the renderer and the
+/// file system refer to: a caller that shows or exports a revision can report the outcome
+/// without knowing (or guessing) an operation id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptSlot {
+    Export,
+    Display,
+}
+
 /// Service state behind one mutex.
 struct State {
     /// Authoring layer per document, kept at the newest revision this service produced.
@@ -780,6 +839,40 @@ impl State {
             return LedgerLookup::Expired;
         }
         LedgerLookup::Replay(Box::new(entry.receipt.clone()))
+    }
+
+    /// Records an acknowledged side effect back onto the receipt it belongs to.
+    ///
+    /// Returns `false` when no retained receipt describes that revision, which is the honest
+    /// answer once the receipt has been evicted: the caller's report is then simply not stored.
+    fn note_side_effect(
+        &mut self,
+        handle: &DocumentHandle,
+        slot: ReceiptSlot,
+        side: SideEffect,
+    ) -> bool {
+        let Some(entry) = self
+            .ledger
+            .iter_mut()
+            .rev()
+            .find(|entry| &entry.receipt.document == handle)
+        else {
+            return false;
+        };
+        match slot {
+            ReceiptSlot::Export => entry.receipt.export = side,
+            ReceiptSlot::Display => entry.receipt.display = side,
+        }
+        true
+    }
+
+    /// The receipt recorded for a revision, if it is still retained.
+    fn receipt_for(&self, handle: &DocumentHandle) -> Option<&TransactionReceipt> {
+        self.ledger
+            .iter()
+            .rev()
+            .find(|entry| &entry.receipt.document == handle)
+            .map(|entry| &entry.receipt)
     }
 
     fn record_receipt(&mut self, receipt: &TransactionReceipt, limits: TransactionLimits) {
@@ -985,35 +1078,42 @@ impl TransactionService {
         batch.validate()?;
         let hash = batch.request_hash();
         let at_ms = mutation.at_ms.unwrap_or_else(now_ms);
-        let snapshot = self.store.snapshot(expected)?;
-        let handle = snapshot.handle().clone();
-        let source = Arc::clone(snapshot.splat());
 
-        let mut state = self.lock();
-        if let Some(operation_id) = &batch.operation_id {
-            match state.ledger_lookup(operation_id, hash, at_ms, self.limits.receipt_ttl_ms) {
-                LedgerLookup::Miss => {}
-                LedgerLookup::Replay(receipt) => return Ok(receipt.replayed()),
-                LedgerLookup::Conflict {
-                    recorded_hash,
-                    recorded,
-                } => {
-                    return Err(TransactionError::OperationConflict {
-                        operation_id: operation_id.clone(),
-                        expected_hash: hash,
+        // The recorded outcome is resolved *first*, before any source snapshot is required.
+        // A retry of an operation whose source revision has since been evicted or replaced is
+        // still a retry of work that already happened: refusing it with `snapshot_expired`
+        // would report the passage of time as a failure of the request.
+        {
+            let mut state = self.lock();
+            if let Some(operation_id) = &batch.operation_id {
+                match state.ledger_lookup(operation_id, hash, at_ms, self.limits.receipt_ttl_ms) {
+                    LedgerLookup::Miss => {}
+                    LedgerLookup::Replay(receipt) => return Ok(receipt.replayed()),
+                    LedgerLookup::Conflict {
                         recorded_hash,
                         recorded,
-                    });
-                }
-                LedgerLookup::Expired => {
-                    return Err(TransactionError::UnknownOutcome {
-                        operation_id: operation_id.clone(),
-                        reason: "its receipt is no longer retained".to_owned(),
-                    });
+                    } => {
+                        return Err(TransactionError::OperationConflict {
+                            operation_id: operation_id.clone(),
+                            expected_hash: hash,
+                            recorded_hash,
+                            recorded,
+                        });
+                    }
+                    LedgerLookup::Expired => {
+                        return Err(TransactionError::UnknownOutcome {
+                            operation_id: operation_id.clone(),
+                            reason: "its receipt is no longer retained".to_owned(),
+                        });
+                    }
                 }
             }
         }
 
+        let snapshot = self.store.snapshot(expected)?;
+        let handle = snapshot.handle().clone();
+        let source = Arc::clone(snapshot.splat());
+        let mut state = self.lock();
         let before = state.authoring_for(&handle, source.len());
         let candidate = {
             let State { selections, .. } = &mut *state;
@@ -1036,15 +1136,109 @@ impl TransactionService {
         Ok(receipt)
     }
 
+    /// Records an acknowledged export or display outcome onto the receipt of a revision.
+    ///
+    /// A commit cannot know whether a picture appeared or a file was written - those happen
+    /// after it returns - so the caller that *did* the work reports it here. Until then a
+    /// display outcome reads [`SideEffect::Published`], never `done`.
+    pub fn note_side_effect(
+        &self,
+        handle: &DocumentHandle,
+        slot: ReceiptSlot,
+        side: SideEffect,
+    ) -> bool {
+        self.lock().note_side_effect(handle, slot, side)
+    }
+
+    /// The recorded receipt of a revision, when it is still retained.
+    pub fn receipt(&self, handle: &DocumentHandle) -> Option<TransactionReceipt> {
+        self.lock().receipt_for(handle).cloned()
+    }
+
+    /// Installs an authoring layer for one revision, for a restored sidecar.
+    ///
+    /// The layer must match the revision's geometry: a mismatch is refused rather than attached,
+    /// because ids that do not describe these gaussians are worse than no metadata at all.
+    pub fn install_authoring(
+        &self,
+        handle: &DocumentHandle,
+        set: AuthoringSet,
+    ) -> Result<usize, TransactionError> {
+        let snapshot = self.store.resolve(handle)?;
+        let points = snapshot.splat().len();
+        if set.len() != points {
+            return Err(TransactionError::Invalid(format!(
+                "authoring metadata describes {} gaussians but {} holds {points}",
+                set.len(),
+                handle
+            )));
+        }
+        let mut state = self.lock();
+        let mut set = set;
+        set.document = Some(handle.document_id.clone());
+        set.set_rows(handle.revision, set.ids().to_vec());
+        let components = set.components().len();
+        // A restored layer replaces whatever was inferred for this document, and the revision it
+        // describes is not one this service produced, so history and selections for it go.
+        state.history.remove(&handle.document_id);
+        state.redo.remove(&handle.document_id);
+        state.selections.forget_document(&handle.document_id);
+        state
+            .latest
+            .insert(handle.document_id.clone(), handle.revision);
+        state.authoring.insert(handle.document_id.clone(), set);
+        state.rebuilt.remove(&handle.document_id);
+        Ok(components)
+    }
+
     /// Commits the candidate a preview retained.
     ///
     /// The caller's expectation must still resolve to the exact revision the preview was built
     /// from: a preview that has been overtaken cannot overwrite newer work.
+    ///
+    /// `operation_id` makes the commit retry-safe. Without one, a second identical commit is
+    /// still refused with `preview_expired` - the candidate is consumed by the first commit and
+    /// there is nothing that identifies the two requests as the same one - so a caller that
+    /// wants retry safety supplies an id, exactly as it does for a batch.
     pub fn commit_preview(
         &self,
         preview_id: u64,
         expected: Expected,
+        operation_id: Option<String>,
     ) -> Result<TransactionReceipt, TransactionError> {
+        // The request identity is the candidate plus the target the caller named. It is
+        // computed from the *request*, never from current state: a retry after the first commit
+        // advanced the revision is the same request, and must reach the recorded outcome rather
+        // than looking like different content.
+        let hash =
+            fingerprint(format!("preview-commit:{preview_id}:{}", expected.describe()).as_bytes());
+        let at_ms = now_ms();
+        {
+            let mut state = self.lock();
+            if let Some(operation_id) = &operation_id {
+                match state.ledger_lookup(operation_id, hash, at_ms, self.limits.receipt_ttl_ms) {
+                    LedgerLookup::Miss => {}
+                    LedgerLookup::Replay(receipt) => return Ok(receipt.replayed()),
+                    LedgerLookup::Conflict {
+                        recorded_hash,
+                        recorded,
+                    } => {
+                        return Err(TransactionError::OperationConflict {
+                            operation_id: operation_id.clone(),
+                            expected_hash: hash,
+                            recorded_hash,
+                            recorded,
+                        });
+                    }
+                    LedgerLookup::Expired => {
+                        return Err(TransactionError::UnknownOutcome {
+                            operation_id: operation_id.clone(),
+                            reason: "its receipt is no longer retained".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
         let snapshot = self.store.snapshot(expected)?;
         let current = snapshot.handle().clone();
         let mut state = self.lock();
@@ -1069,17 +1263,13 @@ impl TransactionService {
             reports: preview.report.steps.clone(),
             warnings: preview.report.warnings.clone(),
         };
-        let hash = fingerprint(
-            format!("preview:{preview_id}:{}", preview.report.source.revision).as_bytes(),
-        );
-        let at_ms = now_ms();
         let receipt = self.commit_candidate(
             &mut state,
             &current,
             Arc::clone(snapshot.splat()),
             candidate,
             before,
-            None,
+            operation_id,
             hash,
             Mutation::edit("edit_splat"),
             Some(PreviewCommit {
@@ -1126,6 +1316,9 @@ impl TransactionService {
             .store
             .commit(Expected::Handle(handle.clone()), stored, mutation)?;
         let produced = metadata.handle.clone();
+        // The name the document is saved under, recorded with the receipt so a replay reports
+        // the same file without asking the store what is displayed now.
+        let file_name = metadata.provenance.file_name.clone();
 
         // Identity bookkeeping: surviving ids stay, retired ids go, new ids were minted while
         // the batch ran. Membership is cleaned so no component points at a retired row.
@@ -1183,6 +1376,12 @@ impl TransactionService {
         let receipt = TransactionReceipt {
             operation_id,
             request_hash,
+            recorded: ReceiptDocument {
+                document_id: produced.document_id.clone(),
+                revision: produced.revision,
+                point_count: ids.len(),
+                file_name,
+            },
             document: produced.clone(),
             committed: true,
             steps: reports,
@@ -1358,6 +1557,67 @@ impl TransactionService {
     /// A retained selection handle.
     pub fn selection(&self, id: u64) -> Option<SelectionHandle> {
         self.lock().selections.get(id).cloned()
+    }
+
+    /// The gaussians a selection resolved to, bounded, in ascending row order.
+    ///
+    /// Read through the identities the handle recorded, so this is exactly the set the handle
+    /// promised: a viewer highlight and a tool reply therefore describe the same gaussians.
+    pub fn selected_points(
+        &self,
+        id: u64,
+        max: usize,
+    ) -> Result<Vec<crate::SplatPoint>, TransactionError> {
+        // Lock 1: the promise itself. The store is untouched while the lock is held.
+        let (handle, ids) = {
+            let state = self.lock();
+            let selection = state.selections.get(id).ok_or_else(|| {
+                TransactionError::Selection(SelectionError::Invalid(format!(
+                    "selection handle {id} is no longer retained; select again"
+                )))
+            })?;
+            let document = selection
+                .document
+                .clone()
+                .ok_or_else(|| TransactionError::Document(DocumentError::NoDocument))?;
+            (
+                DocumentHandle::new(document, selection.revision),
+                selection.ids().to_vec(),
+            )
+        };
+
+        // Outside the lock: resolve the revision and read the points it names.
+        let snapshot = self.store.resolve(&handle)?;
+        let splat = Arc::clone(snapshot.splat());
+
+        // Lock 2: the identity mapping of that revision, for the rows the ids occupy.
+        let rows = {
+            let mut state = self.lock();
+            let set = state.authoring_for(&handle, splat.len());
+            ids.iter()
+                .filter_map(|id| set.row_of(*id))
+                .take(max)
+                .collect::<Vec<usize>>()
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| splat.points.get(row).copied())
+            .collect())
+    }
+
+    /// The authoring layer of an exact revision: ids, components and membership.
+    ///
+    /// A reply reports [`ComponentList`]; this is what a versioned sidecar records, because a
+    /// restore needs the rows its members occupy, not only their identities.
+    pub fn authoring_layer(
+        &self,
+        expected: Expected,
+    ) -> Result<(DocumentHandle, AuthoringSet), TransactionError> {
+        let snapshot = self.store.snapshot(expected)?;
+        let handle = snapshot.handle().clone();
+        let mut state = self.lock();
+        let set = state.authoring_for(&handle, snapshot.splat().len());
+        Ok((handle, set))
     }
 
     /// The authoring layer of an exact revision, with ids and components.

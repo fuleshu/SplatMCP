@@ -23,13 +23,12 @@ pub mod wire;
 pub use client::BridgeClient;
 pub use paths::{app_data_dir, bridge_descriptor_path, ensure_app_data_dir, settings_path};
 pub use protocol::{
-    BatchOpParams, BatchPointParams, BoundsInfo, BoundsSummary, BridgeDescriptor, CameraRequest,
-    CameraState, CaptureRequest, CaptureResult, CommitPreviewRequest, ComponentSummary,
-    ComponentsReply, ComponentsRequest, DistributionSummary, DocumentPlyReply, DocumentReply,
-    DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest, ExportSummary,
-    GetPlyRequest, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
-    InspectionSummary, LoadPlyRequest, Method, PROTOCOL_VERSION, PlyImportSummary,
-    PreviewSummary,
+    AuthoringNote, BatchOpParams, BatchPointParams, BoundsInfo, BoundsSummary, BridgeDescriptor,
+    CameraRequest, CameraState, CaptureRequest, CaptureResult, CommitPreviewRequest,
+    ComponentSummary, ComponentsReply, ComponentsRequest, DistributionSummary, DocumentPlyReply,
+    DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest,
+    ExportSummary, GetPlyRequest, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
+    InspectionSummary, LoadPlyRequest, Method, PROTOCOL_VERSION, PlyImportSummary, PreviewSummary,
     PythonCancelRequest, PythonErrorReport, PythonJobQuery, PythonRunRequest, ReloadRequest,
     Request, Response, RetentionSummary, RevisionSummary, SelectionParams, SelectionSummary,
     SetComponentRequest, SideEffectSummary, StepSummary, TransformSummary, ViewerStatus,

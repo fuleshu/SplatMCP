@@ -47,6 +47,13 @@ export class SplatViewer {
     this.objectUrl = null;
     this.resizeObserver = null;
     this.loadToken = 0;
+    // The selection highlight is a second gsplat layer over the document: it is loaded from
+    // its own marker PLY so the highlighted gaussians are exactly the ones a selection
+    // resolved to, drawn by the same renderer, without touching the document layer.
+    this.highlightEntity = null;
+    this.highlightAsset = null;
+    this.highlightUrl = null;
+    this.highlightToken = 0;
     // Read from the PLY header on load; reported to the bridge as status.
     this.plyPointCount = 0;
 
@@ -79,6 +86,85 @@ export class SplatViewer {
     }
     this.setStatus("");
     this.start();
+  }
+
+  /**
+   * Shows a selection highlight from marker PLY bytes, replacing any previous highlight.
+   *
+   * Marker bytes are authored in document space, so the layer takes the same one-time space
+   * change as the document itself and the markers land on their gaussians. Empty bytes clear
+   * the highlight, which is how a cleared selection is drawn away.
+   */
+  async setHighlight(fileBytes) {
+    this.ensureApp();
+    this.clearHighlight();
+    if (!fileBytes || fileBytes.length === 0) {
+      return;
+    }
+    const token = ++this.highlightToken;
+    const url = this.objectUrlForLayer(fileBytes);
+    this.highlightUrl = url;
+    const asset = new pc.Asset(
+      "selection-highlight.ply",
+      "gsplat",
+      { url, filename: "selection-highlight.ply" },
+      {
+        elementFilter: (propertyName) => REQUIRED_PLY_PROPERTIES.has(propertyName),
+        reorder: false,
+      },
+      { crossOrigin: null, minimalMemory: true },
+    );
+    this.highlightAsset = asset;
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        asset.off("load", onLoad);
+        asset.off("error", onError);
+      };
+      const onLoad = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error) => {
+        cleanup();
+        reject(new Error(errorMessage(error) || "could not parse the highlight"));
+      };
+      asset.on("load", onLoad);
+      asset.on("error", onError);
+      this.app.assets.add(asset);
+      this.app.assets.load(asset);
+    });
+    if (token !== this.highlightToken) {
+      return;
+    }
+    const entity = new pc.Entity("selection-highlight");
+    entity.addComponent("gsplat", { asset });
+    entity.setEulerAngles(PLY_DEFAULT_X_FLIP_DEG, 0, 0);
+    this.highlightEntity = entity;
+    this.app.root.addChild(entity);
+    entity.syncHierarchy();
+    await this.settle(1);
+    this.start();
+  }
+
+  /** Removes the selection highlight. */
+  clearHighlight() {
+    this.highlightToken += 1;
+    if (this.highlightEntity) {
+      this.highlightEntity.destroy();
+      this.highlightEntity = null;
+    }
+    if (this.highlightAsset) {
+      this.highlightAsset.off();
+      if (this.app?.assets?.get(this.highlightAsset.id)) {
+        this.app.assets.remove(this.highlightAsset);
+      }
+      this.highlightAsset.unload();
+      this.highlightAsset = null;
+    }
+    if (this.highlightUrl) {
+      URL.revokeObjectURL(this.highlightUrl);
+      this.highlightUrl = null;
+    }
   }
 
   /** True once a splat is displayed. */
@@ -137,6 +223,7 @@ export class SplatViewer {
   dispose() {
     this.loadToken += 1;
     this.stop();
+    this.clearHighlight();
     this.clearSplat();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -204,6 +291,11 @@ export class SplatViewer {
     this.resizeObserver.observe(this.container);
     this.handleResize();
     this.app.start();
+  }
+
+  /** Object URL for a layer that is not the document, so it is not revoked by a document load. */
+  objectUrlForLayer(fileBytes) {
+    return URL.createObjectURL(new Blob([fileBytes], { type: "application/octet-stream" }));
   }
 
   objectUrlFor(fileBytes) {

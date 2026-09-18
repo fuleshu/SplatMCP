@@ -626,7 +626,10 @@ fn point_from(
                 "color",
                 None,
                 ValidationReason::ColorOutOfRange,
-                format!("sh coefficient {} outside the representable range", render(&dc)),
+                format!(
+                    "sh coefficient {} outside the representable range",
+                    render(&dc)
+                ),
             )
             .at(row)
         });
@@ -1092,9 +1095,11 @@ mod tests {
         ]
         .join("\n");
         let row = "1 2 3 0.1 0.2 0.3 1.0 -8 -8 -8 1 0 0 0 0.5 7.5";
-        let (splat, report) =
-            read_ply_with_policy(format!("{header}\n{row}\n").as_bytes(), PlyImportPolicy::Strict)
-                .unwrap();
+        let (splat, report) = read_ply_with_policy(
+            format!("{header}\n{row}\n").as_bytes(),
+            PlyImportPolicy::Strict,
+        )
+        .unwrap();
 
         assert_eq!(splat.len(), 1);
         assert_eq!(splat.points[0].position, [1.0, 2.0, 3.0]);
@@ -1186,7 +1191,12 @@ mod tests {
         assert!(!report.repairs_truncated());
         assert_eq!(report.repairs[0].point, 0, "repairs are indexed");
         assert!(report.repairs.iter().any(|repair| repair.field == "scale"));
-        assert!(report.repairs.iter().any(|repair| repair.field == "rotation"));
+        assert!(
+            report
+                .repairs
+                .iter()
+                .any(|repair| repair.field == "rotation")
+        );
         assert!(
             report.summary().contains("3 value(s) repaired (repair)"),
             "{report}"
@@ -1196,7 +1206,10 @@ mod tests {
 
         // The same file is one offending gaussian, not three.
         let refused = read_ply(&bytes).unwrap_err().to_string();
-        assert!(refused.contains("1 of 1 gaussians are invalid"), "{refused}");
+        assert!(
+            refused.contains("1 of 1 gaussians are invalid"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1217,7 +1230,10 @@ mod tests {
         assert_eq!(report.normalized[0].point, 0);
         assert_eq!(report.total_repairs, 0, "rescaling is not a repair");
         assert!(!report.is_lossless());
-        assert!(report.summary().contains("rescaled to unit length"), "{report}");
+        assert!(
+            report.summary().contains("rescaled to unit length"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -1227,7 +1243,10 @@ mod tests {
         let (_, report) = read_ply_with_policy(&bytes, PlyImportPolicy::Strict).unwrap();
         assert_eq!(report.total_normalized, 0);
         assert_eq!(report.total_repairs, 0);
-        assert!(report.discarded_names().contains(&"nx"), "placeholder normals are reported");
+        assert!(
+            report.discarded_names().contains(&"nx"),
+            "placeholder normals are reported"
+        );
     }
 
     #[test]
@@ -1251,7 +1270,9 @@ mod tests {
     fn an_unreadable_logit_is_an_error_rather_than_a_repair() {
         let bytes = ascii_with_row("0 0 0 0 0 0 NaN -8 -8 -8 1 0 0 0");
         for policy in [PlyImportPolicy::Strict, PlyImportPolicy::Repair] {
-            let error = read_ply_with_policy(&bytes, policy).unwrap_err().to_string();
+            let error = read_ply_with_policy(&bytes, policy)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("opacity logit"), "{policy:?}: {error}");
         }
 
@@ -1260,8 +1281,7 @@ mod tests {
         let (splat, report) = read_ply_with_policy(&bytes, PlyImportPolicy::Strict).unwrap();
         assert_eq!(splat.points[0].opacity, 1.0);
         let bytes = ascii_with_row("0 0 0 0 0 0 -inf -8 -8 -8 1 0 0 0");
-        let (splat, report_neg) =
-            read_ply_with_policy(&bytes, PlyImportPolicy::Strict).unwrap();
+        let (splat, report_neg) = read_ply_with_policy(&bytes, PlyImportPolicy::Strict).unwrap();
         assert_eq!(splat.points[0].opacity, 0.0);
         assert_eq!(report.changed_values() + report_neg.changed_values(), 0);
     }
@@ -1282,12 +1302,27 @@ mod tests {
         for policy in [PlyImportPolicy::Strict, PlyImportPolicy::Repair] {
             assert_eq!(PlyImportPolicy::parse(policy.name()), Some(policy));
         }
-        assert_eq!(PlyImportPolicy::parse("refuse"), Some(PlyImportPolicy::Strict));
-        assert_eq!(PlyImportPolicy::parse("lenient"), Some(PlyImportPolicy::Repair));
+        assert_eq!(
+            PlyImportPolicy::parse("refuse"),
+            Some(PlyImportPolicy::Strict)
+        );
+        assert_eq!(
+            PlyImportPolicy::parse("lenient"),
+            Some(PlyImportPolicy::Repair)
+        );
         assert_eq!(PlyImportPolicy::parse("maybe"), None);
         // A request has to ask for repair: an absent or false flag means strict.
-        assert_eq!(PlyImportPolicy::from_repair_flag(None), PlyImportPolicy::Strict);
-        assert_eq!(PlyImportPolicy::from_repair_flag(Some(false)), PlyImportPolicy::Strict);
-        assert_eq!(PlyImportPolicy::from_repair_flag(Some(true)), PlyImportPolicy::Repair);
+        assert_eq!(
+            PlyImportPolicy::from_repair_flag(None),
+            PlyImportPolicy::Strict
+        );
+        assert_eq!(
+            PlyImportPolicy::from_repair_flag(Some(false)),
+            PlyImportPolicy::Strict
+        );
+        assert_eq!(
+            PlyImportPolicy::from_repair_flag(Some(true)),
+            PlyImportPolicy::Repair
+        );
     }
 }

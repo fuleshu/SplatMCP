@@ -71,7 +71,7 @@ those bytes as binary data.
 | `edit_history` | `status` reports undo/redo availability and the retained steps of the displayed document; `undo` and `redo` commit a **new** revision each, restoring geometry and component membership. A new edit clears the redo stack |
 | `splat_components` | named components and stable selections: `list`, `create`, `rename`, `remove`, `transform` (declares an explicit local frame; anisotropic gaussians are transformed through their covariance, and singular or reflecting frames are refused), `members` (bind a selection to a component), `apply_transform` (transform those members as a committed edit) and `select` (a revision-bound handle with count, bounds and a bounded sample) |
 | `create_splat` | build a splat from a shape (`sphere`, `cube`, `plane`, `line`, `shell`, `ring`, `grid`) or explicit points, optionally write a `.ply`, and show it |
-| `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) to the displayed document, a `.ply`, or a new empty one, each with an optional box/attribute selection; reports the document id and revision the edit landed in |
+| `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) with an optional box, sphere, attribute, **component**, point-id or saved-selection target. The displayed document is edited through the same transaction as `edit_batch` - stable component/point ids, one revision, components and undo history preserved, `operation_id` makes a retry safe - while a `.ply` or `new` source is a detached buffer that refuses document-only targets instead of ignoring them |
 | `load_splat` | display an existing `.ply` and frame it; the import is strict, so a file that needs repair is refused with indexed diagnostics unless `repair: true` accepts it and the reply reports every change |
 | `splat_info` | document id, revision, point count, bounds, mean colour, opacity range, scale/colour distributions, contract diagnostics and buffer sizes; reads the displayed document as bounded metadata, and shows the first *n* gaussians when asked |
 | `set_camera` | move the camera: `fit`, an explicit position, or orbit values |
@@ -319,13 +319,24 @@ Still open:
   service itself produced. Idempotency receipts are bounded in memory (32 receipts, 15 minutes),
   so after a restart an old operation id is *unknown*: the tool says so instead of replaying a
   destructive edit.
+- **A commit says `published`, not `done`, until the window renders it.** The app announces the
+  exact revision over `splat://edit-revision` and the window fetches *those* bytes by document id
+  and revision, dropping a load that a newer one overtook; only its acknowledgement turns the
+  receipt's display outcome into `done`. A retry replays the recorded receipt - its document,
+  revision, point count and side effects - rather than reporting whatever is displayed now, and a
+  preview commit is retry-safe once it carries an `operation_id`.
 - **Component metadata and point identities are process local too.** `AuthoringSet` holds opaque
   component ids, stable point ids and membership beside the gaussian buffer. A revision produced
   outside the transaction service (a file replace, a Python job) rebuilds that layer, which is
   reported as `rebuilt` so a caller learns why its ids changed. A save writes a versioned
-  `.authoring.json` sidecar next to the PLY carrying document id, revision and the artifact
-  checksum; loading refuses (and warns about) a sidecar whose association does not match exactly,
-  and a plain PLY export keeps its "geometry only" guarantee.
+  `.authoring.json` sidecar next to the PLY carrying document id, revision, the artifact checksum,
+  each component's frame and its members (as identities *and* rows). Reopening a file restores the
+  metadata whose checksum and gaussian count match those bytes, rebuilding every component with
+  fresh ids at the recorded rows; a sidecar that does not match is refused **with a reason the
+  reply carries**, never attached by file name. A plain PLY export keeps its "geometry only"
+  guarantee. A resolved selection is published to the window (`splat://selection`) and drawn as a
+  marker layer over the document, so the sidebar, a tool call and the viewport show the same
+  gaussians.
 
 ## License
 

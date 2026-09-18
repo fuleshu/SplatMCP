@@ -273,7 +273,7 @@ fn a_preview_does_not_change_the_document_and_a_stale_preview_is_refused() {
         )
         .unwrap();
     let error = service
-        .commit_preview(outcome.preview_id, Expected::Any)
+        .commit_preview(outcome.preview_id, Expected::Any, None)
         .unwrap_err();
     assert_eq!(error.code(), "preview_conflict");
 
@@ -283,7 +283,7 @@ fn a_preview_does_not_change_the_document_and_a_stale_preview_is_refused() {
     store2.open(splat(3), Mutation::import("scene.ply"));
     let outcome = service2.preview(Expected::Any, &batch).unwrap();
     let receipt = service2
-        .commit_preview(outcome.preview_id, Expected::Any)
+        .commit_preview(outcome.preview_id, Expected::Any, None)
         .unwrap();
     assert_eq!(receipt.document.revision, 2);
     assert_eq!(receipt.preview.unwrap().preview_id, outcome.preview_id);
@@ -453,4 +453,167 @@ fn a_selection_handle_can_target_a_batch_and_a_stale_one_is_refused() {
         .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
         .unwrap_err();
     assert_eq!(error.code(), "invalid_selection");
+}
+
+#[test]
+fn a_late_retry_replays_the_recorded_outcome_even_after_the_document_moved_on() {
+    let (store, service) = harness();
+    store.open(splat(3), Mutation::import("scene.ply"));
+    let batch = EditBatch::new(vec![BatchStep::new(EditOp::Duplicate {
+        by: [0.0, 0.0, 1.0],
+    })])
+    .with_operation_id("recipe-late");
+    let first = service
+        .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
+        .unwrap();
+    assert_eq!(first.point_count, 6);
+    assert_eq!(first.recorded.point_count, 6);
+    assert_eq!(first.recorded.file_name, "scene.ply");
+    let first_revision = first.document.revision;
+
+    // Undo, redo and another edit: the document is now several revisions on, and the source
+    // revision the original request started from is long gone from retention.
+    service.undo(Expected::Any).unwrap();
+    service.redo(Expected::Any).unwrap();
+    service
+        .commit(
+            Expected::Any,
+            &EditBatch::new(vec![BatchStep::with_targets(
+                EditOp::Remove,
+                BatchTargets::from_selection(Selection {
+                    first: Some(3),
+                    ..Selection::default()
+                }),
+            )]),
+            Mutation::edit("edit_batch"),
+        )
+        .unwrap();
+
+    // The retry still reports *what the original request did*, not what is displayed now.
+    let retry = service
+        .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.document, first.document);
+    assert_eq!(retry.recorded, first.recorded);
+    assert_eq!(retry.point_count, first.point_count);
+    assert_eq!(retry.steps, first.steps);
+    assert_eq!(retry.document.revision, first_revision);
+    assert_eq!(store.active_handle().unwrap().revision, first_revision + 3);
+}
+
+#[test]
+fn a_retry_with_an_evicted_source_snapshot_still_answers_from_the_receipt() {
+    // One retained revision: the retry arrives after the source revision has been evicted and
+    // after the document was replaced, which used to fail with `snapshot_expired`.
+    let store = Arc::new(DocumentStore::with_session(
+        RetentionLimits::new(1, usize::MAX),
+        5,
+    ));
+    let service = TransactionService::new(Arc::clone(&store), TransactionLimits::default());
+    store.open(splat(2), Mutation::import("first.ply"));
+    let batch = EditBatch::new(vec![BatchStep::new(EditOp::Translate {
+        by: [0.0, 1.0, 0.0],
+    })])
+    .with_operation_id("recipe-evicted");
+    let first = service
+        .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
+        .unwrap();
+    assert_eq!(first.document.revision, 2);
+
+    // A different document replaces it, so neither the source nor the produced revision of the
+    // original request is resolvable any more.
+    store.open(splat(7), Mutation::import("second.ply"));
+    let retry = service
+        .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.recorded.document_id, first.recorded.document_id);
+    assert_eq!(retry.recorded.revision, first.recorded.revision);
+    assert_eq!(retry.point_count, first.point_count);
+}
+
+#[test]
+fn an_acknowledged_side_effect_is_replayed_and_unacknowledged_display_is_not_done() {
+    let (store, service) = harness();
+    store.open(splat(2), Mutation::import("scene.ply"));
+    let batch = EditBatch::new(vec![BatchStep::new(EditOp::Translate {
+        by: [1.0, 0.0, 0.0],
+    })])
+    .with_operation_id("recipe-ack");
+    let first = service
+        .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
+        .unwrap();
+    // Nothing has confirmed a picture yet: `published` is not `done`.
+    assert_eq!(first.display, SideEffect::NotRequested);
+    assert!(service.note_side_effect(&first.document, ReceiptSlot::Display, SideEffect::Published));
+    assert!(service.note_side_effect(&first.document, ReceiptSlot::Export, SideEffect::Done));
+
+    let retry = service
+        .commit(Expected::Any, &batch, Mutation::edit("edit_batch"))
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.display, SideEffect::Published);
+    assert!(retry.display.is_published() && !retry.display.is_done());
+    assert_eq!(retry.export, SideEffect::Done);
+
+    // A later acknowledgement is what turns it into `done`.
+    assert!(service.note_side_effect(&first.document, ReceiptSlot::Display, SideEffect::Done));
+    assert_eq!(
+        service.receipt(&first.document).unwrap().display,
+        SideEffect::Done
+    );
+    // An unknown revision is reported as unknown rather than silently stored.
+    let foreign = DocumentHandle::new(DocumentId::mint(9, 9), 1);
+    assert!(!service.note_side_effect(&foreign, ReceiptSlot::Display, SideEffect::Done));
+}
+
+#[test]
+fn a_preview_commit_with_an_operation_id_is_safe_to_retry() {
+    let (store, service) = harness();
+    store.open(splat(3), Mutation::import("scene.ply"));
+    let batch = EditBatch::new(vec![BatchStep::with_targets(
+        EditOp::Remove,
+        BatchTargets::from_selection(Selection {
+            first: Some(1),
+            ..Selection::default()
+        }),
+    )]);
+    let outcome = service.preview(Expected::Any, &batch).unwrap();
+    let first = service
+        .commit_preview(
+            outcome.preview_id,
+            Expected::Any,
+            Some("preview-commit-1".to_owned()),
+        )
+        .unwrap();
+    assert_eq!(first.point_count, 2);
+    assert_eq!(first.preview.unwrap().preview_id, outcome.preview_id);
+    let revision_after_commit = store.active_handle().unwrap().revision;
+    assert_eq!(first.document.revision, revision_after_commit);
+
+    // The candidate is consumed, but the *request* still has a recorded outcome.
+    let retry = service
+        .commit_preview(
+            outcome.preview_id,
+            Expected::Any,
+            Some("preview-commit-1".to_owned()),
+        )
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.document, first.document);
+    assert_eq!(retry.point_count, first.point_count);
+    assert_eq!(
+        store.active_handle().unwrap().revision,
+        revision_after_commit
+    );
+
+    // A different operation id, or none at all, is still refused: there is no candidate left.
+    assert_eq!(
+        service
+            .commit_preview(outcome.preview_id, Expected::Any, None)
+            .unwrap_err()
+            .code(),
+        "preview_expired"
+    );
 }

@@ -18,16 +18,16 @@ use splatmcp_bridge::{
     DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest,
     GetPlyRequest, Handler, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
     InspectionSummary, LoadPlyRequest, Method, PlyImportSummary, PreviewSummary,
-    PythonCancelRequest, PythonJobQuery,
-    PythonRunRequest, ReloadRequest, RetentionSummary, SelectionParams, SelectionSummary,
-    SetComponentRequest, SideEffectSummary, StepSummary, TransformSummary, ViewerStatus,
+    PythonCancelRequest, PythonJobQuery, PythonRunRequest, ReloadRequest, RetentionSummary,
+    SelectionParams, SelectionSummary, SetComponentRequest, SideEffectSummary, StepSummary,
+    TransformSummary, ViewerStatus,
 };
 use tauri::{AppHandle, Emitter, Manager};
 
 use splatmcp_core::validation::ValidationLimits;
 use splatmcp_core::{
     BatchStep, BatchTargets, Box3, ComponentId, EditBatch, EditOp, Expected, Frame, LocalTransform,
-    PlyImportPolicy, PointId, SelectionQuery, Sphere, SplatPoint,
+    PlyImportPolicy, PointId, ReceiptSlot, SelectionQuery, SideEffect, Sphere, SplatPoint,
 };
 
 use crate::document::{self, AppState, Mutation, MutationKind, OutcomeInfo, SplatInfo};
@@ -146,8 +146,15 @@ impl AppBridge {
         // Repair is opt-in: without it a file that would need repair is refused with indexed
         // diagnostics instead of being loaded as a quietly repaired document.
         let policy = PlyImportPolicy::from_repair_flag(request.repair);
+        // A load that names a real file can carry authoring metadata beside it; a buffer with
+        // only a display name cannot, and is not guessed at.
+        let source_path = request
+            .file_name
+            .clone()
+            .filter(|name| std::path::Path::new(name).is_file());
 
         let state = self.app.state::<AppState>();
+        let opening = matches!(expected, Expected::Any);
         let imported = match expected {
             Expected::Any => state.open_ply(&bytes, Mutation::import(file_name), policy)?,
             target => state.replace_ply(
@@ -160,6 +167,15 @@ impl AppBridge {
             )?,
         };
         let info = SplatInfo::of(&imported.metadata);
+        // Opening a *file* is where component metadata is restored: association is by content,
+        // and anything else is reported as a note on this reply rather than attached.
+        if opening
+            && let Some(note) = source_path.as_deref().and_then(|path| {
+                restore_note(&state, std::path::Path::new(path), &imported, &bytes)
+            })
+        {
+            state.set_authoring_note(&imported.metadata.handle, note);
+        }
 
         let value = self.viewer.request(
             Method::ViewerLoadPly,
@@ -172,7 +188,7 @@ impl AppBridge {
         status.loaded = true;
         // The reply identifies the revision the caller actually got, and what the import did
         // to the file it came from.
-        status.document = Some(DocumentSummary::from(&imported.metadata));
+        status.document = Some(summary_of(&state, &imported.metadata));
         status.import = PlyImportSummary::of(&imported.report);
         serde_json::to_value(status).map_err(|error| error.to_string())
     }
@@ -297,6 +313,13 @@ impl AppBridge {
 /// Deliberately separate from the Python job's `splat://revision`: a transaction is not a job,
 /// and a viewer acknowledgement of a job's revision must not be confused with an edit.
 pub const EDIT_REVISION_EVENT: &str = "splat://edit-revision";
+
+/// Event the app emits when a selection is resolved, so the window can highlight it.
+///
+/// A selection made over MCP is the same selection the window shows: the payload carries the
+/// handle the app retained plus the revision it was resolved against, and the viewer draws the
+/// gaussians that handle names.
+pub const SELECTION_EVENT: &str = "splat://selection";
 
 /// Parses a six- or two-number box, the same shape the edit tools accept.
 fn parse_box(values: &[f32], name: &str) -> Result<Box3, String> {
@@ -546,34 +569,133 @@ fn transaction_message(error: splatmcp_core::TransactionError) -> String {
     format!("{} ({})", error, error.code())
 }
 
-impl AppBridge {
-    /// Tells the viewer to load the revision the store just produced.
-    ///
-    /// Publication is revision addressed: the frontend fetches the exact revision as binary, so
-    /// a display failure can never leave the viewer showing half of an edit, and the commit
-    /// stays recorded either way.
-    fn publish(&self, handle: &splatmcp_core::DocumentHandle, frame: bool) -> Result<(), String> {
-        let state = self.app.state::<AppState>();
-        let metadata = state
-            .metadata()
-            .ok_or_else(|| "no splat is loaded".to_owned())?;
-        if &metadata.handle != handle {
-            return Err(format!(
-                "the displayed document is {} but {} was committed",
-                metadata.handle, handle
-            ));
+/// A document summary carrying the one-shot authoring note the app has waiting for it.
+///
+/// The note is *taken*, not read: a restore (or a refusal) is reported on the reply that opens
+/// the document, and a later reply does not repeat a warning about something already known.
+fn summary_of(state: &AppState, metadata: &document::DocumentMetadata) -> DocumentSummary {
+    let note = state.take_authoring_note(&metadata.handle);
+    DocumentSummary::from(metadata).with_authoring(note)
+}
+
+/// Restores the authoring metadata that describes exactly these bytes, or reports why not.
+///
+/// One implementation for every open path, so a load from MCP restores the same way the native
+/// dialog does: association is by content (the artifact checksum and the gaussian count), and
+/// the outcome is a note the reply carries.
+pub(crate) fn restore_note(
+    state: &AppState,
+    path: &std::path::Path,
+    imported: &document::ImportedDocument,
+    bytes: &[u8],
+) -> Option<splatmcp_bridge::AuthoringNote> {
+    let checksum = document::ArtifactChecksum::of(bytes);
+    let artifact = format!("{}:{}", checksum.algorithm, checksum.hex());
+    match crate::authoring::lookup_for_content(path, &artifact, imported.metadata.point_count) {
+        crate::authoring::SidecarLookup::Absent => None,
+        crate::authoring::SidecarLookup::Refused(reason) => {
+            eprintln!(
+                "splatmcp: ignoring the authoring sidecar of {}: {reason}",
+                path.display()
+            );
+            Some(splatmcp_bridge::AuthoringNote {
+                status: "refused".to_owned(),
+                message: format!("authoring metadata was not attached: {reason}"),
+                components: 0,
+                members: 0,
+            })
         }
+        crate::authoring::SidecarLookup::Attached(record) => {
+            let mut set = splatmcp_core::components::AuthoringSet::new(
+                Some(imported.metadata.handle.document_id.clone()),
+                imported.metadata.handle.revision,
+                imported.metadata.point_count,
+            );
+            let summary = crate::authoring::restore(&record, &mut set);
+            match state.install_authoring(&imported.metadata.handle, set) {
+                Ok(components) => Some(splatmcp_bridge::AuthoringNote {
+                    status: "restored".to_owned(),
+                    message: format!(
+                        "{} (from {} of document {} revision {})",
+                        summary.describe(),
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        record.document_id,
+                        record.revision
+                    ),
+                    components,
+                    members: summary.members,
+                }),
+                Err(error) => Some(splatmcp_bridge::AuthoringNote {
+                    status: "refused".to_owned(),
+                    message: format!("authoring metadata was not attached: {error}"),
+                    components: 0,
+                    members: 0,
+                }),
+            }
+        }
+    }
+}
+
+impl AppBridge {
+    /// Tells the viewer to load one exact revision, and reports what that proved.
+    ///
+    /// The event names the document *and* the revision, so the frontend can fetch exactly those
+    /// bytes and refuse to display anything else. A successful emission proves only that the
+    /// announcement left the app: it is reported as [`SideEffect::Published`], and only the
+    /// window's acknowledgement turns it into `done`. That is why this returns an outcome
+    /// instead of claiming a render.
+    fn publish(
+        &self,
+        document: &splatmcp_core::ReceiptDocument,
+        component_id: Option<String>,
+        frame: bool,
+    ) -> SideEffect {
         let payload = RevisionPayload {
-            revision: handle.revision,
-            document_id: handle.document_id.to_string(),
-            file_name: metadata.provenance.file_name.clone(),
-            point_count: metadata.point_count,
-            component_id: metadata.provenance.component_id.clone(),
+            revision: document.revision,
+            document_id: document.document_id.to_string(),
+            file_name: document.file_name.clone(),
+            point_count: document.point_count,
+            component_id,
             frame,
         };
-        self.app
+        match self
+            .app
             .emit_to(VIEWER_WINDOW, EDIT_REVISION_EVENT, payload)
-            .map_err(|error| format!("could not tell the viewer about {handle}: {error}"))
+        {
+            Ok(()) => SideEffect::Published,
+            Err(error) => SideEffect::Failed(format!(
+                "could not tell the viewer about {}@{}: {error}",
+                document.document_id, document.revision
+            )),
+        }
+    }
+
+    /// Records the outcome of publication on the revision's receipt.
+    fn note_display(&self, handle: &splatmcp_core::DocumentHandle, side: &SideEffect) {
+        if side.is_requested() {
+            let state = self.app.state::<AppState>();
+            state.note_side_effect(handle, ReceiptSlot::Display, side.clone());
+        }
+    }
+
+    /// Exports the revision the receipt produced, when the caller asked for a file.
+    ///
+    /// Export happens after the commit and is recorded separately, so a failed write is reported
+    /// as a failed export rather than turning a committed edit into a retryable one.
+    fn record_export(
+        &self,
+        handle: &splatmcp_core::DocumentHandle,
+        path: Option<&str>,
+    ) -> Option<OutcomeInfo> {
+        let path = path?.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let state = self.app.state::<AppState>();
+        let outcome = state
+            .export_revision(handle, std::path::Path::new(path))
+            .unwrap_or_else(|error| SideEffect::Failed(error.to_string()));
+        Some(OutcomeInfo::of(&outcome))
     }
 
     /// Runs an edit batch, or dry-runs it when `dry_run` is set.
@@ -616,25 +738,28 @@ impl AppBridge {
         let mut outcome = state
             .commit_batch(expected, &batch, "edit_batch")
             .map_err(transaction_message)?;
-        let metadata = state
-            .metadata()
-            .ok_or_else(|| "no splat is loaded".to_owned())?;
-        outcome.display = match display {
-            true => match self.publish(&metadata.handle, false) {
-                Ok(()) => OutcomeInfo {
-                    status: "done",
-                    message: None,
-                },
-                Err(message) => OutcomeInfo {
-                    status: "failed",
-                    message: Some(message),
-                },
-            },
-            false => OutcomeInfo {
-                status: "not_requested",
-                message: None,
-            },
-        };
+        let handle = outcome.handle().ok_or_else(|| {
+            "the app recorded an unreadable document id for this commit".to_owned()
+        })?;
+        if !outcome.replayed {
+            // A replay already did all of this: re-exporting or re-announcing it would act on
+            // state the original request never produced.
+            if let Some(export) = self.record_export(&handle, request.export_path.as_deref()) {
+                outcome.export = export;
+            }
+            let side = match display {
+                true => {
+                    let component = state
+                        .metadata()
+                        .filter(|metadata| metadata.handle == handle)
+                        .and_then(|metadata| metadata.provenance.component_id.clone());
+                    self.publish(&outcome.recorded(), component, false)
+                }
+                false => SideEffect::NotRequested,
+            };
+            self.note_display(&handle, &side);
+            outcome.display = OutcomeInfo::of(&side);
+        }
         self.edit_batch_reply(&outcome, None)
     }
 
@@ -646,22 +771,18 @@ impl AppBridge {
             document::expected_target(request.document_id.as_deref(), request.expected_revision)?;
         let state = self.app.state::<AppState>();
         let mut outcome = state
-            .commit_preview(request.preview_id, expected)
+            .commit_preview(request.preview_id, expected, request.operation_id.clone())
             .map_err(transaction_message)?;
-        let metadata = state
-            .metadata()
-            .ok_or_else(|| "no splat is loaded".to_owned())?;
-        if request.display.unwrap_or(true) {
-            outcome.display = match self.publish(&metadata.handle, false) {
-                Ok(()) => OutcomeInfo {
-                    status: "done",
-                    message: None,
-                },
-                Err(message) => OutcomeInfo {
-                    status: "failed",
-                    message: Some(message),
-                },
+        if !outcome.replayed {
+            let handle = outcome.handle().ok_or_else(|| {
+                "the app recorded an unreadable document id for this commit".to_owned()
+            })?;
+            let side = match request.display.unwrap_or(true) {
+                true => self.publish(&outcome.recorded(), None, false),
+                false => SideEffect::NotRequested,
             };
+            self.note_display(&handle, &side);
+            outcome.display = OutcomeInfo::of(&side);
         }
         self.edit_batch_reply(&outcome, None)
     }
@@ -683,20 +804,13 @@ impl AppBridge {
             state.redo(expected)
         }
         .map_err(transaction_message)?;
-        let metadata = state
-            .metadata()
-            .ok_or_else(|| "no splat is loaded".to_owned())?;
-        if request.display.unwrap_or(true) {
-            outcome.display = match self.publish(&metadata.handle, false) {
-                Ok(()) => OutcomeInfo {
-                    status: "done",
-                    message: None,
-                },
-                Err(message) => OutcomeInfo {
-                    status: "failed",
-                    message: Some(message),
-                },
+        if let Some(handle) = outcome.handle() {
+            let side = match request.display.unwrap_or(true) {
+                true => self.publish(&outcome.recorded(), None, false),
+                false => SideEffect::NotRequested,
             };
+            self.note_display(&handle, &side);
+            outcome.display = OutcomeInfo::of(&side);
         }
         self.edit_batch_reply(&outcome, None)
     }
@@ -839,6 +953,18 @@ impl AppBridge {
                 let resolved = state
                     .select_points(expected, &query)
                     .map_err(transaction_message)?;
+                // Tell the window which gaussians were selected, so a selection made over MCP is
+                // visible there too: the ids and the revision are the same ones this reply carries.
+                let _ = self.app.emit_to(
+                    VIEWER_WINDOW,
+                    SELECTION_EVENT,
+                    json!({
+                        "handle_id": resolved.handle_id,
+                        "revision": resolved.revision,
+                        "document_id": resolved.document.document_id,
+                        "count": resolved.count,
+                    }),
+                );
                 selection = Some(selection_summary(&resolved));
                 let list = state
                     .components(Expected::Any)
@@ -885,17 +1011,17 @@ impl AppBridge {
     }
 
     /// The wire shape of a committed batch, with side effects kept separate.
+    ///
+    /// Every field comes from the receipt, and the document summary is the *recorded* one: a
+    /// replay must never be dressed up with whatever the app happens to display now.
     fn edit_batch_reply(
         &self,
         outcome: &document::BatchOutcome,
         preview: Option<PreviewSummary>,
     ) -> Result<Value, String> {
         let state = self.app.state::<AppState>();
-        let metadata = state
-            .metadata()
-            .ok_or_else(|| "no splat is loaded".to_owned())?;
         let reply = EditBatchReply {
-            document: DocumentSummary::from(&metadata),
+            document: outcome.summary(),
             retention: RetentionSummary::from(state.retention()),
             committed: outcome.committed,
             replayed: outcome.replayed,
@@ -1081,6 +1207,148 @@ mod tests {
                 .component
                 .map(|text| splatmcp_core::ComponentId::parse(&text).unwrap())
         );
+    }
+
+    /// Saves a document with one component beside its PLY, the way `save_splat` does.
+    fn saved_scene(
+        directory: &std::path::Path,
+    ) -> (std::path::PathBuf, AppState, splatmcp_core::ComponentId) {
+        std::fs::create_dir_all(directory).unwrap();
+        let path = directory.join("scene.ply");
+        let state = AppState::default();
+        let splat = splatmcp_core::fixtures::axis_fixture();
+        let bytes = document::ply_bytes(&splat).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        state
+            .open_ply(
+                &bytes,
+                Mutation::open(path.to_string_lossy().to_string()),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap();
+        let created = state.create_component(Expected::Any, "hair").unwrap();
+        let component = ComponentId::parse(&created.component_id).unwrap();
+        state
+            .set_component_members(
+                Expected::Any,
+                &component,
+                &SelectionQuery {
+                    within: Some(Box3::from_corners([-1.0, -0.2, -1.0], [1.0, 0.25, 1.0])),
+                    ..SelectionQuery::all()
+                },
+            )
+            .unwrap();
+        // Export writes the PLY the sidecar must describe; then the sidecar itself.
+        let outcome = state.export(Expected::Any, &path).unwrap();
+        let (handle, layer) = state.authoring_snapshot(Expected::Any).unwrap();
+        let record = crate::authoring::record(
+            handle.document_id.as_str(),
+            handle.revision,
+            &outcome.checksum,
+            layer.len(),
+            &layer,
+        );
+        crate::authoring::write(&path, &record).unwrap();
+        (path, state, component)
+    }
+
+    #[test]
+    fn reopening_a_saved_file_restores_its_components_with_new_identities() {
+        let directory =
+            std::env::temp_dir().join(format!("splatmcp-reopen-{}", std::process::id()));
+        let (path, saved, component) = saved_scene(&directory);
+        let members = saved
+            .components(Expected::Any)
+            .unwrap()
+            .components
+            .iter()
+            .find(|entry| entry.component_id == component.to_string())
+            .unwrap()
+            .point_count;
+        assert!(members > 0);
+
+        // A fresh app opens the same bytes: it has no components until the sidecar is restored.
+        let fresh = AppState::default();
+        let bytes = std::fs::read(&path).unwrap();
+        let imported = fresh
+            .open_ply(
+                &bytes,
+                Mutation::open(path.to_string_lossy().to_string()),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap();
+        assert!(
+            fresh
+                .components(Expected::Any)
+                .unwrap()
+                .components
+                .is_empty()
+        );
+
+        let note = restore_note(&fresh, &path, &imported, &bytes).expect("a note");
+        assert_eq!(note.status, "restored", "{note:?}");
+        assert_eq!(note.components, 1);
+        assert_eq!(note.members, members);
+        assert!(note.message.contains("ids re-minted"), "{}", note.message);
+
+        let restored = fresh.components(Expected::Any).unwrap();
+        assert_eq!(restored.components.len(), 1);
+        assert_eq!(restored.components[0].name, "hair");
+        assert_eq!(restored.components[0].point_count, members);
+        assert_ne!(
+            restored.components[0].component_id,
+            component.to_string(),
+            "identities are re-minted for the new document"
+        );
+        // The note is reported once, on the reply that describes the document it belongs to:
+        // a registered note is taken by the first summary, and not repeated afterwards.
+        fresh.set_authoring_note(&imported.metadata.handle, note.clone());
+        let summary = summary_of(&fresh, &imported.metadata);
+        assert_eq!(
+            summary.authoring.as_ref().map(|n| n.status.as_str()),
+            Some("restored")
+        );
+        assert!(summary.authoring.unwrap().message.contains("hair") == false);
+        assert!(summary_of(&fresh, &imported.metadata).authoring.is_none());
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_sidecar_that_does_not_describe_these_bytes_is_reported_not_attached() {
+        let directory = std::env::temp_dir().join(format!("splatmcp-stale-{}", std::process::id()));
+        let (path, _saved, _component) = saved_scene(&directory);
+
+        // The file changes after the metadata was written: same name, different content.
+        let other = splatmcp_core::fixtures::rotated_fixture();
+        let bytes = document::ply_bytes(&other).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let fresh = AppState::default();
+        let imported = fresh
+            .open_ply(
+                &bytes,
+                Mutation::open(path.to_string_lossy().to_string()),
+                PlyImportPolicy::Strict,
+            )
+            .unwrap();
+        let note = restore_note(&fresh, &path, &imported, &bytes).expect("a note");
+        assert_eq!(note.status, "refused");
+        assert_eq!(note.components, 0);
+        assert!(
+            note.message.contains("artifact"),
+            "the reason names what did not match: {}",
+            note.message
+        );
+        assert!(
+            fresh
+                .components(Expected::Any)
+                .unwrap()
+                .components
+                .is_empty(),
+            "nothing is attached by file name"
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

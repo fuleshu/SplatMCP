@@ -51,6 +51,13 @@ pub struct EditInput {
     /// edited as if it were intact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair: Option<bool>,
+    /// Retry-safe identity for an edit of the displayed document.
+    ///
+    /// Given one, a resend after a lost response replays the recorded receipt instead of
+    /// applying the edit twice, and a retry that names a stale revision is answered from that
+    /// receipt rather than failing because the revision has since been replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 /// The edit operations a step can ask for.
@@ -425,6 +432,9 @@ pub fn batch_call(input: &EditBatchInput) -> Result<BatchCall, String> {
             document_id: input.document_id.clone(),
             expected_revision: input.expected_revision,
             display: input.display,
+            // Without this, a resend of the same commit reports a consumed candidate as expired
+            // even though the first attempt succeeded.
+            operation_id: input.operation_id.clone(),
         }));
     }
     let steps = input.steps.as_deref().unwrap_or(&[]);
@@ -443,8 +453,47 @@ pub fn batch_call(input: &EditBatchInput) -> Result<BatchCall, String> {
         resolution: input.resolution.clone(),
         dry_run: input.dry_run,
         display: input.display,
+        export_path: None,
         steps,
     }))
+}
+
+/// True when `source` names the displayed document.
+pub fn is_displayed_source(source: Option<&str>) -> bool {
+    match source {
+        None => true,
+        Some(text) => {
+            let text = text.trim();
+            text.is_empty() || text.eq_ignore_ascii_case(SOURCE_VIEWER)
+        }
+    }
+}
+
+/// Turns `edit_splat` input into the batch the app must run.
+///
+/// Used when the edit targets the displayed document: the app owns that document's components,
+/// point identities, history and receipts, so the edit goes through the same transaction the
+/// `edit_batch` tool uses rather than through a detached copy that would lose all of it.
+pub fn edit_batch_request(input: &EditInput) -> Result<EditBatchRequest, String> {
+    if input.ops.is_empty() {
+        return Err("ops is empty; pass at least one edit step".to_owned());
+    }
+    let steps = input
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(index, step)| step_params(step, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EditBatchRequest {
+        document_id: None,
+        expected_revision: None,
+        operation_id: input.operation_id.clone(),
+        resolution: None,
+        dry_run: None,
+        display: input.display,
+        export_path: input.path.clone(),
+        steps,
+    })
 }
 
 /// Turns the component tool input into the app request it describes.
@@ -838,11 +887,57 @@ fn document_ply(link: &AppLink) -> Result<(Option<DocumentIdentity>, Vec<u8>), S
     Ok((document, bytes))
 }
 
-/// Applies `ops` to `splat` and reports each step.
+/// The target fields that only a document can resolve.
+///
+/// A component, a point identity, a saved selection handle and a component-local frame all name
+/// something that lives in the app's document, not in a PLY buffer. An edit of a *file* cannot
+/// honour them, so they are refused rather than ignored - silently widening the selection to
+/// every gaussian is the one outcome a caller must never get.
+pub fn document_only_targets(input: &EditOpInput) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if input.component.is_some() {
+        fields.push("component");
+    }
+    if input.point_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+        fields.push("point_ids");
+    }
+    if input.selection_handle.is_some() {
+        fields.push("selection_handle");
+    }
+    if input.frame.is_some() {
+        fields.push("frame");
+    }
+    if input.sphere.is_some() {
+        fields.push("sphere");
+    }
+    fields
+}
+
+/// Refuses a file-only edit that names document targets, naming the fields it cannot honour.
+pub fn reject_document_targets(ops: &[EditOpInput]) -> Result<(), String> {
+    for (index, op) in ops.iter().enumerate() {
+        let fields = document_only_targets(op);
+        if !fields.is_empty() {
+            return Err(format!(
+                "op {index} targets {} but this source is not the displayed document: \
+                 component, point and selection targets are resolved against a document, so edit \
+                 the displayed document (omit source) or drop those fields",
+                fields.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Applies `ops` to a detached `splat` and reports each step.
+///
+/// This is the file path: the geometry is a buffer the caller named, so it has no document
+/// behind it to resolve components or point identities against.
 pub fn apply_edits(splat: &mut Splat, ops: &[EditOpInput]) -> Result<Vec<StepReport>, String> {
     if ops.is_empty() {
         return Err("ops is empty; pass at least one edit step".to_owned());
     }
+    reject_document_targets(ops)?;
     let steps: Vec<EditStep> = ops
         .iter()
         .enumerate()
@@ -974,10 +1069,7 @@ pub fn info_reply_with_document(
 }
 
 /// Same reply, reporting what reading a file source did.
-pub fn info_reply_with_import(
-    reply: InfoReply,
-    import: Option<PlyImportSummary>,
-) -> InfoReply {
+pub fn info_reply_with_import(reply: InfoReply, import: Option<PlyImportSummary>) -> InfoReply {
     InfoReply { import, ..reply }
 }
 
@@ -1350,8 +1442,12 @@ mod tests {
             "a new splat has no document identity"
         );
 
-        let error =
-            resolve_source(&link, Some("C:/nowhere/missing.ply"), PlyImportPolicy::Strict).unwrap_err();
+        let error = resolve_source(
+            &link,
+            Some("C:/nowhere/missing.ply"),
+            PlyImportPolicy::Strict,
+        )
+        .unwrap_err();
         assert!(error.contains("could not read"), "{error}");
     }
 
@@ -1518,15 +1614,20 @@ mod tests {
         assert_eq!(summary.policy, "repair");
 
         // The policy the tools select from an omitted or explicit flag.
-        assert_eq!(PlyImportPolicy::from_repair_flag(None), PlyImportPolicy::Strict);
-        assert_eq!(PlyImportPolicy::from_repair_flag(Some(true)), PlyImportPolicy::Repair);
+        assert_eq!(
+            PlyImportPolicy::from_repair_flag(None),
+            PlyImportPolicy::Strict
+        );
+        assert_eq!(
+            PlyImportPolicy::from_repair_flag(Some(true)),
+            PlyImportPolicy::Repair
+        );
         let strict: LoadInput = serde_json::from_str(r#"{"path":"a.ply"}"#).unwrap();
         assert_eq!(strict.repair, None);
         let repairing: LoadInput =
             serde_json::from_str(r#"{"path":"a.ply","repair":true}"#).unwrap();
         assert_eq!(repairing.repair, Some(true));
-        let info: InfoInput =
-            serde_json::from_str(r#"{"source":"a.ply","repair":true}"#).unwrap();
+        let info: InfoInput = serde_json::from_str(r#"{"source":"a.ply","repair":true}"#).unwrap();
         assert_eq!(info.repair, Some(true));
         let editing: EditInput = serde_json::from_str(
             r#"{"source":"a.ply","ops":[{"op":"translate","by":[0,1,0]}],"repair":true}"#,
@@ -1615,6 +1716,146 @@ mod tests {
         match accepted.op {
             EditOp::Merge { points } => assert_eq!(points[0].scale, [0.05; 3]),
             other => panic!("expected merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_component_target_survives_the_trip_to_the_transaction_service() {
+        // The reported defect: a component-targeted translate reached the app as a whole-document
+        // translate, so every gaussian moved. The target must travel as a target.
+        let input = EditInput {
+            ops: vec![EditOpInput {
+                op: EditOpKind::Translate,
+                component: Some("cmp-2".to_owned()),
+                by: Some([0.01, 0.0, 0.0]),
+                ..step(EditOpKind::Translate)
+            }],
+            operation_id: Some("hair-nudge".to_owned()),
+            ..EditInput::default()
+        };
+        let request = edit_batch_request(&input).unwrap();
+        assert_eq!(request.operation_id.as_deref(), Some("hair-nudge"));
+        assert_eq!(request.steps.len(), 1);
+        let selection = request.steps[0].selection.as_ref().expect("targets travel");
+        assert_eq!(selection.component.as_deref(), Some("cmp-2"));
+        assert_eq!(request.steps[0].by, Some([0.01, 0.0, 0.0]));
+
+        // Point ids, a saved handle, a frame and a sphere travel too.
+        let input = EditInput {
+            ops: vec![EditOpInput {
+                op: EditOpKind::Remove,
+                point_ids: Some(vec!["pt-7".to_owned(), "pt-9".to_owned()]),
+                selection_handle: Some(3),
+                frame: Some("local".to_owned()),
+                sphere: Some([0.0, 0.0, 0.0, 1.0]),
+                ..step(EditOpKind::Remove)
+            }],
+            ..EditInput::default()
+        };
+        let request = edit_batch_request(&input).unwrap();
+        let selection = request.steps[0].selection.as_ref().unwrap();
+        assert_eq!(selection.point_ids, vec!["pt-7", "pt-9"]);
+        assert_eq!(selection.selection_handle, Some(3));
+        assert_eq!(selection.frame.as_deref(), Some("local"));
+        assert_eq!(selection.sphere, Some([0.0, 0.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn a_file_source_refuses_document_targets_instead_of_ignoring_them() {
+        // A detached buffer has no components or point identities, so naming one is an error - not
+        // a silent widening to every gaussian.
+        let ops = vec![EditOpInput {
+            op: EditOpKind::Translate,
+            component: Some("cmp-2".to_owned()),
+            by: Some([0.01, 0.0, 0.0]),
+            ..step(EditOpKind::Translate)
+        }];
+        let error = reject_document_targets(&ops).unwrap_err();
+        assert!(error.contains("component"), "{error}");
+        assert!(error.contains("not the displayed document"), "{error}");
+
+        for (field, op) in [
+            (
+                "point_ids",
+                EditOpInput {
+                    op: EditOpKind::Remove,
+                    point_ids: Some(vec!["pt-1".to_owned()]),
+                    ..step(EditOpKind::Remove)
+                },
+            ),
+            (
+                "selection_handle",
+                EditOpInput {
+                    op: EditOpKind::Remove,
+                    selection_handle: Some(1),
+                    ..step(EditOpKind::Remove)
+                },
+            ),
+            (
+                "frame",
+                EditOpInput {
+                    op: EditOpKind::Remove,
+                    frame: Some("local".to_owned()),
+                    ..step(EditOpKind::Remove)
+                },
+            ),
+            (
+                "sphere",
+                EditOpInput {
+                    op: EditOpKind::Remove,
+                    sphere: Some([0.0; 4]),
+                    ..step(EditOpKind::Remove)
+                },
+            ),
+        ] {
+            let error = reject_document_targets(&[op]).unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+
+        // A detached edit with only the fields a buffer can honour still runs.
+        let mut splat = Splat::from_points(vec![SplatPoint::new(
+            [0.0; 3],
+            [0.1; 3],
+            [0.5; 3],
+            0.8,
+            [1.0, 0.0, 0.0, 0.0],
+        )]);
+        let reports = apply_edits(
+            &mut splat,
+            &[EditOpInput {
+                op: EditOpKind::Translate,
+                by: Some([0.0, 1.0, 0.0]),
+                ..step(EditOpKind::Translate)
+            }],
+        )
+        .unwrap();
+        assert_eq!(reports[0].affected, 1);
+        assert_eq!(splat.points[0].position[1], 1.0);
+    }
+
+    #[test]
+    fn a_displayed_document_edit_is_recognised_whatever_the_source_spelling() {
+        assert!(is_displayed_source(None));
+        assert!(is_displayed_source(Some("viewer")));
+        assert!(is_displayed_source(Some(" VIEWER ")));
+        assert!(is_displayed_source(Some("")));
+        assert!(!is_displayed_source(Some("new")));
+        assert!(!is_displayed_source(Some("C:/scenes/axis.ply")));
+    }
+
+    #[test]
+    fn a_preview_commit_carries_its_operation_id_so_a_retry_is_safe() {
+        let input = EditBatchInput {
+            preview_id: Some(4),
+            operation_id: Some("commit-1".to_owned()),
+            ..EditBatchInput::default()
+        };
+        match batch_call(&input).unwrap() {
+            BatchCall::CommitPreview(request) => {
+                assert_eq!(request.preview_id, 4);
+                assert_eq!(request.operation_id.as_deref(), Some("commit-1"));
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

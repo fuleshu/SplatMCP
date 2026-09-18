@@ -46,8 +46,8 @@ pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
 pub use transaction::{
     BatchStep, BatchStepReport, BatchTargets, ComponentChange, ComponentList, EditBatch,
     HistoryEntry, HistoryReport, PreviewCommit, PreviewOutcome, PreviewReport, PreviewSnapshot,
-    SideEffect, TargetResolution, TransactionError, TransactionLimits, TransactionReceipt,
-    TransactionService,
+    ReceiptDocument, ReceiptSlot, SideEffect, TargetResolution, TransactionError,
+    TransactionLimits, TransactionReceipt, TransactionService,
 };
 pub use validation::{
     MAX_REPORTED_ISSUES, ValidationError, ValidationIssue, ValidationLimits, ValidationReason,

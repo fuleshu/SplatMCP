@@ -63,12 +63,32 @@ separate outcomes. A committed edit whose export or display failed is still a re
 its receipt says which part failed. Atomicity applies to the document; there is no promise of an
 all-or-nothing filesystem or GPU transaction.
 
+**A receipt is replayed, not recomputed.** It carries its own copy of what it produced - document,
+revision, point count, file name, per-step counts and the side-effect outcomes - so a retry reports
+the outcome of the request it repeats even after the document has moved several revisions on or the
+source revision has been evicted. Replay is resolved *before* any source snapshot is required, and a
+replayed receipt never re-exports a file or re-announces a revision. The app records the export and
+display outcomes back onto the receipt once they are known, addressed by the revision they concern.
+
+**`published` is not `done`.** An event that left the app proves only that it left the app, so a
+commit reports `published` and the window's acknowledgement (`edit_note_displayed`, or
+`edit_note_display_failed`) turns it into `done` or `failed`. A tool reply therefore never claims a
+picture appeared when all that happened is that the revision was announced with its document id and
+revision, so the window can fetch exactly those bytes.
+
 ## Components, point identities and selections
 
 `splatmcp_core::components::AuthoringSet` holds the authoring layer of one document revision:
 opaque component ids, editable names, explicit local frames, free-form metadata, and a stable
 `PointId` per row. It sits **beside** the gaussian buffer, never inside it, so PLY import/export,
 edits and the Python bindings keep working on plain geometry.
+
+**`edit_splat` is the same transaction.** Editing the displayed document goes through
+`document_edit_batch`, so the long-standing tool honours component, point-id, saved-selection,
+frame and sphere targets, commits one revision, and preserves component membership and undo
+history. A detached source (`new`, or a `.ply` path) cannot resolve any of that, so those target
+fields are *refused* with the field names instead of being dropped - silently widening a
+component-targeted edit to the whole document is the failure this rule exists to prevent.
 
 Identity rules:
 
@@ -93,10 +113,23 @@ positive per-axis scale (`A = R·S`). Rotating or scaling a gaussian transforms 
 only way a rotated, anisotropic gaussian keeps its shape. Reflections (`det < 0`), singular
 transforms and degenerate quaternions are refused with `unsupported_transform`, never repaired.
 
-**Persistence.** Component metadata is written to a versioned `<file>.authoring.json` sidecar
-carrying the document id, the revision, the artifact checksum of the PLY it belongs to and the
-membership. Loading attaches it only when all of those match; anything else is reported and
-ignored. A plain PLY export keeps its documented guarantee: geometry only.
+**Persistence and reopen.** Component metadata is written to a versioned `<file>.authoring.json`
+sidecar carrying the document id, the revision, the artifact checksum of the PLY it belongs to,
+each component's frame, and its members as *both* identities and the rows they occupy. Opening a
+file always mints a new identity, so the association used on open is the content the record claims
+to describe: the artifact checksum plus the gaussian count. A record that matches is **restored**
+- every component rebuilt with fresh identities at the recorded rows - and a record that does not
+is **refused with a reason the reply carries**, never attached by file name and never merely
+printed. The restored-rows rule is what makes a restore possible at all: an identity belongs to
+the session that minted it, a row belongs to the file. A plain PLY export keeps its documented
+guarantee: geometry only.
+
+**A selection is visible.** A resolved selection is published as `splat://selection` with its
+handle, revision, document and count; the window asks the app for the marker geometry of exactly
+those point ids (a bounded PLY of bright markers, authored in document space) and draws it as a
+second layer over the document. The sidebar and a tool call therefore describe the same gaussians,
+and a highlight that belongs to another revision is cleared rather than left pointing at geometry
+that is no longer displayed.
 
 ## Surfaces
 
@@ -105,7 +138,10 @@ stdio MCP connection, so previews, history, the idempotency ledger and component
 all of them. Thin actions:
 
 - Tauri commands: `edit_batch`, `edit_preview`, `commit_preview`, `preview_splat_bytes`,
-  `edit_history`, `edit_undo`, `edit_redo`, `component_list`, `component_action`.
+  `edit_history`, `edit_undo`, `edit_redo`, `edit_note_displayed`, `edit_note_display_failed`,
+  `component_list`, `component_action`, `selection_highlight`, `splat_bytes_for_revision`
+  (document id *and* revision, so the window fetches the revision it was told about rather than
+  whatever is displayed).
 - Bridge methods: `document_edit_batch`, `document_commit_preview`, `document_history`,
   `document_undo`, `document_redo`, `document_components`.
 - MCP tools: `edit_batch`, `edit_history`, `splat_components`.

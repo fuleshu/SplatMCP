@@ -74,15 +74,26 @@ fn missing_app_message() -> String {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that set [`APP_PATH_ENV`].
+    ///
+    /// The variable is process-wide, so two tests that set it concurrently see each other's
+    /// value: one test's override becomes the other's expected answer. A lock makes the pairing
+    /// of set/read/clear atomic, which is what these tests actually mean to assert.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn the_environment_variable_wins_when_it_points_at_a_file() {
+        let _guard = env_lock();
         // The current test binary stands in for the app executable.
         let exe = std::env::current_exe().expect("the test binary has a path");
-        // SAFETY: single-threaded test setup for a process-wide variable, and no other
-        // test in this crate reads it.
+        // SAFETY: the lock serialises every test that touches this variable.
         unsafe { std::env::set_var(APP_PATH_ENV, &exe) };
-        assert_eq!(app_executable(), Some(exe.clone()));
+        let resolved = app_executable();
         unsafe { std::env::remove_var(APP_PATH_ENV) };
+        assert_eq!(resolved, Some(exe));
     }
 
     #[test]
@@ -94,6 +105,7 @@ mod tests {
 
     #[test]
     fn launching_a_missing_executable_is_an_error_not_a_panic() {
+        let _guard = env_lock();
         unsafe { std::env::set_var(APP_PATH_ENV, "C:/definitely/not/here.exe") };
         // A non-existent override is ignored, so the search falls back to the usual
         // locations; the call must still return cleanly either way.
