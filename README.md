@@ -70,6 +70,9 @@ those bytes as binary data.
 | `edit_batch` | apply several edit steps as **one transaction**: all of them commit as a single new revision or nothing changes. `dry_run` reports a preview (affected counts, before/after bounds, memory estimate) without committing; `preview_id` commits that candidate later and is refused if the document moved on. `operation_id` makes a retry after a lost response safe: an identical resend replays the recorded receipt, different content under the same id is refused. Undo/redo and the history are shared with the window |
 | `edit_history` | `status` reports undo/redo availability and the retained steps of the displayed document; `undo` and `redo` commit a **new** revision each, restoring geometry and component membership. A new edit clears the redo stack |
 | `splat_components` | named components and stable selections: `list`, `create`, `rename`, `remove`, `transform` (declares an explicit local frame; anisotropic gaussians are transformed through their covariance, and singular or reflecting frames are refused), `members` (bind a selection to a component), `apply_transform` (transform those members as a committed edit) and `select` (a revision-bound handle with count, bounds and a bounded sample) |
+| `splatmcp_capabilities` | what this build supports and the limits you are held to: capture, Gaussian and retention budgets, camera presets and projections, formats, diagnostic passes with their meanings, the documented workflow, and the gaps it does not fill. Numbers come from the component that enforces them; `client_budget_hint_bytes` is reported as a client hint, never as an app limit |
+| `capture_view` | capture **one** frame of one exact revision: the document, the pose and the image belong to one operation. Returns frame id, applied pose, view/projection matrices, viewport, format, checksum and restore outcome; captures are serialised on the shared viewer (a concurrent one is refused by name), camera and size changes are temporary unless `keep_camera` is set. See [docs/design/capture.md](docs/design/capture.md) |
+| `capture_views` | capture a **set** of labelled views from one pinned revision, with per-view and shared diagnostic passes (`rgb`, `alpha`, `component`, `scale_orientation`), an optional labelled contact sheet, an optional reference difference under your explicit alignment, and `output_dir` for the originals. A failed view is marked failed and never replaced |
 | `create_splat` | build a splat from a shape (`sphere`, `cube`, `plane`, `line`, `shell`, `ring`, `grid`) or explicit points, optionally write a `.ply`, and show it |
 | `edit_splat` | apply ordered edit steps (`translate`, `rotate`, `scale`, `set_radius`, `adjust_color`, `set_color`, `set_opacity`, `duplicate`, `remove`, `merge`) with an optional box, sphere, attribute, **component**, point-id or saved-selection target. The displayed document is edited through the same transaction as `edit_batch` - stable component/point ids, one revision, components and undo history preserved, `operation_id` makes a retry safe - while a `.ply` or `new` source is a detached buffer that refuses document-only targets instead of ignoring them |
 | `load_splat` | display an existing `.ply` and frame it; the import is strict, so a file that needs repair is refused with indexed diagnostics unless `repair: true` accepts it and the reply reports every change |
@@ -84,7 +87,10 @@ those bytes as binary data.
 | `cancel_python_job` | ask a job to stop; says whether execution is still unwinding |
 
 Every reply is compact JSON with three decimals, and a test keeps the listing within its
-context budget (`the_tool_listing_stays_within_its_context_budget`).
+context budget (`the_tool_listing_stays_within_its_context_budget`). The three tools above are the
+only ones that also return structured content; they and every failure follow
+[docs/design/mcp-contracts.md](docs/design/mcp-contracts.md), where the result envelope, the stable
+error codes and the capability/limit reporting are defined.
 
 The Python tools take a *recipe*, never geometry: a 500 000-Gaussian job is a few hundred
 bytes of request. See [docs/design/python-generation.md](docs/design/python-generation.md)

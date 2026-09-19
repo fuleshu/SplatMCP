@@ -21,6 +21,7 @@ const openButton = document.getElementById("open-button");
 const saveButton = document.getElementById("save-button");
 
 let viewer = null;
+let inspectionPanel = null;
 let viewerBridge = null;
 let pythonPanel = null;
 let componentsPanel = null;
@@ -106,6 +107,53 @@ async function startBridge() {
   const instance = await ensureViewer();
   viewerBridge = new ViewerBridge({ viewer: instance, invoke, listen });
   await viewerBridge.start();
+}
+
+/**
+ * Starts the inspection panel.
+ *
+ * A capture set is taken through the same code path the bridge uses, so the panel cannot quietly
+ * become a second camera controller: it builds a set, asks for it, and shows the manifest it got
+ * back - including the views that failed.
+ */
+async function startInspectionPanel() {
+  if (inspectionPanel || !invoke || !listen) {
+    return;
+  }
+  const { createInspectionPanel } = await import("./inspection-panel.js");
+  const { captureViews } = await import("./capture-set.js");
+  inspectionPanel = createInspectionPanel({
+    container: document.getElementById("inspection"),
+    onCapture: async (request) => {
+      const instance = await ensureViewer();
+      const displayed = instance.displayedRevision?.() ?? null;
+      const result = await captureViews(instance, {
+        set: {
+          document_id: displayed?.documentId ?? null,
+          expected_revision: displayed?.revision ?? null,
+          views: request.views,
+          shared: {},
+          contact_sheet: request.contact_sheet,
+          reference: request.reference,
+        },
+        holder: "the inspection panel",
+        displayed: displayed
+          ? { documentId: displayed.documentId, revision: displayed.revision }
+          : null,
+      });
+      return {
+        ...result,
+        summary: `${result.views.filter((view) => view.status === "captured").length} of ${
+          result.views.length
+        } views captured from revision ${result.document?.revision ?? "?"}`,
+      };
+    },
+    onReference: async () => {
+      // The reference is chosen through the app's own dialog and only ever read.
+      const chosen = await invoke("choose_reference_image").catch(() => null);
+      return chosen ?? null;
+    },
+  });
 }
 
 /** Starts the generation panel; it shares this window's viewer. */
@@ -248,4 +296,5 @@ if (!invoke) {
   startComponentsPanel().catch((error) => setStatus(`Component panel unavailable: ${error?.message || error}`));
   startJobBar().catch((error) => setStatus(`Job bar unavailable: ${error?.message || error}`));
   startDocumentState().catch((error) => setStatus(`Document state unavailable: ${error?.message || error}`));
+  startInspectionPanel().catch((error) => setStatus(`Inspection panel unavailable: ${error?.message || error}`));
 }

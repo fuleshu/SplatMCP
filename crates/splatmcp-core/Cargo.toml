@@ -10,4 +10,10 @@ name = "splatmcp_core"
 path = "src/lib.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[dev-dependencies]
+# Only the capture contract's tests read it back as JSON, where a u64 is checked to survive as
+# exact decimal digits.
+serde_json = "1"

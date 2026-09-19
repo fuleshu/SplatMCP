@@ -126,6 +126,13 @@ pub enum Method {
     ViewerSetCamera,
     /// Renders a frame and returns it as base64 PNG or JPEG.
     ViewerCapture,
+    /// Captures one frame of one pinned revision through the capture contract: the pose, the
+    /// viewport, the background and the restore policy are all part of the request, and the
+    /// reply carries the frame identity and the camera that was actually applied.
+    ViewerCaptureView,
+    /// Captures a set of views of ONE pinned revision, with optional diagnostic passes and a
+    /// contact sheet. Returns a per-view manifest; a failed view is marked, never replaced.
+    ViewerCaptureViews,
     /// Replaces the displayed splat from PLY bytes.
     ViewerLoadPly,
     /// Registers an immutable local asset from a file or a small inline payload.
@@ -156,6 +163,9 @@ pub enum Method {
     PublicationStatus,
     /// What the renderer can do, and the exact acceptance timeout it uses.
     PublicationCapabilities,
+    /// What this build supports and the limits it enforces, read from the components that
+    /// enforce them.
+    AppCapabilities,
     /// The PLY bytes of one revision of one document.
     DocumentGetPly,
     /// Bounded metadata of a document revision, without transferring its geometry.
@@ -195,6 +205,8 @@ impl Method {
                 | Method::ViewerGetCamera
                 | Method::ViewerSetCamera
                 | Method::ViewerCapture
+                | Method::ViewerCaptureView
+                | Method::ViewerCaptureViews
                 | Method::ViewerLoadPly
         )
     }
@@ -370,6 +382,115 @@ impl CaptureResult {
     pub fn decoded_len(&self) -> usize {
         self.data_base64.trim_end_matches('=').len() * 3 / 4
     }
+}
+
+/// Parameters of `viewer.capture_view`: the whole capture contract in one request.
+///
+/// The contract itself - pose forms, presets, projection, clipping, restore policy and limits -
+/// lives in `splatmcp_core::capture` and is not restated here, so the MCP tool, the app and the
+/// viewer cannot drift apart about what a capture means.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureViewRequest {
+    /// The capture: pinned revision, camera, viewport, encoding, background, timeout, restore.
+    pub spec: splatmcp_core::capture::CaptureSpec,
+    /// Who is capturing, reported to a later caller when the viewer is taken.
+    #[serde(default)]
+    pub holder: String,
+}
+
+/// Reply of `viewer.capture_view`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureViewReply {
+    /// Identity, viewport, applied camera, matrices, checksum inputs and restore outcome.
+    pub metadata: splatmcp_core::capture::FrameMetadata,
+    /// The frame, encoded. A frame above the declared budget is refused before it is rendered.
+    pub data_base64: String,
+    /// Checksum of the encoded frame, so a caller can trace the image it received.
+    pub checksum: splatmcp_core::capture::ChecksumSummary,
+    /// Diagnostic passes produced with the frame, when any were asked for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passes: Vec<splatmcp_core::capture::PassOutcome>,
+}
+
+/// Parameters of `viewer.capture_views`: one pinned revision, several views.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureViewsRequest {
+    /// The set: views, shared settings, contact sheet and optional reference.
+    pub set: splatmcp_core::capture::CaptureSetSpec,
+    /// Who is capturing, reported to a later caller when the viewer is taken.
+    #[serde(default)]
+    pub holder: String,
+    /// Absolute directory to write the original frames into, when the caller wants files
+    /// instead of inline images. Originals are the caller's, and nothing here rewrites them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
+}
+
+/// Reply of `viewer.capture_views`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureViewsReply {
+    /// The revision every view was rendered from.
+    pub document: splatmcp_core::capture::PinnedRevision,
+    /// Point count of the pinned revision, so an empty document is visible as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_count: Option<usize>,
+    /// Per-view outcomes, in the order they were requested.
+    pub views: Vec<CaptureViewOutcomeReply>,
+    /// The contact sheet, when one was asked for and at least one view was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_sheet: Option<ContactSheetReply>,
+    /// Passes this build cannot produce, reported once rather than per view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_passes: Vec<String>,
+    /// True when the run was cancelled; the remaining views are marked skipped.
+    #[serde(default)]
+    pub cancelled: bool,
+    /// Caveats the caller must not lose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// One view's result inside `viewer.capture_views`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureViewOutcomeReply {
+    pub label: String,
+    /// `captured`, `failed` or `skipped`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<splatmcp_core::capture::ChecksumSummary>,
+    /// The pose and matrices the renderer used for this frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<splatmcp_core::capture::AppliedCamera>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passes: Vec<splatmcp_core::capture::PassOutcome>,
+    /// Absolute path of the written original, when an `output_dir` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The composed contact sheet of a capture set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContactSheetReply {
+    pub data_base64: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub labels: bool,
+    pub checksum: splatmcp_core::capture::ChecksumSummary,
 }
 
 /// Parameters of `job.submit`.
@@ -1959,6 +2080,45 @@ pub struct PythonErrorReport {
     /// Stable machine readable code, e.g. `invalid_batch`.
     pub code: String,
     pub message: String,
+}
+
+/// Builds a validated `viewer.capture_view` request from a caller's spec.
+///
+/// The spec is parsed into the contract's own type and checked against the declared limits *here*,
+/// before it crosses the loopback: a refusal that has to travel to the app and back costs a round
+/// trip and reports a worse message than the one this returns.
+pub fn capture_view_request(
+    spec: Value,
+    holder: impl Into<String>,
+    limits: &splatmcp_core::capture::CaptureLimits,
+) -> std::result::Result<CaptureViewRequest, String> {
+    let spec: splatmcp_core::capture::CaptureSpec = serde_json::from_value(spec)
+        .map_err(|error| format!("invalid capture spec: {error}"))?;
+    spec.validate(limits).map_err(|error| error.to_string())?;
+    Ok(CaptureViewRequest {
+        spec,
+        holder: holder.into(),
+    })
+}
+
+/// Builds a validated `viewer.capture_views` request from a caller's set.
+///
+/// Only the rules the request itself can be judged by are applied: whether a diagnostic pass exists
+/// is a fact about the renderer, and the app that owns the renderer answers it.
+pub fn capture_views_request(
+    set: Value,
+    holder: impl Into<String>,
+    output_dir: Option<String>,
+    limits: &splatmcp_core::capture::CaptureLimits,
+) -> std::result::Result<CaptureViewsRequest, String> {
+    let set: splatmcp_core::capture::CaptureSetSpec = serde_json::from_value(set)
+        .map_err(|error| format!("invalid capture set: {error}"))?;
+    set.validate_shape(limits).map_err(|error| error.to_string())?;
+    Ok(CaptureViewsRequest {
+        set,
+        holder: holder.into(),
+        output_dir,
+    })
 }
 
 /// Convenience for a camera parameter that may arrive as null.

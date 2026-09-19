@@ -6,6 +6,7 @@
 
 pub mod asset;
 pub mod author;
+pub mod contract;
 pub mod edit;
 pub mod job;
 pub mod publication;

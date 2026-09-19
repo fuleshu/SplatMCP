@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
     BatchOpParams, BatchPointParams, BoundsInfo, BridgeDescriptor, BridgeServer, BridgeService,
-    CaptureRequest, CommitPreviewRequest, ComponentSummary, ComponentsReply, ComponentsRequest,
+    CaptureRequest, CaptureViewRequest, CaptureViewsRequest, CommitPreviewRequest, ComponentSummary, ComponentsReply, ComponentsRequest,
     DocumentPlyReply, DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply,
     EditBatchRequest, GetPlyRequest, Handler, HistoryReply, HistoryStepSummary, InspectRequest,
     InspectResult, InspectionSummary, LoadPlyRequest, Method, PlyImportSummary, PreviewSummary,
@@ -31,6 +31,7 @@ use splatmcp_core::{
 };
 
 use crate::assets::AssetHost;
+use crate::capture::CaptureHost;
 use crate::document::{self, AppState, Mutation, MutationKind, OutcomeInfo, SplatInfo};
 use crate::publication::PublicationHostState;
 use crate::python::PythonHost;
@@ -45,6 +46,9 @@ pub(crate) struct AppBridge {
     python: Arc<PythonHost>,
     /// The one asset registry this process hosts; the window uses the same one.
     assets: Arc<AssetHost>,
+    /// The one capture gate this process hosts: captures share the interactive viewer, so they
+    /// are admitted one at a time by whoever asks.
+    captures: Arc<CaptureHost>,
     started: Instant,
     app_version: String,
 }
@@ -74,6 +78,8 @@ impl Handler for AppBridge {
             Method::ViewerGetCamera | Method::ViewerSetCamera => {
                 self.viewer.request(method, params, VIEWER_TIMEOUT)
             }
+            Method::ViewerCaptureView => self.capture_view(params),
+            Method::ViewerCaptureViews => self.capture_views(params),
             Method::ViewerCapture => {
                 // Validate the request here so the viewer only sees well-formed input.
                 let request: CaptureRequest = if params.is_null() {
@@ -118,6 +124,10 @@ impl Handler for AppBridge {
             Method::JobCancel => self.job_cancel(params),
             Method::PublicationStatus => self.publication_status(params),
             Method::PublicationCapabilities => self.publication_capabilities(params),
+            Method::AppCapabilities => Ok(crate::capabilities::report(
+                &self.state(),
+                &self.captures,
+            )),
             Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
                     .map_err(|error| format!("invalid python run request: {error}"))?;
@@ -637,6 +647,38 @@ impl AppBridge {
     fn publication_capabilities(&self, params: Value) -> Result<Value, String> {
         let _ = params;
         Ok(crate::publication::capabilities_for(&self.app))
+    }
+
+    /// One frame of one pinned revision, through the capture contract.
+    ///
+    /// The request is validated and its revision pinned *before* the renderer is asked, so a
+    /// stale capture costs nothing and cannot return a frame of a scene the caller did not name.
+    pub(crate) fn capture_view(&self, params: Value) -> Result<Value, String> {
+        let request: CaptureViewRequest = if params.is_null() {
+            return Err("a capture needs a spec: revision, camera and viewport".to_owned());
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid capture request: {error}"))?
+        };
+        self.captures
+            .capture_view(&self.viewer, &self.state(), request)
+    }
+
+    /// A set of views of one pinned revision, with optional passes and a contact sheet.
+    pub(crate) fn capture_views(&self, params: Value) -> Result<Value, String> {
+        let request: CaptureViewsRequest = if params.is_null() {
+            return Err("a capture set needs at least one view".to_owned());
+        } else {
+            serde_json::from_value(params)
+                .map_err(|error| format!("invalid capture set: {error}"))?
+        };
+        self.captures
+            .capture_views(&self.viewer, &self.state(), request)
+    }
+
+    /// The document host, resolved from managed state so a command and the bridge share it.
+    fn state(&self) -> tauri::State<'_, crate::document::AppState> {
+        self.app.state::<crate::document::AppState>()
     }
 }
 
@@ -1436,11 +1478,13 @@ impl AppBridge {
         let viewer = app.state::<ViewerState>().0.clone();
         let python = app.state::<crate::python::PythonHostState>().0.clone();
         let assets = app.state::<crate::assets::AssetHostState>().0.clone();
+        let captures = app.state::<crate::capture::CaptureHostState>().0.clone();
         Self {
             app: app.clone(),
             viewer,
             python,
             assets,
+            captures,
             started: Instant::now(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1510,6 +1554,7 @@ pub fn start(
     viewer: Arc<Viewer>,
     python: Arc<PythonHost>,
     assets: Arc<AssetHost>,
+    captures: Arc<CaptureHost>,
 ) -> Result<BridgeHost, String> {
     let server = BridgeServer::bind().map_err(|error| error.to_string())?;
     let descriptor = server
@@ -1520,6 +1565,7 @@ pub fn start(
         viewer,
         python,
         assets,
+        captures,
         started: Instant::now(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
     });

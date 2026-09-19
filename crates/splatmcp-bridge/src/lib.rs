@@ -27,8 +27,11 @@ pub use protocol::{
     AssetReleaseRequest, AssetStatsSummary, AssetSummary, AssetUploadBeginRequest,
     AssetUploadChunkRequest, AssetUploadReply, AssetUploadRequest, AttributePatchParams,
     AuthoringNote, BatchOpParams, BatchPointParams, BoundsInfo, BoundsSummary, BridgeDescriptor,
-    CameraRequest, CameraState, CaptureRequest, CaptureResult, CommitPreviewRequest,
-    ComponentSummary, ComponentsReply, ComponentsRequest, DistributionSummary, DocumentPlyReply,
+    CameraRequest, CameraState, CaptureRequest, CaptureResult, CaptureViewOutcomeReply,
+    CaptureViewReply, CaptureViewRequest, CaptureViewsReply, CaptureViewsRequest,
+    CommitPreviewRequest,
+    ComponentSummary, ComponentsReply, ComponentsRequest, ContactSheetReply,
+    DistributionSummary, DocumentPlyReply,
     DocumentReply, DocumentSummary, DocumentTargetRequest, EditBatchReply, EditBatchRequest,
     ExportSummary, GetPlyRequest, HistoryReply, HistoryStepSummary, InspectRequest, InspectResult,
     InspectionSummary, JobAdmissionReply, JobCancelRequest, JobFailureSummary, JobListReply,
@@ -41,7 +44,10 @@ pub use protocol::{
     SelectionParams, SelectionSummary, SetComponentRequest, SideEffectSummary, StepSummary,
     TransformSummary, ViewerStatus,
 };
-pub use protocol::{asset_load_params, load_ply_params, replace_ply_params};
+pub use protocol::{
+    asset_load_params, capture_view_request, capture_views_request, load_ply_params,
+    replace_ply_params,
+};
 pub use server::{BridgeServer, BridgeService, Handler};
 pub use wire::{MAX_FRAME_BYTES, read_line_limited, read_message, write_message};
 

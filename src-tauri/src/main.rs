@@ -12,6 +12,8 @@
 mod assets;
 mod authoring;
 mod bridge;
+mod capabilities;
+mod capture;
 mod document;
 mod jobs;
 mod paths;
@@ -29,6 +31,19 @@ use splatmcp_core::{Expected, PlyImportPolicy};
 use tauri::ipc::Response;
 use tauri::{Manager, State};
 use viewer::Viewer;
+
+/// Picks a reference image for the inspection panel's overlay and difference view.
+///
+/// A dialog, not a path handed in by a request: the panel never invents a location, and the file is
+/// only ever read. Returns `None` when the user cancels.
+#[tauri::command]
+fn choose_reference_image() -> Result<Option<String>, String> {
+    Ok(rfd::FileDialog::new()
+        .set_title("Reference image")
+        .add_filter("Image (PNG, JPEG)", &["png", "jpg", "jpeg"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().to_string()))
+}
 
 /// Picks a PLY file, imports it and makes it the displayed document.
 
@@ -344,6 +359,7 @@ fn main() {
         .manage(bridge::BridgeHostState(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             open_splat,
+            choose_reference_image,
             reload_splat,
             current_splat_bytes,
             save_splat,
@@ -404,6 +420,10 @@ fn main() {
             // and resolve the same ids, so a payload is never copied to be shared.
             let assets = Arc::new(assets::AssetHost::default());
             app.manage(assets::AssetHostState(assets.clone()));
+            // One capture gate for the whole process: the window's own captures and an MCP
+            // caller's are admitted by the same rule.
+            let captures = std::sync::Arc::new(capture::CaptureHost::new());
+            app.manage(capture::CaptureHostState(captures.clone()));
             // One job service for the whole process: an import started from MCP and one
             // started from the window are the same queue, with the same states and receipts.
             let jobs = Arc::new(jobs::JobHost::default());
@@ -414,7 +434,7 @@ fn main() {
             app.manage(publication::PublicationHostState(publications.clone()));
             // A bridge failure must not stop the viewer from working: without a data
             // directory only the MCP half of the app is unavailable.
-            match bridge::start(&handle, viewer, python, assets) {
+            match bridge::start(&handle, viewer, python, assets, captures) {
                 Ok(host) => {
                     println!("splatmcp: bridge listening on 127.0.0.1:{}", host.port());
                     let state = app.state::<bridge::BridgeHostState>();

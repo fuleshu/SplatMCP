@@ -120,6 +120,80 @@
         flex: 1 1 auto;
         min-height: 0;
       }
+      /* Inspection panel: the capture set's settings, its sheet and its per-view outcome. */
+      .inspection {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        border-top: 1px solid var(--border);
+        padding-top: 10px;
+      }
+
+      .inspection-title {
+        margin: 0;
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--muted, #8b949e);
+      }
+
+      .inspection-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+      }
+
+      .inspection-row > span {
+        flex: 0 0 72px;
+      }
+
+      .inspection-row input[type="text"],
+      .inspection-row input[type="number"],
+      .inspection-row select {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .inspection-toggle {
+        gap: 6px;
+      }
+
+      .inspection-capture {
+        align-self: flex-start;
+      }
+
+      .inspection-status {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted, #8b949e);
+      }
+
+      .inspection-views-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        font-size: 12px;
+      }
+
+      .inspection-captured {
+        color: #7fb0a8;
+      }
+
+      .inspection-failed,
+      .inspection-skipped {
+        color: #e4b363;
+      }
+
+      .inspection-sheet {
+        max-width: 100%;
+        border: 1px solid var(--border);
+      }
+
+      .inspection-sheet:not([src]) {
+        display: none;
+      }
+
       .sidebar {
         flex: 0 0 320px;
         display: flex;
@@ -373,6 +447,7 @@
           </div>
           <p id="python-job"></p>
           <div id="python-log"></div>
+          <section id="inspection"></section>
         </aside>
         <main id="viewer">
           <p id="splat-status" hidden></p>

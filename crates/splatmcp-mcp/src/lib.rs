@@ -9,6 +9,7 @@
 
 pub mod app_launch;
 pub mod bridge;
+pub mod contract;
 pub mod tools;
 
 use std::sync::Arc;
@@ -26,7 +27,8 @@ use serde_json::{Value, json};
 use bridge::AppLink;
 use splatmcp_bridge::Method;
 use splatmcp_core::PlyImportPolicy;
-use tools::{asset, author, edit, job, publication, python, viewer};
+use contract::{Envelope, ErrorLayer, Failure, ToolOutput};
+use tools::{asset, author, contract as contract_tools, edit, job, publication, python, viewer};
 
 /// Shared state of the MCP service: the link to the desktop app.
 #[derive(Clone)]
@@ -610,6 +612,86 @@ impl SplatMcpServer {
         Ok(tool_text(value))
     }
 
+    /// Reports what this build supports and the limits it enforces.
+    #[tool(
+        description = "What this build supports and the limits you are held to: capture, Gaussian \
+                       and retention budgets, presets, projections, formats, passes, workflow and \
+                       unfilled gaps. Limits come from the components enforcing them.",
+        annotations(title = "Capabilities", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn splatmcp_capabilities(
+        &self,
+        Parameters(input): Parameters<contract_tools::CapabilitiesInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match contract_tools::capabilities(&self.link, &input) {
+            Ok(payload) => tool_envelope(contract_tools::envelope(payload), None),
+            Err(failure) => tool_failure(failure),
+        }
+    }
+
+    /// Captures one frame of one pinned revision, atomically.
+    #[tool(
+        description = "Capture ONE frame of one exact revision: pose, document and image belong to \
+                       one operation. Give camera (pose/orbit/preset/fit), viewport, format and \
+                       expected_revision; get the frame id, applied pose, matrices, checksum and \
+                       restore outcome. Concurrent captures are refused by name.",
+        annotations(
+            title = "Capture view",
+            read_only_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn capture_view(
+        &self,
+        Parameters(input): Parameters<contract_tools::CaptureViewInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match contract_tools::capture_view(&self.link, &input) {
+            Ok(outcome) => {
+                let correlation = contract_tools::capture_correlation(&outcome.frame);
+                let envelope = contract_tools::envelope(json!({
+                    "capture": outcome.frame,
+                    "note": "the frame is attached as image content when it was returned; \
+                             metadata_only requests identity without the image",
+                }))
+                .with_correlation(correlation);
+                let mut blocks = Vec::new();
+                if !outcome.data_base64.is_empty() {
+                    blocks.push(ContentBlock::image(
+                        outcome.data_base64.clone(),
+                        outcome.mime_type.clone(),
+                    ));
+                }
+                blocks.push(ContentBlock::text(envelope.to_text()));
+                Ok(CallToolResult::structured(envelope.to_value()).with_content(blocks))
+            }
+            Err(failure) => tool_failure(failure),
+        }
+    }
+
+    /// Captures a marked set of views from one pinned revision.
+    #[tool(
+        description = "Capture a SET of labelled views (front, sides, rear) from ONE pinned \
+                       revision: each reports a frame, checksum and camera, a failed view is marked \
+                       failed rather than replaced, and an optional contact sheet composes what \
+                       exists.",
+        annotations(
+            title = "Capture views",
+            read_only_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn capture_views(
+        &self,
+        Parameters(input): Parameters<contract_tools::CaptureViewsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match contract_tools::capture_views(&self.link, &input) {
+            Ok(payload) => tool_envelope(contract_tools::envelope(payload), None),
+            Err(failure) => tool_failure(failure),
+        }
+    }
+
     /// Renders the current view and returns it as an image.
     #[tool(
         description = "Render the SplatMCP window and return the frame as an image, optionally \
@@ -665,10 +747,53 @@ pub(crate) fn tool_json<T: serde::Serialize>(value: &T) -> Result<CallToolResult
 
 /// Turns a failure into a tool error the model can act on.
 ///
-/// The message is the whole payload: an MCP client shows it to the model, so it must
-/// already say what went wrong and what to do next.
+/// The message is classified: it is deliberately **not** wrapped as `internal_error`, because a
+/// stale revision, an unsupported mode or a timeout is not an internal failure and a client must be
+/// able to tell them apart. The classified form rides in the error data, so a caller sees both the
+/// code and the sentence that explains it.
 pub(crate) fn tool_error(message: String) -> McpError {
-    McpError::internal_error(message, None)
+    let failure = Failure::inferred(ErrorLayer::App, message);
+    McpError::invalid_params(failure.to_text(), Some(failure.to_value()))
+}
+
+/// A tool reply that succeeded, carrying structured content and readable text.
+pub(crate) fn tool_envelope(
+    envelope: Envelope,
+    extra: Option<Vec<ContentBlock>>,
+) -> Result<CallToolResult, McpError> {
+    let mut blocks = extra.unwrap_or_default();
+    blocks.push(ContentBlock::text(envelope.to_text()));
+    Ok(CallToolResult::structured(envelope.to_value()).with_content(blocks))
+}
+
+/// `CallToolResult::structured` already carries the JSON as text; a caller that adds blocks wants
+/// them beside it, not instead of it.
+trait WithContent {
+    fn with_content(self, blocks: Vec<ContentBlock>) -> Self;
+}
+
+impl WithContent for CallToolResult {
+    fn with_content(self, blocks: Vec<ContentBlock>) -> Self {
+        let mut result = self;
+        result.content.extend(blocks);
+        result
+    }
+}
+
+/// A tool reply that failed: an error result with structured content, not a protocol error.
+///
+/// MCP separates the two: a protocol error means the call never reached the tool, while a tool
+/// execution error means it ran and refused. A refusal has to stay a tool execution error so the
+/// client keeps the conversation, the correlation and the actionable fields.
+pub(crate) fn tool_failure(failure: Failure) -> Result<CallToolResult, McpError> {
+    let output = ToolOutput::failed(failure);
+    let text = output.envelope.to_text();
+    let structured = output.envelope.to_value();
+    // An error *tool result*, not a protocol error: the call reached the tool and was refused, and
+    // the client keeps the correlation and the actionable fields.
+    let mut result = CallToolResult::structured_error(structured);
+    result.content = vec![ContentBlock::text(text)];
+    Ok(result)
 }
 
 /// Compact JSON: no indentation, so a tool reply stays small.
@@ -726,8 +851,8 @@ mod tests {
 
         assert_eq!(
             tools.len(),
-            19,
-            "the surface is expected to hold nineteen tools"
+            22,
+            "the surface is expected to hold twenty-two tools"
         );
         let budget = tools.len() * LISTING_BUDGET_BYTES_PER_TOOL;
         assert!(

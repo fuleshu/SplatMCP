@@ -146,19 +146,43 @@ function check(label, condition, detail) {
 async function main() {
   installDom();
 
-  // The ordering rule itself, in isolation.
-  check("an older token is superseded by a newer one", isSuperseded(2, 3) === true);
-  check("an equal token is not a newer publication", isSuperseded(3, 3) === true);
-  check("a newer token is not superseded", isSuperseded(4, 3) === false);
-  check("a missing token cannot be compared", isSuperseded(null, 3) === false);
+  // The ordering rule itself, in isolation. Comparisons carry the document id, because tokens are
+  // per document: a global "highest token" dropped a new document's first publications.
+  const doc = "doc-1-1";
+  check(
+    "an older token is superseded by a newer one",
+    isSuperseded({ documentId: doc, token: 2 }, { documentId: doc, token: 3 }) === true,
+  );
+  check(
+    "an equal token is not a newer publication",
+    isSuperseded({ documentId: doc, token: 3 }, { documentId: doc, token: 3 }) === true,
+  );
+  check(
+    "a newer token is not superseded",
+    isSuperseded({ documentId: doc, token: 4 }, { documentId: doc, token: 3 }) === false,
+  );
+  check(
+    "a missing token cannot be compared",
+    isSuperseded({ documentId: doc, token: null }, { documentId: doc, token: 3 }) === false,
+  );
+  check(
+    "another document's token is never superseded",
+    isSuperseded({ documentId: "doc-2-1", token: 1 }, { documentId: doc, token: 4 }) === false,
+  );
   const order = new PublicationOrder();
-  order.observe(5);
-  check("an older event does not lower the bar", order.observe(4) === false && order.newest === 5);
-  check("the newest event holds the bar", order.observe(6) === true && order.newest === 6);
-  check("a token below the bar is stale", order.stale(5) === true && order.stale(6) === false);
-  order.markDisplayed(6);
-  check("a stale load may not display", order.mayDisplay(5) === false);
-  check("a newer load may display", order.mayDisplay(7) === true);
+  order.observe(doc, 5);
+  check(
+    "an older event does not lower the bar",
+    order.observe(doc, 4) === false && order.sequence(doc).newest === 5,
+  );
+  check(
+    "the newest event holds the bar",
+    order.observe(doc, 6) === true && order.sequence(doc).newest === 6,
+  );
+  check("a token below the bar is stale", order.stale(doc, 5) === true && order.stale(doc, 6) === false);
+  order.markDisplayed(doc, 6);
+  check("a stale load may not display", order.mayDisplay(doc, 5) === false);
+  check("a newer load may display", order.mayDisplay(doc, 7) === true);
 
   // The three repetitions a reviewer used, on both panels.
   for (const panel of ["components", "python"]) {

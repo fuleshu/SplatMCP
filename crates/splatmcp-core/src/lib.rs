@@ -17,6 +17,7 @@
 
 mod authoring;
 pub mod asset;
+pub mod capture;
 pub mod components;
 pub mod contract;
 pub mod document;
@@ -36,6 +37,15 @@ pub use asset::{
     AssetKind, AssetRegistry, AssetStats, AssetUpload, AttributePatch, PatchAttribute,
     PatchDescriptor, PatchDtype, PatchEncoding, PatchEndian, PatchError, PatchLayout, PatchReport,
     PatchShape, UploadProgress, UploadStatus, decode_points,
+};
+pub use capture::{
+    AppliedCamera, Axis, Background, CameraGeneration, CameraPreset, CameraSpec, CaptureError,
+    CaptureGate, CaptureLimits, CaptureManifest, CaptureSession, CaptureSetSpec, CaptureSpec,
+    CaptureStage, ContactSheetPlan, ContactSheetRequest, DiagnosticPass, DifferenceSummary,
+    FitTarget, FrameIdentity, FrameMetadata, Orbit, OutputFormat, PassCapability, PassSupport,
+    Pose, Projection, ReferenceAlignment, ReferenceSpec, RestoreDecision, RestorePolicy, Roi,
+    ViewOutcome, ViewSpec, ViewStatus, Viewport, compare_planes, pass_capabilities,
+    plan_contact_sheet,
 };
 pub use components::{
     AuthoringSet, Component, ComponentId, Frame, ImportSummary, LocalTransform, PointId,
