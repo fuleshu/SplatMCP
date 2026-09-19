@@ -22,10 +22,12 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+#[cfg(test)]
+use splatmcp_core::DocumentHandle;
 use splatmcp_core::{
-    AssetHandle, AssetKind, DocumentHandle, Expected, JobAdmission, JobBody, JobError, JobFailure,
-    JobId, JobKind, JobLimits, JobPhase, JobReceipt, JobRequest, JobResult, JobService, JobState,
-    JobView, LogLevel, Mutation, PlyImportPolicy, SideEffectState,
+    AssetHandle, AssetKind, Expected, JobAdmission, JobBody, JobError, JobFailure, JobId, JobKind,
+    JobLimits, JobPhase, JobReceipt, JobRequest, JobResult, JobService, JobView, LogLevel, Mutation,
+    PlyImportPolicy, SideEffectState,
 };
 use tauri::{AppHandle, Manager};
 
@@ -589,6 +591,7 @@ pub fn admission_json(admission: &JobAdmission) -> Value {
 }
 
 /// The document handle a receipt names, when it names one.
+#[cfg(test)]
 pub fn receipt_handle(receipt: &JobReceipt) -> Option<DocumentHandle> {
     match &receipt.result {
         JobResult::Document {
@@ -602,6 +605,7 @@ pub fn receipt_handle(receipt: &JobReceipt) -> Option<DocumentHandle> {
 }
 
 /// One line describing how a job ended, for the window and for a caller's log.
+#[cfg(test)]
 pub fn completion_summary(receipt: &JobReceipt) -> String {
     match receipt.state {
         splatmcp_core::JobState::Committed => format!("committed {}", receipt.result.describe()),
@@ -628,6 +632,7 @@ pub fn completion_summary(receipt: &JobReceipt) -> String {
 }
 
 /// True when a failure means the caller should look for a different job rather than retry.
+#[cfg(test)]
 pub fn is_unknown_job(error: &JobError) -> bool {
     matches!(
         error,
@@ -704,7 +709,14 @@ pub fn job_inspect(app: AppHandle, request: Value) -> Result<Value, String> {
 
 /// Tauri command: one job's status and the log lines after `log_after`.
 #[tauri::command]
-pub fn job_status(host: tauri::State<'_, JobHostState>, request: Value) -> Result<Value, String> {
+pub fn job_status(
+    app: AppHandle,
+    host: tauri::State<'_, JobHostState>,
+    request: Value,
+) -> Result<Value, String> {
+    // A job's display field is a promise; reading it is where the acknowledgement, timeout,
+    // failure or supersede that arrived meanwhile is applied.
+    crate::publication::apply_publication_notices(&app);
     let job_id = request
         .get("job_id")
         .and_then(Value::as_str)
@@ -727,7 +739,12 @@ pub fn job_status(host: tauri::State<'_, JobHostState>, request: Value) -> Resul
 
 /// Tauri command: the newest jobs, newest first, for the window's job list.
 #[tauri::command]
-pub fn job_list(host: tauri::State<'_, JobHostState>, limit: Option<usize>) -> Value {
+pub fn job_list(
+    app: AppHandle,
+    host: tauri::State<'_, JobHostState>,
+    limit: Option<usize>,
+) -> Value {
+    crate::publication::apply_publication_notices(&app);
     let limit = limit.unwrap_or(10).min(64);
     let jobs: Vec<Value> = host.0.recent(limit).iter().map(receipt_json).collect();
     json!({ "jobs": jobs, "stats": stats_json(&host.0) })
@@ -768,6 +785,7 @@ pub fn job_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splatmcp_core::JobState;
 
     #[test]
     fn an_admission_reports_what_was_accepted() {

@@ -532,6 +532,10 @@ impl AppBridge {
     fn job_status(&self, params: Value) -> Result<Value, String> {
         let request: splatmcp_bridge::JobStatusRequest = serde_json::from_value(params)
             .map_err(|error| format!("invalid job.status request: {error}"))?;
+        // Reading a job is where a display outcome that arrived since it was admitted is applied,
+        // so `display` reflects the acknowledgement, timeout, failure or supersede rather than the
+        // value recorded at submission time.
+        crate::publication::apply_publication_notices(&self.app);
         let jobs = self.app.state::<crate::jobs::JobHostState>().0.clone();
         let job_id = crate::jobs::parse_job_id(&request.job_id)?;
         let view = jobs
@@ -547,6 +551,7 @@ impl AppBridge {
 
     /// The newest jobs with the service's counts and limits.
     fn job_list(&self, params: Value) -> Result<Value, String> {
+        crate::publication::apply_publication_notices(&self.app);
         let request: splatmcp_bridge::JobListRequest = if params.is_null() {
             splatmcp_bridge::JobListRequest::default()
         } else {
@@ -591,6 +596,9 @@ impl AppBridge {
             serde_json::from_value(params)
                 .map_err(|error| format!("invalid publication.status request: {error}"))?
         };
+        // Reading a status is also where an expired publication is applied to the jobs that
+        // announced it, so a caller sees the timeout after asking once.
+        crate::publication::apply_publication_notices(&self.app);
         let publications = self
             .app
             .state::<crate::publication::PublicationHostState>()
@@ -622,37 +630,18 @@ impl AppBridge {
             .map_err(|error| error.to_string())
     }
 
-    /// What the renderer can do, with the viewer's own report of what it is showing.
+    /// What the renderer can do, assembled from the app's own records.
+    ///
+    /// Deliberately the same builder the Tauri command uses: a caller must never see two
+    /// contradictory answers about which revision is displayed.
     fn publication_capabilities(&self, params: Value) -> Result<Value, String> {
         let _ = params;
-        let publications = self
-            .app
-            .state::<crate::publication::PublicationHostState>()
-            .0
-            .clone();
-        // The viewer's own status, so the capabilities describe the real renderer rather than
-        // an assumption about it. A viewer that cannot answer is reported as not ready.
-        let reported = self
-            .viewer
-            .request(Method::ViewerStatus, Value::Null, VIEWER_TIMEOUT)
-            .ok()
-            .and_then(|value| serde_json::from_value::<ViewerStatus>(value).ok());
-        let (displayed_revision, point_count, viewer_ready) = match reported {
-            Some(status) => (
-                status.document.as_ref().map(|document| document.revision),
-                status.point_count,
-                status.viewer_ready,
-            ),
-            None => (None, 0, false),
-        };
-        let capabilities = publications.capabilities(displayed_revision, point_count);
-        let mut reply = splatmcp_bridge::PublicationCapabilitiesReply::from(&capabilities);
-        reply.viewer_ready = viewer_ready;
-        serde_json::to_value(reply).map_err(|error| error.to_string())
+        Ok(crate::publication::capabilities_for(&self.app))
     }
 }
 
-/// Event the app emits when an edit transaction committed a revision that should be shown.///
+/// Event the app emits when an edit transaction committed a revision that should be shown.
+///
 /// Deliberately separate from the Python job's `splat://revision`: a transaction is not a job,
 /// and a viewer acknowledgement of a job's revision must not be confused with an edit.
 pub const EDIT_REVISION_EVENT: &str = "splat://edit-revision";

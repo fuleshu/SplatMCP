@@ -6,8 +6,9 @@
 //! B; a hidden commit must move the committed revision without claiming to be displayed; a
 //! stalled publication must expire; and switching documents must move the screen.
 
-use super::tracker::{ACK_TIMEOUT_MS, MAX_FAILURES, MAX_HISTORY};
+use super::tracker::{ACK_TIMEOUT_MS, MAX_FAILURES, MAX_HISTORY, MAX_NOTICES};
 use super::*;
+use crate::DocumentId;
 
 /// A tracker with a fixed clock and a timeout the tests can drive.
 fn tracker() -> PublicationTracker {
@@ -213,6 +214,58 @@ fn switching_documents_moves_the_screen() {
 }
 
 #[test]
+fn a_new_documents_first_publication_is_never_stale_against_the_previous_document() {
+    // The reported defect, as a state-machine fact: document A had reached token 4 and was
+    // displayed, and document B's first publication - token 1 - was then treated as too old to
+    // display, so B's revisions 1..5 never reached the screen and their requests timed out. Tokens
+    // are minted per document, so nothing about A can make B's own request stale.
+    let tracker = tracker();
+    for revision in 1..=4u64 {
+        let request = begin(
+            &tracker,
+            0,
+            "doc-1-1",
+            revision,
+            PublicationSource::Committed,
+            false,
+        )
+        .unwrap();
+        assert_eq!(request.token, revision, "A's tokens count up on their own");
+    }
+    let last_a = begin(&tracker, 0, "doc-1-1", 5, PublicationSource::Committed, false).unwrap();
+    assert_eq!(last_a.token, 5);
+    acknowledge(&tracker, 0, "doc-1-1", 5, last_a.token).unwrap();
+    assert_eq!(
+        status(&tracker, 0, "doc-1-1").unwrap().unwrap().displayed_revision,
+        Some(5)
+    );
+
+    // B's very first request: token 1, while A's highest is 5. It is minted, it is displayable,
+    // and one acknowledgement is all it takes.
+    let first_b = begin(
+        &tracker,
+        0,
+        "doc-1-2",
+        1,
+        PublicationSource::Committed,
+        true,
+    )
+    .unwrap();
+    assert_eq!(first_b.token, 1, "B's tokens are its own sequence");
+    assert_eq!(
+        status(&tracker, 0, "doc-1-2").unwrap().unwrap().pending.map(|p| p.token),
+        Some(1)
+    );
+    let shown = acknowledge(&tracker, 0, "doc-1-2", 1, first_b.token).unwrap();
+    assert_eq!(shown.displayed_revision, Some(1));
+    assert!(shown.is_current());
+    // A is no longer on screen, and it says so rather than claiming to be current.
+    let read_a = status(&tracker, 0, "doc-1-1").unwrap().unwrap();
+    assert_eq!(read_a.displayed_revision, None);
+    assert!(read_a.display_lagging);
+}
+
+#[test]
 fn a_document_with_a_commit_but_no_publication_says_another_document_is_displayed() {
     let tracker = tracker();
     let a = begin(&tracker, 0, "doc-1-1", 1, PublicationSource::Committed, true).unwrap();
@@ -296,20 +349,27 @@ fn a_failure_for_something_not_in_flight_does_not_drop_the_real_request() {
 }
 
 #[test]
-fn one_document_never_disturbs_another_request_in_flight() {
+fn one_document_never_acknowledges_another_documents_request() {
     let tracker = tracker();
     let one = begin(&tracker, 0, "doc-1-1", 1, PublicationSource::Committed, true).unwrap();
     let other = begin(&tracker, 0, "doc-1-2", 1, PublicationSource::Committed, true).unwrap();
     acknowledge(&tracker, 0, "doc-1-2", 1, other.token).unwrap();
-    // The first document's request is still in flight, and a foreign acknowledgement is refused.
+    // A foreign acknowledgement is refused whatever it names.
     let error = acknowledge(&tracker, 0, "doc-1-2", 1, one.token).unwrap_err();
     assert_eq!(error.code(), "stale_acknowledgement");
+    // Document 1's request is superseded rather than left pending: it can never be displayed now
+    // that another document owns the screen, and a caller must not be told to wait for it.
     let read = status(&tracker, 0, "doc-1-1").unwrap().unwrap();
+    assert!(
+        read.pending.is_none(),
+        "a request for a document that is not on screen is not still in flight"
+    );
     assert_eq!(
-        read.pending.as_ref().map(|p| p.document_id.as_str()),
-        Some("doc-1-1")
+        read.last.as_ref().map(|(_, outcome)| outcome.clone()),
+        Some(PublicationOutcome::Skipped { superseded_by: None })
     );
     assert_eq!(read.displayed_revision, None);
+    assert!(read.displayed_elsewhere);
 
     let all = tracker.all().unwrap();
     assert_eq!(all.len(), 2);
@@ -371,6 +431,117 @@ fn a_closed_document_forgets_its_state() {
     assert_eq!(read.displayed_revision, None);
     assert!(read.skipped.is_empty() && read.failures.is_empty());
     assert!(!read.display_lagging);
+}
+
+#[test]
+fn a_superseded_request_is_reported_as_such_and_not_left_pending() {
+    // The reported defect: a request that another publication replaced stayed "pending" forever, so
+    // anything that recorded a promise about it never learned the outcome.
+    let tracker = tracker();
+    begin(&tracker, 0, "doc-1-1", 1, PublicationSource::Committed, true);
+    begin(&tracker, 0, "doc-1-1", 2, PublicationSource::Committed, false);
+    let notices = tracker.take_notices().unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].document_id, "doc-1-1");
+    assert_eq!(notices[0].revision, 1, "the superseded revision, not the new one");
+    assert_eq!(notices[0].outcome, PublicationNoticeOutcome::Superseded);
+    assert!(notices[0].describe().contains("1"));
+
+    // Reading them drains the queue: an outcome is applied once.
+    assert!(tracker.take_notices().unwrap().is_empty());
+}
+
+#[test]
+fn every_publication_outcome_reaches_the_app_once() {
+    let tracker = tracker();
+    // Displayed.
+    let shown = begin(&tracker, 0, "doc-1-1", 3, PublicationSource::Committed, true).unwrap();
+    acknowledge(&tracker, 0, "doc-1-1", 3, shown.token).unwrap();
+    let notices = tracker.take_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].outcome, PublicationNoticeOutcome::Displayed);
+    assert_eq!(notices[0].revision, 3);
+
+    // Failed.
+    begin(&tracker, 0, "doc-1-1", 4, PublicationSource::Committed, false);
+    fail(&tracker, 0, "doc-1-1", 4, "GPU upload failed").unwrap();
+    let notices = tracker.take_notices().unwrap();
+    assert_eq!(
+        notices[0].outcome,
+        PublicationNoticeOutcome::Failed("GPU upload failed".to_owned())
+    );
+    assert!(notices[0].describe().contains("GPU upload failed"));
+
+    // Timed out: raised by the sweep on a read, not only by an explicit timeout.
+    begin(&tracker, 1_000, "doc-1-1", 5, PublicationSource::Committed, false);
+    let _ = status(&tracker, 1_000 + ACK_TIMEOUT_MS + 1, "doc-1-1").unwrap();
+    let notices = tracker.take_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].revision, 5);
+    assert_eq!(notices[0].outcome, PublicationNoticeOutcome::TimedOut);
+
+    // A preview frame is displayed, but no notice is raised for the revision it carries: a preview
+    // is not that revision's geometry, and a job waiting to display revision 5 must not be told it
+    // appeared because a dry run was shown.
+    let preview = begin(&tracker, 1_000, "doc-1-1", 5, PublicationSource::Preview, false).unwrap();
+    acknowledge(&tracker, 1_000, "doc-1-1", 5, preview.token).unwrap();
+    assert!(tracker.take_notices().unwrap().is_empty());
+}
+
+#[test]
+fn another_document_taking_the_screen_supersedes_the_request_left_behind() {
+    // A request for document A can never be displayed once B owns the screen: it is superseded, not
+    // pending, so nothing waits for an acknowledgement that cannot come.
+    let tracker = tracker();
+    let a = begin(&tracker, 0, "doc-1-1", 1, PublicationSource::Committed, true).unwrap();
+    acknowledge(&tracker, 0, "doc-1-1", 1, a.token).unwrap();
+    let _ = tracker.take_notices().unwrap();
+
+    // A's next revision is announced but not acknowledged.
+    begin(&tracker, 0, "doc-1-1", 2, PublicationSource::Committed, false);
+    // B's publication is displayed instead.
+    let b = begin(&tracker, 0, "doc-1-2", 1, PublicationSource::Committed, true).unwrap();
+    acknowledge(&tracker, 0, "doc-1-2", 1, b.token).unwrap();
+
+    let notices = tracker.take_notices().unwrap();
+    let superseded: Vec<&PublicationNotice> = notices
+        .iter()
+        .filter(|notice| notice.outcome == PublicationNoticeOutcome::Superseded)
+        .collect();
+    assert_eq!(superseded.len(), 1, "{notices:?}");
+    assert_eq!(superseded[0].document_id, "doc-1-1");
+    assert_eq!(superseded[0].revision, 2);
+
+    let read_a = status(&tracker, 0, "doc-1-1").unwrap().unwrap();
+    assert!(read_a.pending.is_none(), "A is not waiting for anything");
+    assert_eq!(read_a.displayed_revision, None, "A is not on screen");
+    assert!(read_a.displayed_elsewhere);
+    // And a later read reports no stall either.
+    let read_a = status(&tracker, ACK_TIMEOUT_MS + 10, "doc-1-1").unwrap().unwrap();
+    assert_eq!(
+        read_a.last.as_ref().map(|(_, outcome)| outcome.clone()),
+        Some(PublicationOutcome::Skipped { superseded_by: None })
+    );
+}
+
+#[test]
+fn the_notice_queue_is_bounded_and_a_closed_document_clears_its_own() {
+    let tracker = tracker();
+    for revision in 1..=(MAX_NOTICES as u64 + 5) {
+        begin(&tracker, 0, "doc-1-1", revision, PublicationSource::Committed, false);
+    }
+    let notices = tracker.take_notices().unwrap();
+    assert_eq!(notices.len(), MAX_NOTICES);
+    assert_eq!(
+        notices.last().unwrap().revision,
+        MAX_NOTICES as u64 + 4,
+        "the newest outcomes are the ones kept"
+    );
+
+    // A forgotten document's unread notices go with it: its ids are not resolvable any more.
+    let handle = DocumentId::mint(0x1, 1);
+    tracker.forget(handle.as_str()).unwrap();
+    assert_eq!(status(&tracker, 0, handle.as_str()).unwrap(), None);
 }
 
 #[test]

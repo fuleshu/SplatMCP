@@ -9,6 +9,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use super::*;
+use crate::document::{DocumentHandle, DocumentId};
 
 /// A service with small bounds, so retention and queue behaviour are testable.
 fn service() -> JobService {
@@ -672,6 +673,125 @@ fn side_effects_are_recorded_separately_from_the_commit() {
     assert_eq!(receipt.export.as_str(), "failed");
     assert_eq!(receipt.display.as_str(), "pending");
     assert!(matches!(receipt.export, SideEffectState::Failed(ref reason) if reason == "disk full"));
+}
+
+#[test]
+fn a_job_display_outcome_converges_instead_of_freezing_at_pending() {
+    // The reported defect: a job that announced its revision kept `display: "pending"` after the
+    // window had acknowledged it, after a timeout, and after a newer publication skipped it.
+    let service = service();
+    let four = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 4);
+    let admission = service
+        .submit(
+            JobRequest::new(JobKind::Edit, "edit_batch")
+                .with_document("doc-4f2a-1", Some(3)),
+            Box::new(|context| {
+                let result = context.commit(|| {
+                    Ok(JobResult::Document {
+                        document_id: "doc-4f2a-1".to_owned(),
+                        revision: 4,
+                        point_count: 12,
+                    })
+                })?;
+                // Announcing is not displaying: the job records a promise.
+                context.note_side_effect("display", SideEffectState::Pending);
+                Ok(result)
+            }),
+        )
+        .unwrap();
+    let receipt = service
+        .wait(&admission.job_id, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(receipt.display, SideEffectState::Pending);
+
+    // The window acknowledges it: the stored receipt converges.
+    assert_eq!(service.note_display(&four, SideEffectState::Done), 1);
+    let receipt = service.status(&admission.job_id).unwrap();
+    assert_eq!(receipt.display, SideEffectState::Done);
+    assert_eq!(receipt.display.as_str(), "done");
+
+    // A late duplicate notice does not rewrite a recorded outcome.
+    assert_eq!(service.note_display(&four, SideEffectState::TimedOut), 0);
+    assert_eq!(
+        service.status(&admission.job_id).unwrap().display,
+        SideEffectState::Done
+    );
+}
+
+#[test]
+fn a_display_notice_only_touches_the_revision_it_names() {
+    let service = service();
+    let mut jobs = Vec::new();
+    for revision in [4u64, 5] {
+        let admission = service
+            .submit(
+                JobRequest::new(JobKind::Edit, "edit_batch")
+                    .with_document("doc-4f2a-1", Some(revision - 1)),
+                Box::new(move |context| {
+                    let result = context.commit(|| {
+                        Ok(JobResult::Document {
+                            document_id: "doc-4f2a-1".to_owned(),
+                            revision,
+                            point_count: 12,
+                        })
+                    })?;
+                    context.note_side_effect("display", SideEffectState::Pending);
+                    Ok(result)
+                }),
+            )
+            .unwrap();
+        service
+            .wait(&admission.job_id, Duration::from_secs(5))
+            .unwrap();
+        jobs.push(admission.job_id);
+    }
+
+    // Revision 5's display times out; revision 4's job is untouched.
+    let five = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 5);
+    assert_eq!(service.note_display(&five, SideEffectState::TimedOut), 1);
+    assert_eq!(
+        service.status(&jobs[1]).unwrap().display.as_str(),
+        "timed_out"
+    );
+    assert_eq!(service.status(&jobs[0]).unwrap().display.as_str(), "pending");
+
+    // Superseded is a state of its own, and a different document's handle matches nothing.
+    let six = DocumentHandle::new(DocumentId::mint(0x4f2a, 2), 4);
+    assert_eq!(service.note_display(&six, SideEffectState::Superseded), 0);
+    let four = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 4);
+    assert_eq!(service.note_display(&four, SideEffectState::Superseded), 1);
+    assert_eq!(
+        service.status(&jobs[0]).unwrap().display.as_str(),
+        "superseded"
+    );
+}
+
+#[test]
+fn an_export_outcome_is_not_disturbed_by_a_display_notice() {
+    let service = service();
+    let admission = service
+        .submit(
+            JobRequest::new(JobKind::Export, "export").with_path("C:/out/scene.ply"),
+            Box::new(|context| {
+                context.note_side_effect("export", SideEffectState::Pending);
+                Ok(JobResult::Artifact {
+                    path: "C:/out/scene.ply".to_owned(),
+                    checksum: "fnv1a64:1".to_owned(),
+                    bytes: 8,
+                })
+            }),
+        )
+        .unwrap();
+    service
+        .wait(&admission.job_id, Duration::from_secs(5))
+        .unwrap();
+    // A display notice cannot match a receipt whose result is an artifact, and it must not touch
+    // the export slot either.
+    let handle = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 1);
+    assert_eq!(service.note_display(&handle, SideEffectState::Done), 0);
+    let receipt = service.status(&admission.job_id).unwrap();
+    assert_eq!(receipt.export, SideEffectState::Pending);
+    assert_eq!(receipt.display.as_str(), "not_requested");
 }
 
 #[test]

@@ -36,6 +36,21 @@ A stale target is a concurrency outcome, not a generic failure:
 The job counters keep `conflicted` separate from `failed` for the same reason the transaction
 receipts do.
 
+## A promised display outcome converges
+
+A job that announces a revision records `display: "pending"`, because only the window can say
+whether a frame appeared. The publication tracker raises one notice per request —
+`displayed`, `failed`, `timed_out` or `superseded` — and the app applies it to every retained job
+whose *result* names that `(document, revision)` and whose display is still pending. The state
+becomes `done`, `failed`, `timed_out` or `superseded`; a recorded outcome is never overwritten by
+a late notice, and a notice for a different revision or document touches nothing.
+
+The application happens on every read (`job.status`, `job.list`, `publication.status`, the
+Tauri job commands, `python.job` and an acknowledgement), so a caller sees the current answer
+after asking once instead of reading the value recorded at submission time. `timed_out` is what a
+`pending` display becomes when the tracker's acknowledgement timeout passes — which is why the
+timeout sweep must run on a read, not only in the background.
+
 ## Downstream outcomes are recorded even when they fail
 
 An export that was requested and did not complete records `export: "failed"` on the receipt before

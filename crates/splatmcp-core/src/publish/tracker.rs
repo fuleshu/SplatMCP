@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use super::{
-    PUBLICATION_CONTRACT_VERSION, PublicationError, PublicationOutcome, PublicationRequest,
-    PublicationSource, PublicationStatus,
+    PUBLICATION_CONTRACT_VERSION, PublicationError, PublicationNotice, PublicationNoticeOutcome,
+    PublicationOutcome, PublicationRequest, PublicationSource, PublicationStatus,
 };
 
 /// How many superseded or failed requests one document remembers.
@@ -39,6 +39,11 @@ use super::{
 pub(crate) const MAX_HISTORY: usize = 32;
 /// How many failed requests are kept, with their reasons.
 pub(crate) const MAX_FAILURES: usize = 8;
+/// How many publication notices one document queues before the oldest are dropped.
+///
+/// A notice is consumed by the app as soon as it is read, so this bound only matters when nothing
+/// reads them for a while.
+pub(crate) const MAX_NOTICES: usize = 64;
 
 /// How long a publication may wait for an acknowledgement before it is reported as timed out.
 ///
@@ -64,6 +69,8 @@ pub struct DocumentPublication {
     skipped: Vec<u64>,
     /// Revisions the viewer could not display, newest first, with the reason.
     failures: Vec<(u64, String)>,
+    /// Outcomes this document has produced that the rest of the app has not read yet.
+    notices: Vec<PublicationNotice>,
 }
 
 impl DocumentPublication {
@@ -79,6 +86,7 @@ impl DocumentPublication {
             last: None,
             skipped: Vec::new(),
             failures: Vec::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -157,6 +165,7 @@ impl DocumentPublication {
                 },
             ));
             self.remember_skipped(previous.revision);
+            self.notice(previous.revision, PublicationNoticeOutcome::Superseded);
         }
         self.pending = Some(request.clone());
         self.pending_since_ms = Some(now_ms);
@@ -200,9 +209,11 @@ impl DocumentPublication {
         let request = self.pending.take().expect("matched above");
         self.pending_since_ms = None;
         // A preview candidate is not a revision: the caller sees the frame, but the app's
-        // displayed *revision* stays where it was.
+        // displayed *revision* stays where it was - and no notice is raised for it, because a
+        // preview of revision N does not mean revision N's geometry is on screen.
         if request.source == PublicationSource::Committed {
             self.displayed_revision = Some(request.revision);
+            self.notice(request.revision, PublicationNoticeOutcome::Displayed);
         }
         self.last = Some((request, PublicationOutcome::Displayed));
         Ok(self.status())
@@ -224,7 +235,8 @@ impl DocumentPublication {
             Some(request) if request.revision == revision => {
                 self.failures.insert(0, (revision, reason.clone()));
                 self.failures.truncate(MAX_FAILURES);
-                self.last = Some((request, PublicationOutcome::Failed(reason)));
+                self.last = Some((request, PublicationOutcome::Failed(reason.clone())));
+                self.notice(revision, PublicationNoticeOutcome::Failed(reason));
             }
             Some(request) => {
                 // A failure for something that is not in flight: keep the flight intact and
@@ -242,6 +254,7 @@ impl DocumentPublication {
         let pending = self.pending.take()?;
         self.pending_since_ms = None;
         self.last = Some((pending.clone(), PublicationOutcome::TimedOut));
+        self.notice(pending.revision, PublicationNoticeOutcome::TimedOut);
         Some(pending)
     }
 
@@ -262,11 +275,36 @@ impl DocumentPublication {
     /// The viewer shows exactly one document. When a publication for another document is
     /// displayed, this entry stops reporting a displayed revision - it is not on screen - while
     /// keeping its committed revision, so the status reads "committed here, showing elsewhere".
+    ///
+    /// Any request still in flight for this document is dropped as superseded: it can never be
+    /// displayed now, and leaving it pending would report a stall that is really a switch.
     pub fn relinquish_screen(&mut self) -> bool {
-        if self.displayed_revision.take().is_some() {
-            return true;
+        let mut changed = self.displayed_revision.take().is_some();
+        if let Some(pending) = self.pending.take() {
+            self.pending_since_ms = None;
+            self.last = Some((pending.clone(), PublicationOutcome::Skipped { superseded_by: None }));
+            self.remember_skipped(pending.revision);
+            self.notice(pending.revision, PublicationNoticeOutcome::Superseded);
+            changed = true;
         }
-        false
+        changed
+    }
+
+    /// Takes the outcomes this document has produced and not yet handed over.
+    pub fn take_notices(&mut self) -> Vec<PublicationNotice> {
+        std::mem::take(&mut self.notices)
+    }
+
+    /// Queues one outcome for the rest of the app, newest last, bounded.
+    fn notice(&mut self, revision: u64, outcome: PublicationNoticeOutcome) {
+        if self.notices.len() >= MAX_NOTICES {
+            self.notices.remove(0);
+        }
+        self.notices.push(PublicationNotice {
+            document_id: self.document_id.clone(),
+            revision,
+            outcome,
+        });
     }
 
     /// The current status, with the two revisions kept separate.
@@ -304,6 +342,7 @@ impl DocumentPublication {
         self.last = None;
         self.skipped.clear();
         self.failures.clear();
+        self.notices.clear();
     }
 
     fn remember_skipped(&mut self, revision: u64) {
@@ -328,12 +367,14 @@ pub struct PublicationTracker {
     documents: Mutex<TrackerState>,
 }
 
-/// Tracker contents: the entries plus which of them owns the screen.
+/// Tracker contents: the entries, which of them owns the screen, and the outcomes nobody has read.
 #[derive(Default)]
 struct TrackerState {
     documents: BTreeMap<String, DocumentPublication>,
     /// The document a publication was last displayed for, if any.
     active: Option<String>,
+    /// Outcomes produced since the last read, oldest first, bounded like the per-document queues.
+    notices: Vec<PublicationNotice>,
 }
 
 impl Default for PublicationTracker {
@@ -371,16 +412,37 @@ impl PublicationTracker {
             .documents
             .entry(document_id.to_owned())
             .or_insert_with(|| DocumentPublication::new(document_id));
-        Ok(work(entry))
+        let value = work(entry);
+        Self::drain(&mut state, document_id);
+        Ok(value)
+    }
+
+    /// Moves one document's unread outcomes into the tracker's queue.
+    fn drain(state: &mut TrackerState, document_id: &str) {
+        let Some(entry) = state.documents.get_mut(document_id) else {
+            return;
+        };
+        for notice in entry.take_notices() {
+            if state.notices.len() >= MAX_NOTICES {
+                state.notices.remove(0);
+            }
+            state.notices.push(notice);
+        }
     }
 
     /// Times out every request that has waited longer than the acknowledgement timeout.
     ///
     /// Runs on every read, so "pending" is never a permanent state: a viewer that stopped
     /// answering shows up as `timed_out` and a display failure rather than an eternal promise.
-    fn sweep_expired(&self, state: &mut TrackerState, now_ms: u64, timeout_ms: u64) {
-        for entry in state.documents.values_mut() {
-            let _ = entry.expire_pending(now_ms, timeout_ms);
+    fn sweep_expired(state: &mut TrackerState, now_ms: u64, timeout_ms: u64) {
+        let mut expired: Vec<String> = Vec::new();
+        for (document_id, entry) in state.documents.iter_mut() {
+            if entry.expire_pending(now_ms, timeout_ms).is_some() {
+                expired.push(document_id.clone());
+            }
+        }
+        for document_id in expired {
+            Self::drain(state, &document_id);
         }
     }
 
@@ -403,12 +465,14 @@ impl PublicationTracker {
         frame: bool,
     ) -> Result<PublicationRequest, PublicationError> {
         let mut state = self.locked()?;
-        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        Self::sweep_expired(&mut state, now_ms, timeout_ms);
         let entry = state
             .documents
             .entry(document_id.to_owned())
             .or_insert_with(|| DocumentPublication::new(document_id));
-        entry.begin(now_ms, revision, source, frame)
+        let request = entry.begin(now_ms, revision, source, frame);
+        Self::drain(&mut state, document_id);
+        request
     }
 
     /// Accepts an acknowledgement and reports the status it produced.
@@ -424,7 +488,7 @@ impl PublicationTracker {
         token: u64,
     ) -> Result<PublicationStatus, PublicationError> {
         let mut state = self.locked()?;
-        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        Self::sweep_expired(&mut state, now_ms, timeout_ms);
         let entry = state
             .documents
             .get_mut(document_id)
@@ -432,15 +496,26 @@ impl PublicationTracker {
                 document_id: document_id.to_owned(),
             })?;
         let status = entry.acknowledge(document_id, revision, token)?;
-        // The screen moved: every other document gives up its displayed revision.
+        // The screen moved: every other document gives up its displayed revision, and any request
+        // of theirs still in flight - which can never be displayed now - is dropped as superseded.
         if status.displayed_revision.is_some() {
-            for (other_id, other) in state.documents.iter_mut() {
-                if other_id != document_id {
+            let others: Vec<String> = state
+                .documents
+                .keys()
+                .filter(|other_id| other_id.as_str() != document_id)
+                .cloned()
+                .collect();
+            for other_id in &others {
+                if let Some(other) = state.documents.get_mut(other_id) {
                     other.relinquish_screen();
                 }
             }
             state.active = Some(document_id.to_owned());
+            for other_id in others {
+                Self::drain(&mut state, &other_id);
+            }
         }
+        Self::drain(&mut state, document_id);
         Ok(status)
     }
 
@@ -454,14 +529,16 @@ impl PublicationTracker {
         reason: impl Into<String>,
     ) -> Result<PublicationStatus, PublicationError> {
         let mut state = self.locked()?;
-        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        Self::sweep_expired(&mut state, now_ms, timeout_ms);
         let entry = state
             .documents
             .get_mut(document_id)
             .ok_or_else(|| PublicationError::UnknownDocument {
                 document_id: document_id.to_owned(),
             })?;
-        entry.fail(revision, reason)
+        let status = entry.fail(revision, reason);
+        Self::drain(&mut state, document_id);
+        status
     }
 
     /// Marks the request in flight as timed out.
@@ -484,7 +561,7 @@ impl PublicationTracker {
         document_id: &str,
     ) -> Result<Option<PublicationStatus>, PublicationError> {
         let mut state = self.locked()?;
-        self.sweep_expired(&mut state, now_ms, timeout_ms);
+        Self::sweep_expired(&mut state, now_ms, timeout_ms);
         Ok(state.documents.get(document_id).map(|entry| {
             let mut status = entry.status();
             status.displayed_elsewhere =
@@ -492,6 +569,15 @@ impl PublicationTracker {
                     && state.active.as_deref() != Some(document_id);
             status
         }))
+    }
+
+    /// Takes the outcomes produced since the last read, oldest first.
+    ///
+    /// The app applies them to the records that announced a display - a job's `display` field, for
+    /// instance - so a stored outcome converges instead of freezing at submission time.
+    pub fn take_notices(&self) -> Result<Vec<PublicationNotice>, PublicationError> {
+        let mut state = self.locked()?;
+        Ok(std::mem::take(&mut state.notices))
     }
 
     /// The document that owns the screen, if any publication has been displayed.

@@ -95,8 +95,14 @@ export class SplatViewer {
     }
     // A publication older than what is already on screen never replaces it, whatever order the
     // two arrived in. Arrival order is not evidence: a slow fetch for revision 8 finishing after
-    // revision 9 was displayed must not put revision 8 back on screen.
-    if (request && isSuperseded(request.token, this.displayed?.token)) {
+    // revision 9 was displayed must not put revision 8 back on screen. The comparison is scoped
+    // to one document: tokens are minted per document, so another document's token says nothing
+    // about this one, and a new document's first publication must be able to replace the
+    // previous model.
+    if (
+      request &&
+      isSuperseded({ documentId: request.documentId, token: request.token }, this.displayed)
+    ) {
       return null;
     }
     const token = ++this.loadToken;

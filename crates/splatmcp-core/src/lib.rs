@@ -58,8 +58,8 @@ pub use ply::{
 };
 pub use publish::{
     ACK_TIMEOUT_MS, DocumentPublication, PUBLICATION_CONTRACT_VERSION, PublicationError,
-    PublicationOutcome, PublicationRequest, PublicationSource, PublicationStatus,
-    PublicationTracker, RendererCapabilities,
+    PublicationNotice, PublicationNoticeOutcome, PublicationOutcome, PublicationRequest,
+    PublicationSource, PublicationStatus, PublicationTracker, RendererCapabilities,
 };
 pub use splat::{Bounds, Splat, SplatPoint, SplatStats};
 pub use transaction::{

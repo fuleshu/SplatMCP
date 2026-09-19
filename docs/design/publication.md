@@ -17,6 +17,38 @@ instead of collapsing them into one "loaded" flag.
 | `PublicationRequest { document, revision, token, source, frame }` | minted by the app before the event is sent | one piece of publication work |
 | `PublicationOutcome` | the tracker | `pending`, `displayed`, `failed`, `skipped`, `timed_out` |
 
+## Tokens are per document
+
+A publication token counts within **one document's** sequence: document A reaching token 4 says
+nothing about document B, whose first publication is token 1. Any comparison of tokens (or of
+revisions) must therefore carry the document identity with it, in both the app and the window:
+
+- `PublicationTracker` keys every entry by document id and mints `next_token` per entry;
+- `ui/publication-order.js` tracks a `{ newest, displayed }` pair *per document*, and
+  `isSuperseded(incoming, displayed)` compares `{ documentId, token }` pairs, treating two
+  different documents as unrelated;
+- `ui/components.js` and `ui/python-panel.js` pass the event's `document_id` to every ordering
+  call, and the selection highlight is scoped by `(document, revision)` rather than by revision
+  alone.
+
+Getting this wrong is not subtle: a global "highest token seen" made a new document's early
+publications look stale, so the window kept showing the previous model and the app's requests
+timed out until the new document's token happened to exceed the old document's count.
+
+## One document owns the screen
+
+A request for a document that has been replaced can never be displayed, so it is not left
+in flight: acknowledging another document's publication drops it as `skipped` rather than
+leaving a pending request that can only expire.
+
+## Outcomes are published, not frozen
+
+Every request produces exactly one `PublicationNotice` — `displayed`, `failed`, `timed_out` or
+`superseded` — which the app reads and applies to the records that announced a display (a job's
+`display` field). Notices are bounded, drained on read, and are what make a stored promise
+converge instead of staying `pending`. A preview acknowledgement raises no notice: a dry run of
+revision N does not mean revision N's geometry appeared.
+
 ## Why a token and not just a revision
 
 Two publications of the *same* revision are still two different pieces of work. The viewer
@@ -140,9 +172,15 @@ a revision and must never be reported as one.
   `publication_status`, the bridge as `publication.status`, and the MCP tool `splat_display`
   makes it readable to a caller.
 - `publication.capabilities` reports what the renderer can do: `transport`
-  (`tauri_binary_response`), `revision_addressed`, the viewer's own reported
-  `displayed_revision` and `displayed_point_count`, and `ack_timeout_ms`. A caller never infers
-  readiness from a fixed delay, and camera capture consumes this readiness contract.
+  (`tauri_binary_response`), `revision_addressed`, `displayed_revision`, `displayed_point_count`
+  and `ack_timeout_ms`. A caller never infers readiness from a fixed delay, and camera capture
+  consumes this readiness contract.
+
+  Its identity comes from the **app's own records**, not from the renderer: the displayed revision
+  is the one the tracker acknowledged, and the point count is read from the store's metadata for
+  that exact revision. A viewer reports only what only a renderer knows (`viewer_ready`,
+  `has_splat`), because it has no document identity of its own — reading identity from it is how
+  capabilities and status came to disagree about which revision was displayed.
 
 ## What is deliberately not here
 

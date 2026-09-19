@@ -709,10 +709,14 @@ pub fn python_submit(
 /// Tauri command: read a script job from the shared service, with the engine's detail beside it.
 #[tauri::command]
 pub fn python_job(
+    app: tauri::AppHandle,
     query: splatmcp_bridge::PythonJobQuery,
     host: tauri::State<'_, PythonHostState>,
     jobs: tauri::State<'_, crate::jobs::JobHostState>,
 ) -> Result<Value, String> {
+    // The panel polls this command, so the display outcome of the job it is watching has to be
+    // applied here too - otherwise a script job reads `pending` after the window acknowledged it.
+    crate::publication::apply_publication_notices(&app);
     if query.job_id.trim().is_empty() {
         let recent: Vec<Value> = jobs
             .0

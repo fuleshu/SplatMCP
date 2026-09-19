@@ -31,6 +31,8 @@
 
 mod tracker;
 
+/// The notices and their outcomes are defined here because they are part of the publication
+/// contract the rest of the app reads; the tracker is the module that produces them.
 pub use tracker::{ACK_TIMEOUT_MS, DocumentPublication, PublicationTracker};
 
 use std::fmt;
@@ -86,6 +88,58 @@ impl PublicationSource {
         match self {
             Self::Committed => "committed",
             Self::Preview => "preview",
+        }
+    }
+}
+
+/// What became of one publication request, for the parts of the app that recorded an outcome of
+/// their own.
+///
+/// A job, for instance, records `display: pending` when it announces its revision: only the window
+/// can say whether a frame appeared, and that answer arrives later as an acknowledgement, a
+/// failure or a timeout. These notices are how the tracker tells the rest of the app what happened,
+/// so a stored outcome can converge instead of staying frozen at submission time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationNotice {
+    pub document_id: String,
+    /// Revision the request carried.
+    pub revision: u64,
+    pub outcome: PublicationNoticeOutcome,
+}
+
+impl PublicationNotice {
+    /// One bounded line for a log.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}@{} {}",
+            self.document_id,
+            self.revision,
+            self.outcome.describe()
+        )
+    }
+}
+
+/// How a publication ended, in the words the rest of the app records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationNoticeOutcome {
+    /// A frame presented this exact revision.
+    Displayed,
+    /// The viewer reported that it could not, with the reason.
+    Failed(String),
+    /// The viewer never answered within the acknowledgement timeout.
+    TimedOut,
+    /// A newer publication replaced it, or another document took the screen, before it was
+    /// displayed.
+    Superseded,
+}
+
+impl PublicationNoticeOutcome {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Displayed => "displayed".to_owned(),
+            Self::Failed(reason) => format!("display failed: {reason}"),
+            Self::TimedOut => "display timed out".to_owned(),
+            Self::Superseded => "superseded before it was displayed".to_owned(),
         }
     }
 }

@@ -260,6 +260,7 @@ fn edit_note_displayed(
 /// touching what a frame presented.
 #[tauri::command]
 fn edit_note_display_failed(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     publications: State<'_, publication::PublicationHostState>,
     document_id: String,
@@ -273,6 +274,9 @@ fn edit_note_display_failed(
         splatmcp_core::SideEffect::Failed(message.clone()),
     );
     let publications = publications.0.clone();
+    // The failure is applied before the reply, so a job that announced this revision reports
+    // `failed` on the very next read instead of staying `pending`.
+    publication::apply_publication_notices(&app);
     match publications.fail(&document_id, revision, message) {
         Ok(status) => Ok(json!({
             "recorded": recorded,

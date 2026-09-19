@@ -250,11 +250,12 @@ export class PythonPanel {
     }
     this.pendingRevision = payload.revision;
     const token = typeof payload.token === "number" ? payload.token : null;
-    if (this.order.stale(token)) {
-      // A newer publication already won; this one is history.
+    if (this.order.stale(payload.document_id, token)) {
+      // A newer publication *of this document* already won; this one is history. Another
+      // document's token is a different sequence and never makes this stale.
       return;
     }
-    this.order.observe(token);
+    this.order.observe(payload.document_id, token);
     // The newest publication this panel knows about, so it can put it back on screen if a
     // superseded load manages to replace it.
     this.latest = {
@@ -269,13 +270,13 @@ export class PythonPanel {
     try {
       bytes = await this.fetchRevision(payload.document_id, payload.revision);
     } catch (error) {
-      if (this.order.stale(token)) {
+      if (this.order.stale(payload.document_id, token)) {
         return;
       }
       await this.failDisplay(payload.revision, error?.message || String(error));
       return;
     }
-    if (this.order.stale(token)) {
+    if (this.order.stale(payload.document_id, token)) {
       // Overtaken while fetching: showing these bytes would put an older revision on screen.
       return;
     }
@@ -302,19 +303,19 @@ export class PythonPanel {
       this.pendingRevision = null;
       return;
     }
-    if (this.order.stale(token)) {
-      // The swap landed after a newer publication won: only a viewer without the ordering rule
-      // can do that. Say so, and put the newest revision back rather than leaving an older one
-      // on screen in silence.
+    if (this.order.stale(payload.document_id, token)) {
+      // The swap landed after a newer publication of this document won: only a viewer without
+      // the ordering rule can do that. Say so, and put the newest revision back rather than
+      // leaving an older one on screen in silence.
       this.pendingRevision = null;
       this.setStatus(
-        `revision ${payload.revision} finished loading after revision ${this.order.newest} ` +
-          "and was replaced again",
+        `revision ${payload.revision} finished loading after revision ` +
+          `${this.order.newestFor(payload.document_id)} and was replaced again`,
       );
       await this.redisplayNewest();
       return;
     }
-    this.order.markDisplayed(token);
+    this.order.markDisplayed(payload.document_id, token);
     await this.invoke("python_note_rendered", {
       revision: payload.revision,
       documentId: payload.document_id,
@@ -355,8 +356,8 @@ export class PythonPanel {
         return;
       }
       // A revision is reported as rendered once.
-      const alreadyRecorded = this.order.displayed === latest.token;
-      this.order.markDisplayed(latest.token);
+      const alreadyRecorded = this.order.displayedFor(latest.documentId) === latest.token;
+      this.order.markDisplayed(latest.documentId, latest.token);
       if (!alreadyRecorded) {
         await this.invoke("python_note_rendered", {
           revision: latest.revision,

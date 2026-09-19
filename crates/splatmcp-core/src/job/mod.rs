@@ -520,12 +520,22 @@ impl fmt::Display for JobFailure {
 }
 
 /// How a downstream side effect (export, display) ended.
+///
+/// A job records `Pending` the moment it announces its revision, because only the window can say
+/// whether a frame appeared. That value is a *promise*, not an outcome: it has to be replaced when
+/// the acknowledgement, the failure, the timeout or a newer publication arrives, or a caller reads
+/// a submission-time value forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideEffectState {
     NotRequested,
     /// Announced, not yet acknowledged: the same distinction the transaction receipts keep.
     Pending,
     Done,
+    /// The viewer never answered within the acknowledgement timeout.
+    TimedOut,
+    /// A newer publication replaced this revision, or another document took the screen, before it
+    /// was displayed.
+    Superseded,
     Failed(String),
 }
 
@@ -535,8 +545,15 @@ impl SideEffectState {
             Self::NotRequested => "not_requested",
             Self::Pending => "pending",
             Self::Done => "done",
+            Self::TimedOut => "timed_out",
+            Self::Superseded => "superseded",
             Self::Failed(_) => "failed",
         }
+    }
+
+    /// True while the outcome may still change: only a pending effect is replaced by a later one.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
     }
 }
 

@@ -774,6 +774,12 @@ pub struct ComponentChangeInfo {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SelectionMarkers {
     pub handle_id: u64,
+    /// Document the selection was resolved against.
+    ///
+    /// Carried beside the revision because a highlight belongs to one revision *of one document*:
+    /// the same revision number in another document is a different picture, and the window must be
+    /// able to tell that apart instead of comparing revisions across documents.
+    pub document_id: String,
     /// Revision the selection was resolved against.
     pub revision: u64,
     /// Gaussians the selection covers.
@@ -1096,6 +1102,7 @@ impl AppState {
             .collect::<Vec<_>>();
         Ok(SelectionMarkers {
             handle_id,
+            document_id: revision.document_id.to_string(),
             revision: selection.revision,
             count: selection.count,
             shown: points.len(),

@@ -413,6 +413,40 @@ impl JobService {
         }
     }
 
+    /// Records a downstream display outcome on every retained job waiting for it.
+    ///
+    /// A job stores `display: pending` when it announces its revision, and the real outcome arrives
+    /// later - an acknowledgement, a failure, a timeout or a newer publication. Matching is by the
+    /// revision the job *produced* (the document and revision in its result), and only a pending
+    /// effect is replaced, so a recorded outcome is never rewritten by a late notice.
+    ///
+    /// Returns how many receipts changed, so a caller can tell "nothing to do" from "converged".
+    pub fn note_display(
+        &self,
+        handle: &crate::DocumentHandle,
+        state: SideEffectState,
+    ) -> usize {
+        let Ok(mut inner) = self.locked() else {
+            return 0;
+        };
+        let mut updated = 0;
+        for entry in inner.jobs.values_mut() {
+            let matches = matches!(
+                &entry.receipt.result,
+                JobResult::Document {
+                    document_id,
+                    revision,
+                    ..
+                } if document_id == handle.document_id.as_str() && *revision == handle.revision
+            );
+            if matches && entry.receipt.display.is_pending() {
+                entry.receipt.display = state.clone();
+                updated += 1;
+            }
+        }
+        updated
+    }
+
     /// What the service is holding, plus the bounds it is measured against.
     pub fn stats(&self) -> JobStats {
         let Ok(inner) = self.locked() else {

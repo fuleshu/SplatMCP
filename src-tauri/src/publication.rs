@@ -21,10 +21,12 @@ use std::sync::Arc;
 
 use serde_json::json;
 use tauri::{Emitter, Manager};
+#[cfg(test)]
+use splatmcp_core::PublicationOutcome;
 use splatmcp_core::{
-    document::now_ms, DocumentHandle, PublicationError, PublicationOutcome, PublicationRequest,
-    PublicationSource, PublicationStatus, PublicationTracker, RendererCapabilities,
-    ACK_TIMEOUT_MS, PUBLICATION_CONTRACT_VERSION,
+    document::now_ms, DocumentHandle, PublicationError, PublicationNoticeOutcome,
+    PublicationRequest, PublicationSource, PublicationStatus, PublicationTracker,
+    RendererCapabilities, SideEffectState, ACK_TIMEOUT_MS,
 };
 
 /// The process-wide publication tracker.
@@ -126,6 +128,10 @@ impl PublicationHost {
     }
 
     /// Marks the request in flight as timed out, for a caller that is giving up on this viewer.
+    ///
+    /// The automatic case is the sweep inside the tracker; this is the explicit one, exercised by
+    /// a test that has already stopped waiting.
+    #[cfg(test)]
     pub fn time_out(
         &self,
         document_id: &str,
@@ -170,7 +176,9 @@ pub struct PublicationHostState(pub Arc<PublicationHost>);
 /// The payload of the event that asks the viewer to display one exact request.
 ///
 /// An event, never a payload carrier: identity, revision, token and the two switches. The geometry
-/// travels through the binary `splat_bytes_for_revision` response.
+/// travels through the binary `splat_bytes_for_revision` response. The app builds this shape in
+/// `announce`; the helper exists so a test can assert the contract.
+#[cfg(test)]
 pub fn request_payload(request: &PublicationRequest, file_name: &str, point_count: usize) -> serde_json::Value {
     json!({
         "contract_version": splatmcp_core::PUBLICATION_CONTRACT_VERSION,
@@ -185,6 +193,7 @@ pub fn request_payload(request: &PublicationRequest, file_name: &str, point_coun
 }
 
 /// True for the outcome that means the requested revision did *not* reach the screen.
+#[cfg(test)]
 pub fn needs_attention(outcome: &PublicationOutcome) -> bool {
     matches!(
         outcome,
@@ -287,12 +296,112 @@ pub fn announce(
     Ok(request)
 }
 
+/// The viewer status type this module reads, named once.
+type ViewerStatus = splatmcp_bridge::ViewerStatus;
+
+/// Applies the publication outcomes the tracker has produced to the records that promised them.
+///
+/// A job stores `display: pending` when it announces its revision; the acknowledgement, the
+/// timeout, the failure or the supersede arrives later and is recorded here, so a job's display
+/// field converges instead of freezing at submission time. Called from every read that can observe
+/// an outcome - a status query, a job query, an acknowledgement - so a caller always sees the
+/// current answer after asking once.
+///
+/// Returns how many job receipts were updated.
+pub fn apply_publication_notices(app: &tauri::AppHandle) -> usize {
+    let publications = app.state::<PublicationHostState>().0.clone();
+    let notices = match publications.tracker().take_notices() {
+        Ok(notices) => notices,
+        Err(_) => return 0,
+    };
+    if notices.is_empty() {
+        return 0;
+    }
+    let jobs = app.state::<crate::jobs::JobHostState>().0.clone();
+    let mut updated = 0;
+    for notice in &notices {
+        // A job is matched by the revision it produced, so a notice for another revision or
+        // another document touches nothing.
+        let Some(document_id) = splatmcp_core::DocumentId::parse(&notice.document_id) else {
+            continue;
+        };
+        let handle = DocumentHandle::new(document_id, notice.revision);
+        updated += jobs.service().note_display(&handle, effect_of(&notice.outcome));
+    }
+    updated
+}
+
+/// The job display state that matches a publication outcome.
+fn effect_of(outcome: &PublicationNoticeOutcome) -> SideEffectState {
+    match outcome {
+        PublicationNoticeOutcome::Displayed => SideEffectState::Done,
+        PublicationNoticeOutcome::Failed(reason) => SideEffectState::Failed(reason.clone()),
+        PublicationNoticeOutcome::TimedOut => SideEffectState::TimedOut,
+        PublicationNoticeOutcome::Superseded => SideEffectState::Superseded,
+    }
+}
+
+/// What the renderer is doing, assembled from the app's own records.
+///
+/// The displayed revision comes from the tracker (the app acknowledged it) and the point count from
+/// the store's metadata for that exact revision, because those are the values `publication_status`
+/// reports. The viewer supplies only what only a renderer knows - whether it answered, and whether
+/// a splat is loaded - so the two replies can never contradict each other about identity.
+pub fn capabilities_for(app: &tauri::AppHandle) -> serde_json::Value {
+    let publications = app.state::<PublicationHostState>().0.clone();
+    apply_publication_notices(app);
+    let state = app.state::<crate::document::AppState>();
+    let handle = state.active_handle();
+    let displayed_revision = handle
+        .as_ref()
+        .and_then(|handle| {
+            publications
+                .status(handle.document_id.as_str())
+                .ok()
+                .flatten()
+                .and_then(|status| status.displayed_revision)
+        });
+    // The count of the revision that is actually displayed, read from the store rather than from
+    // the renderer: a viewer that has not reloaded yet would otherwise report the previous model's
+    // count next to the new revision.
+    let displayed_point_count = match (&handle, displayed_revision) {
+        (Some(handle), Some(revision)) => state
+            .snapshot(splatmcp_core::Expected::Handle(DocumentHandle::new(
+                handle.document_id.clone(),
+                revision,
+            )))
+            .map(|snapshot| snapshot.metadata().point_count)
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let viewer_status = app
+        .state::<crate::bridge::ViewerState>()
+        .0
+        .request(
+            splatmcp_bridge::Method::ViewerStatus,
+            serde_json::Value::Null,
+            crate::viewer::VIEWER_TIMEOUT,
+        )
+        .ok()
+        .and_then(|value| serde_json::from_value::<ViewerStatus>(value).ok());
+    let mut capabilities = publications.capabilities(displayed_revision, displayed_point_count);
+    if let Some(status) = &viewer_status {
+        capabilities.viewer_ready = status.viewer_ready;
+        capabilities.has_splat = status.loaded;
+    }
+    capabilities_json(&capabilities)
+}
+
 /// Tauri command: the status of one document's publication, or of every tracked document.
 #[tauri::command]
 pub fn publication_status(
+    app: tauri::AppHandle,
     host: tauri::State<'_, PublicationHostState>,
     document_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    // Reading a status is also where an expired publication is noticed and applied, so the jobs
+    // that announced a display see the timeout without a second call.
+    apply_publication_notices(&app);
     match document_id {
         Some(document_id) => match host.0.status(&document_id) {
             Ok(Some(status)) => Ok(status_json(&status)),
@@ -316,39 +425,10 @@ pub fn publication_status(
     }
 }
 
-/// Tauri command: renderer capabilities, from the viewer plus this app's own contract.
+/// Tauri command: renderer capabilities, assembled from the app's own records.
 #[tauri::command]
-pub fn renderer_capabilities(
-    host: tauri::State<'_, PublicationHostState>,
-    app: tauri::AppHandle,
-) -> serde_json::Value {
-    // What the viewer reports about itself, so the capabilities are the renderer's own words
-    // rather than an assumption. A viewer that cannot answer is reported as not ready.
-    let status = app
-        .state::<crate::bridge::ViewerState>()
-        .0
-        .request(
-            splatmcp_bridge::Method::ViewerStatus,
-            serde_json::Value::Null,
-            crate::viewer::VIEWER_TIMEOUT,
-        )
-        .ok()
-        .and_then(|value| serde_json::from_value::<splatmpc_status::ViewerStatus>(value).ok());
-    let point_count = status.as_ref().map(|status| status.point_count).unwrap_or(0);
-    // The displayed revision is the app's own answer (the tracker records acknowledgements);
-    // the viewer only supplies the facts only it knows.
-    let acknowledged = app
-        .state::<crate::document::AppState>()
-        .active_handle()
-        .and_then(|handle| host.0.status(handle.document_id.as_str()).ok().flatten())
-        .and_then(|status| status.displayed_revision);
-    capabilities_json(&host.0.capabilities(acknowledged, point_count))
-}
-
-/// A local alias so the viewer status type is named once, in the capabilities command.
-mod splatmpc_status {
-    /// The viewer's own report of what it is showing.
-    pub type ViewerStatus = splatmcp_bridge::ViewerStatus;
+pub fn renderer_capabilities(app: tauri::AppHandle) -> serde_json::Value {
+    capabilities_for(&app)
 }
 
 /// Tauri command: the binary payload of one exact revision of one exact document.
@@ -373,7 +453,8 @@ pub fn splat_bytes_for_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use splatmcp_core::{DocumentId, PublicationTracker};
+    use splatmcp_core::{DocumentId, PublicationNoticeOutcome, PublicationTracker,
+                        PUBLICATION_CONTRACT_VERSION};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn handle() -> DocumentHandle {
@@ -604,6 +685,70 @@ mod tests {
             Some(PublicationOutcome::TimedOut)
         );
         assert!(status.pending.is_none());
+    }
+
+    #[test]
+    fn a_publication_notice_maps_onto_the_job_display_state() {
+        // The mapping is what a job's `display` field reports, so each outcome has to land on its
+        // own state rather than on a generic "failed".
+        assert_eq!(
+            effect_of(&PublicationNoticeOutcome::Displayed),
+            SideEffectState::Done
+        );
+        assert_eq!(
+            effect_of(&PublicationNoticeOutcome::TimedOut),
+            SideEffectState::TimedOut
+        );
+        assert_eq!(
+            effect_of(&PublicationNoticeOutcome::Superseded),
+            SideEffectState::Superseded
+        );
+        assert_eq!(
+            effect_of(&PublicationNoticeOutcome::Failed("parse failed".to_owned())),
+            SideEffectState::Failed("parse failed".to_owned())
+        );
+        // Every state names itself, which is what the wire reply carries.
+        assert_eq!(SideEffectState::TimedOut.as_str(), "timed_out");
+        assert_eq!(SideEffectState::Superseded.as_str(), "superseded");
+        assert!(SideEffectState::Pending.is_pending());
+        assert!(!SideEffectState::Done.is_pending());
+    }
+
+    #[test]
+    fn the_tracker_reports_an_acknowledgement_and_a_timeout_as_notices_for_the_app() {
+        // The desktop's path: the tracker produces notices, and they name the revision the app
+        // stored on the job it is going to update.
+        let (host, clock) = clocked();
+        let request = host
+            .begin(&handle(), PublicationSource::Committed, false)
+            .unwrap();
+        assert!(host.tracker().take_notices().unwrap().is_empty(), "nothing yet");
+        host.acknowledge("doc-4f2a-1", request.revision, request.token)
+            .unwrap();
+        let notices = host.tracker().take_notices().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].document_id, "doc-4f2a-1");
+        assert_eq!(notices[0].revision, 4);
+        assert_eq!(notices[0].outcome, PublicationNoticeOutcome::Displayed);
+
+        // And a timeout, observed by a read, produces its own notice. Revision 5, because
+        // revision 4 is already displayed (and re-publishing it would be refused).
+        clock.store(9_000, Ordering::SeqCst);
+        let five = DocumentHandle::new(DocumentId::mint(0x4f2a, 1), 5);
+        let slow = host
+            .begin(&five, PublicationSource::Committed, false)
+            .unwrap();
+        let _ = host.tracker().take_notices().unwrap();
+        clock.store(
+            9_000 + splatmcp_core::ACK_TIMEOUT_MS + 1,
+            Ordering::SeqCst,
+        );
+        let status = host.status("doc-4f2a-1").unwrap().unwrap();
+        assert!(status.pending.is_none());
+        let notices = host.tracker().take_notices().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].revision, slow.revision);
+        assert_eq!(notices[0].outcome, PublicationNoticeOutcome::TimedOut);
     }
 
     #[test]

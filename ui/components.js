@@ -69,7 +69,12 @@ export class ComponentsPanel {
     // resolved against: a highlight belongs to one revision, so a newer one clears it rather
     // than leaving markers where nothing is selected any more.
     this.highlightHandle = null;
+    // Revision *and* document the highlight was resolved against: a highlight belongs to one
+    // revision of one document, so the same revision number in another document is a different
+    // picture and must not keep a stale marker layer on screen.
     this.highlightRevision = null;
+    this.highlightDocumentId = null;
+    this.highlightDocumentId = null;
     this.nodes = {
       list: document.getElementById("component-list"),
       name: document.getElementById("component-name"),
@@ -402,11 +407,12 @@ export class ComponentsPanel {
     // A publication from an older app build carries no token: the viewer still displays it, but
     // it reports the display without a request identity, which the app records as such.
     const token = typeof payload.token === "number" ? payload.token : null;
-    if (this.order.stale(token)) {
-      // A newer publication is already in flight or on screen: this one is history.
+    if (this.order.stale(documentId, token)) {
+      // A newer publication *of this document* is already in flight or on screen: this one is
+      // history. Another document's token is a different sequence and never makes this stale.
       return;
     }
-    this.order.observe(token);
+    this.order.observe(documentId, token);
     // The newest publication this panel knows about, so it can put it back on screen if a
     // superseded load manages to replace it.
     this.latest = {
@@ -423,15 +429,15 @@ export class ComponentsPanel {
       bytes = await this.fetchRevision(documentId, payload.revision);
     } catch (error) {
       // A late failure for a superseded publication is not this revision's failure to report.
-      if (this.order.stale(token)) {
+      if (this.order.stale(documentId, token)) {
         return;
       }
       await this.failDisplay(documentId, payload.revision, error);
       return;
     }
-    if (this.order.stale(token)) {
+    if (this.order.stale(documentId, token)) {
       // Overtaken while fetching: displaying these bytes would show an older revision than the
-      // app has already published.
+      // app has already published for this document.
       return;
     }
     let displayed = null;
@@ -454,19 +460,24 @@ export class ComponentsPanel {
       // Superseded before the swap: report nothing, because nothing changed on screen.
       return;
     }
-    if (this.order.stale(token)) {
-      // A newer publication arrived while this one was staged, and the swap landed anyway: that
-      // can only happen with a viewer old enough to lack the ordering rule. Say what happened and
-      // put the newest revision back, rather than leaving an older one displayed in silence.
+    if (this.order.stale(documentId, token)) {
+      // A newer publication of this document arrived while this one was staged, and the swap
+      // landed anyway: that can only happen with a viewer old enough to lack the ordering rule.
+      // Say what happened and put the newest revision back, rather than leaving an older one
+      // displayed in silence.
       this.setStatus(
-        `revision ${payload.revision} finished loading after revision ${this.order.newest} ` +
-          "and was replaced again",
+        `revision ${payload.revision} finished loading after revision ` +
+          `${this.order.newestFor(documentId)} and was replaced again`,
       );
       await this.redisplayNewest();
       return;
     }
-    this.order.markDisplayed(token);
-    if (this.highlightHandle && this.highlightRevision !== payload.revision) {
+    this.order.markDisplayed(documentId, token);
+    if (
+      this.highlightHandle &&
+      (this.highlightRevision !== payload.revision ||
+        this.highlightDocumentId !== documentId)
+    ) {
       // The highlighted gaussians belonged to another revision; their markers would point at
       // geometry that is no longer displayed.
       await this.clearHighlight();
@@ -521,8 +532,8 @@ export class ComponentsPanel {
       }
       // The app is told a revision is displayed once: re-displaying the newest revision is not
       // news if it was already acknowledged.
-      const alreadyRecorded = this.order.displayed === latest.token;
-      this.order.markDisplayed(latest.token);
+      const alreadyRecorded = this.order.displayedFor(latest.documentId) === latest.token;
+      this.order.markDisplayed(latest.documentId, latest.token);
       if (!alreadyRecorded) {
         await this.invoke("edit_note_displayed", {
           documentId: latest.documentId,
@@ -590,6 +601,7 @@ export class ComponentsPanel {
       await instance.setHighlight(bytes);
       this.highlightHandle = handleId;
       this.highlightRevision = marker?.revision ?? null;
+      this.highlightDocumentId = marker?.document_id ?? null;
       const shown = marker?.shown ?? 0;
       const count = marker?.count ?? shown;
       const truncated = marker?.truncated ? ` (showing ${shown} of ${count})` : "";
