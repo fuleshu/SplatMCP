@@ -23,6 +23,8 @@
 // World axes are the scene's: `+Y` up, `+Z` towards the viewer, so `front` looks along `-Z`.
 // The field of view is the vertical one.
 
+import { appliedCamera } from "./camera-matrices.js";
+
 const DEFAULT_FOV = 60;
 const MIN_FOV = 10;
 const MAX_FOV = 120;
@@ -71,20 +73,69 @@ const PRESETS = Object.freeze({
   three_quarter: { direction: [0.5, 0.5, 0.7071], up: [0, 1, 0] },
 });
 
-/** Reads the camera the viewer is actually rendering with. */
+/**
+ * Reads the camera the viewer is actually rendering with.
+ *
+ * Every geometric value comes from the camera *entity*, which is what the renderer uses. The
+ * look-at point is the one thing a transform cannot supply - a camera has a forward ray, not a
+ * target - so it is the point on that ray at the distance the viewer last framed at, reported
+ * alongside the distance itself. Reading the interactive controls' internal pose instead is what
+ * made a reply describe a camera that was still easing toward the request.
+ */
 export function cameraState(viewer) {
   const entity = viewer?.cameraEntity;
   if (!entity) {
     return null;
   }
-  const position = entity.getPosition();
-  const focus = viewer.controls?.focusPoint;
-  const target = focus ? focus.clone() : position.clone().add(entity.forward);
+  const position = vectorOr(entity.getPosition?.() ?? null, null);
+  if (!position) {
+    return null;
+  }
+  const forward = normalizeVec(vectorOr(entity.forward ?? null, null) ?? [0, 0, -1]);
+  const eyeDistance = lookDistance(viewer, position);
+  const component = entity.camera ?? {};
+  const orthographic = Number(component.projection) === PROJECTION_ORTHOGRAPHIC;
+  const viewport = viewer.canvasSize?.() ?? { width: 0, height: 0 };
   return {
-    position: toArray(position),
-    target: toArray(target),
-    fov: entity.camera?.fov ?? DEFAULT_FOV,
+    position,
+    target: add(position, scale(forward, eyeDistance)),
+    up: vectorOr(entity.up ?? null, null) ?? [0, 1, 0],
+    fov: Number.isFinite(Number(component.fov)) ? Number(component.fov) : DEFAULT_FOV,
+    projection: orthographic
+      ? { kind: "orthographic", height: Math.max(Number(component.orthoHeight ?? 1) * 2, MIN_DISTANCE) }
+      : { kind: "perspective" },
+    near: Number.isFinite(Number(component.nearClip)) ? Number(component.nearClip) : 0.1,
+    far: Number.isFinite(Number(component.farClip)) ? Number(component.farClip) : 1000,
+    distance: eyeDistance,
+    viewport: { width: Number(viewport.width) || 0, height: Number(viewport.height) || 0 },
   };
+}
+
+/**
+ * The camera as the renderer has it, with the matrices for the current viewport.
+ *
+ * This is what `get_camera` and the viewer's status report: the applied state, not the requested
+ * one, so a caller reading it learns what a frame from this pose would actually contain.
+ */
+export function appliedCameraState(viewer) {
+  const state = cameraState(viewer);
+  if (!state) {
+    return null;
+  }
+  const applied = appliedCamera(
+    {
+      position: state.position,
+      target: state.target,
+      up: state.up,
+      fov: state.fov,
+      projection: state.projection,
+      near: state.near,
+      far: state.far,
+      distance: state.distance,
+    },
+    state.viewport,
+  );
+  return { ...state, view_matrix: applied.view_matrix, projection_matrix: applied.projection_matrix };
 }
 
 /**
@@ -101,7 +152,9 @@ export function applyCamera(viewer, request = {}) {
   }
 
   const current = cameraState(viewer);
-  const bounds = viewer.worldBounds?.() ?? null;
+  // The document bounds are normalised here rather than read from the engine's own shape, so this
+  // path works with whatever a viewer reports - a PlayCanvas bounding box or plain extents.
+  const bounds = normalizeBounds(viewer.worldBounds?.() ?? null);
   const target = vectorOr(request.target, current.target);
 
   if (request.fit) {
@@ -109,7 +162,7 @@ export function applyCamera(viewer, request = {}) {
   } else if (request.position) {
     const position = vectorOr(request.position, current.position);
     const radius = bounds
-      ? Math.max(bounds.halfExtents.length(), 0.05)
+      ? Math.max(bounds.radius, 0.05)
       : Math.max(distance(position, target), 0.05);
     viewer.placeCamera(position, target, radius);
   } else if (
@@ -117,7 +170,7 @@ export function applyCamera(viewer, request = {}) {
     request.elevation !== undefined ||
     request.distance !== undefined
   ) {
-    const radius = bounds ? Math.max(bounds.halfExtents.length(), 0.001) : 1;
+    const radius = bounds ? Math.max(bounds.radius, 0.001) : 1;
     const orbitDistance =
       numberOr(request.distance, null) ?? Math.max(distance(current.position, target), radius * 3);
     const position = orbitPosition(target, request.azimuth, request.elevation, orbitDistance);
@@ -468,33 +521,19 @@ export function boundsFromViewer(viewer) {
  * applied, and it is what the restore rule compares against.
  */
 export function resolvedCameraOf(viewer) {
-  const entity = viewer?.cameraEntity;
-  if (!entity) {
+  const state = cameraState(viewer);
+  if (!state) {
     return null;
   }
-  const position = vectorOr(entity.getPosition?.() ?? null, null);
-  if (!position) {
-    return null;
-  }
-  const focus = vectorOr(viewer.controls?.focusPoint ?? null, null);
-  const forward = vectorOr(entity.forward ?? null, null);
-  const target = focus ?? (forward ? add(position, forward) : null);
-  if (!target) {
-    return null;
-  }
-  const component = entity.camera ?? {};
-  const orthographicProjection = Number(component.projection) === PROJECTION_ORTHOGRAPHIC;
   return {
-    position,
-    target,
-    up: vectorOr(entity.up ?? null, null) ?? [0, 1, 0],
-    fov: Number.isFinite(Number(component.fov)) ? Number(component.fov) : DEFAULT_FOV,
-    projection: orthographicProjection
-      ? { kind: "orthographic", height: Number(component.orthoHeight ?? 1) * 2 }
-      : { kind: "perspective" },
-    near: Number.isFinite(Number(component.nearClip)) ? Number(component.nearClip) : 0.1,
-    far: Number.isFinite(Number(component.farClip)) ? Number(component.farClip) : 1000,
-    distance: length(sub(target, position)),
+    position: state.position,
+    target: state.target,
+    up: state.up,
+    fov: state.fov,
+    projection: state.projection,
+    near: state.near,
+    far: state.far,
+    distance: state.distance,
   };
 }
 
@@ -508,6 +547,7 @@ export function applyResolvedCamera(viewer, camera) {
     camera.position,
     camera.target,
     Math.max(camera.distance, MIN_DISTANCE),
+    vectorOr(camera.up, null) ?? [0, 1, 0],
   );
   const component = entity.camera;
   if (component) {
@@ -601,6 +641,27 @@ export function fitDistance(radius, fov, padding = 0) {
   const fitted = radius / Math.max(Math.sin(half), 1.0e-3);
   // The same 0.95 margin the interactive framer uses, so an MCP fit and a UI frame agree.
   return fitted * FIT_MARGIN * (1 + padding);
+}
+
+/**
+ * The distance from the eye to the point it is looking at.
+ *
+ * Recorded when a camera is placed; the controls' focus point is only a fallback for a viewer that
+ * was driven by something other than this module, and the scene radius is the last resort.
+ */
+function lookDistance(viewer, position) {
+  const recorded = Number(viewer?.lookDistance);
+  if (Number.isFinite(recorded) && recorded > MIN_DISTANCE) {
+    return recorded;
+  }
+  const focus = vectorOr(viewer?.controls?.focusPoint ?? null, null);
+  if (focus) {
+    return Math.max(distance(position, focus), MIN_DISTANCE);
+  }
+  // No recorded distance and no focus point: the scene's own size is the next best answer, and 1
+  // metre is the last resort for a viewer that reports nothing at all.
+  const radius = normalizeBounds(viewer?.worldBounds?.() ?? null)?.radius;
+  return Number.isFinite(radius) && radius > 0 ? radius * 3 : 1;
 }
 
 function requestedForms(spec) {

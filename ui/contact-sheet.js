@@ -6,6 +6,12 @@
 //
 // The drawing surface and the encoder are injected, so the same layout code runs in the window
 // and in a node test, and nothing here reaches for `document`.
+//
+// Every artifact this module produces carries a checksum, because the app and the MCP manifest
+// identify a sheet by bytes rather than by a name: a sheet without one cannot be traced back to
+// anything, and the reply that requires it is refused.
+
+import { checksumOfBase64 } from "./checksums.js";
 
 /** Draws one cell per view, in reading order, with the label under each thumbnail. */
 export async function composeContactSheet({ plan, views, deps = {} }) {
@@ -62,12 +68,14 @@ export async function composeContactSheet({ plan, views, deps = {} }) {
   return {
     data_base64: encoded.base64,
     mime_type: encoded.mime_type,
-    bytes: encoded.bytes,
+    bytes: encoded.bytes ?? Math.floor((encoded.base64.length * 3) / 4),
     width: plan.sheet.width,
     height: plan.sheet.height,
     columns: plan.columns,
     rows: plan.rows,
     labels: plan.labels,
+    // Identity of the bytes that were produced, so a caller can name the sheet it received.
+    checksum: checksumOfBase64(encoded.base64),
   };
 }
 

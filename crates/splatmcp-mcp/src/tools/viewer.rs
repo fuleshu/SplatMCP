@@ -74,11 +74,32 @@ impl CameraInput {
 }
 
 /// Camera state as reported back to the model.
+///
+/// The first three fields are the original reply. The rest is the *applied* state a caller needs
+/// to reason about a frame - orientation, projection, clipping, the viewport and the matrices -
+/// and is additive, so a client that reads only position/target/fov is unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct CameraOut {
     pub position: [f32; 3],
     pub target: [f32; 3],
     pub fov: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection: Option<splatmcp_core::capture::Projection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub far: Option<f32>,
+    /// Distance from the eye to the reported target; a camera has a ray, not a target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<splatmcp_core::capture::Viewport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_matrix: Option<[f32; 16]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_matrix: Option<[f32; 16]>,
 }
 
 impl From<CameraState> for CameraOut {
@@ -87,6 +108,14 @@ impl From<CameraState> for CameraOut {
             position: super::round3_vec(state.position),
             target: super::round3_vec(state.target),
             fov: super::round3(state.fov),
+            up: Some(super::round3_vec(state.up)),
+            projection: state.projection,
+            near: state.near.map(super::round3),
+            far: state.far.map(super::round3),
+            distance: state.distance.map(super::round3),
+            viewport: state.viewport,
+            view_matrix: state.view_matrix,
+            projection_matrix: state.projection_matrix,
         }
     }
 }
@@ -255,6 +284,7 @@ mod tests {
             position: [1.234_56, 2.0, 3.0],
             target: [0.0, 0.0, 0.0],
             fov: 59.999_99,
+            ..CameraState::default()
         });
         assert_eq!(out.position, [1.235, 2.0, 3.0]);
         assert_eq!(out.fov, 60.0);
@@ -289,11 +319,19 @@ mod tests {
             position: [0.01, super::super::round3(-1.0e-18), 1.5],
             target: [0.0, 0.0, 0.0],
             fov: 60.0,
+            up: Some([0.0, 1.0, 0.0]),
+            projection: None,
+            near: None,
+            far: None,
+            distance: None,
+            viewport: None,
+            view_matrix: None,
+            projection_matrix: None,
         };
         let encoded = serde_json::to_string(&out).unwrap();
         assert_eq!(
             encoded,
-            "{\"position\":[0.01,0.0,1.5],\"target\":[0.0,0.0,0.0],\"fov\":60.0}"
+            "{\"position\":[0.01,0.0,1.5],\"target\":[0.0,0.0,0.0],\"fov\":60.0,\"up\":[0.0,1.0,0.0]}"
         );
     }
 }

@@ -185,7 +185,11 @@ pub struct CaptureOutcome {
 /// An unreachable app is not a failure of this call: the capabilities a caller needs in order to
 /// start working are the contract's own, and they are reported with `app_attached: false` so a
 /// client can tell a negotiated answer from a local default.
-pub fn capabilities(link: &AppLink, input: &CapabilitiesInput) -> Result<Value, Failure> {
+pub fn capabilities(
+    link: &AppLink,
+    input: &CapabilitiesInput,
+    served_tools: &[String],
+) -> Result<Value, Failure> {
     let app = link.request(Method::AppCapabilities, Value::Null).ok();
     let (limits, attached) = ReportedLimits::merge(app.as_ref());
     let mut payload = json!({
@@ -206,6 +210,8 @@ pub fn capabilities(link: &AppLink, input: &CapabilitiesInput) -> Result<Value, 
     let object = payload
         .as_object_mut()
         .expect("the payload above is an object");
+    // What this server actually serves: a caller can enumerate instead of discovering by failure.
+    object.insert("tools".to_owned(), json!(served_tools));
     if input.diagnostics.unwrap_or(false) {
         object.insert(
             "diagnostics".to_owned(),
@@ -238,6 +244,11 @@ pub fn capabilities(link: &AppLink, input: &CapabilitiesInput) -> Result<Value, 
             }),
         );
     }
+    // The conventions a caller has to know to interpret geometry, and the optional runtime's
+    // readiness: both are reported only when they can be read, never guessed.
+    if let Some(conventions) = app.as_ref().and_then(|app| app.get("conventions")) {
+        object.insert("conventions".to_owned(), conventions.clone());
+    }
     if let Some(app) = app.as_ref() {
         if let Some(external) = app.get("external_boundaries") {
             object.insert("external_boundaries".to_owned(), external.clone());
@@ -246,6 +257,19 @@ pub fn capabilities(link: &AppLink, input: &CapabilitiesInput) -> Result<Value, 
             object.insert("unsupported".to_owned(), unsupported.clone());
         }
     }
+    // Python is optional: its readiness is reported as data, including when it is unavailable.
+    object.insert(
+        "python".to_owned(),
+        match link.request(Method::PythonRuntimeInfo, Value::Null) {
+            Ok(info) => info,
+            Err(message) => json!({
+                "ready": false,
+                "unavailable": true,
+                "reason": message,
+                "note": "Python is optional; every Rust tool works without it",
+            }),
+        },
+    );
     Ok(payload)
 }
 
@@ -256,7 +280,7 @@ pub fn capture_view(link: &AppLink, input: &CaptureViewInput) -> Result<CaptureO
         holder(),
         &crate::contract::capture_limits(),
     )
-    .map_err(|message| Failure::new(ErrorCode::InvalidInput, ErrorLayer::Mcp, message))?;
+    .map_err(|message| Failure::inferred(ErrorLayer::Mcp, message))?;
     let params = to_params(&request)?;
     let reply = link
         .request(Method::ViewerCaptureView, params)
@@ -325,7 +349,7 @@ pub fn capture_views(link: &AppLink, input: &CaptureViewsInput) -> Result<Value,
         input.output_dir.clone(),
         &crate::contract::capture_limits(),
     )
-    .map_err(|message| Failure::new(ErrorCode::InvalidInput, ErrorLayer::Mcp, message))?;
+    .map_err(|message| Failure::inferred(ErrorLayer::Mcp, message))?;
     let params = to_params(&request)?;
     link.request(Method::ViewerCaptureViews, params)
         .map_err(|message| Failure::inferred(ErrorLayer::App, message))
@@ -358,7 +382,7 @@ pub fn capture_correlation(frame: &Value) -> Correlation {
 /// Serialises a typed request into the bridge params.
 fn to_params<T: Serialize>(request: &T) -> Result<Value, Failure> {
     serde_json::to_value(request)
-        .map_err(|error| Failure::new(ErrorCode::InvalidInput, ErrorLayer::Mcp, error.to_string()))
+        .map_err(|error| Failure::new(ErrorCode::InternalError, ErrorLayer::Mcp, error.to_string()))
 }
 
 /// Who is capturing, as the app reports it to a later caller that finds the viewer busy.
@@ -373,24 +397,24 @@ fn capture_set_spec(input: &CaptureViewsInput) -> Value {
         "expected_revision": input.expected_revision,
         "views": input.views.iter().map(|view| json!({
             "label": view.label,
-            "camera": view.camera,
+            "camera": camera_value(&view.camera),
             "viewport": view.viewport.map(|viewport| json!({
                 "width": viewport.width,
                 "height": viewport.height,
             })),
-            "format": view.format,
-            "passes": view.passes,
+            "format": format_value(view.format.as_deref(), view.quality),
+            "passes": view.passes.iter().map(pass_value).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "shared": {
             "viewport": input.shared.viewport.map(|viewport| json!({
                 "width": viewport.width,
                 "height": viewport.height,
             })),
-            "format": input.shared.format,
-            "background": input.shared.background,
+            "format": format_value(input.shared.format.as_deref(), input.shared.quality),
+            "background": background_value(&input.shared.background),
             "timeout_ms": input.shared.timeout_ms,
             "restore": input.shared.restore,
-            "passes": input.shared.passes,
+            "passes": input.shared.passes.iter().map(pass_value).collect::<Vec<_>>(),
         },
         "contact_sheet": input.contact_sheet.as_ref().map(|sheet| json!({
             "thumbnail_width": sheet.thumbnail_width,
@@ -402,21 +426,72 @@ fn capture_set_spec(input: &CaptureViewsInput) -> Value {
 }
 
 /// Turns a capture request into the contract's own spec shape.
+///
+/// The schema documents `format` as a name and `quality` beside it, so the two are combined into
+/// the encoding the contract carries. A camera the caller omitted or set to `null` becomes the
+/// empty spec that means "keep the current camera", rather than being forwarded as a null the
+/// other side has to interpret.
 fn capture_spec(input: &CaptureViewInput) -> Value {
     json!({
         "document_id": input.document_id,
         "expected_revision": input.expected_revision,
-        "camera": input.camera,
+        "camera": camera_value(&input.camera),
         "viewport": input.viewport.map(|viewport| json!({
             "width": viewport.width,
             "height": viewport.height,
         })),
-        "format": input.format,
-        "quality": input.quality,
-        "background": input.background,
+        "format": format_value(input.format.as_deref(), input.quality),
+        "background": background_value(&input.background),
         "timeout_ms": input.timeout_ms,
         "restore": input.restore,
     })
+}
+
+/// The encoding as the contract names it: a name, with a quality when the caller gave one.
+fn format_value(format: Option<&str>, quality: Option<u8>) -> Value {
+    match (format, quality) {
+        (None, None) => Value::Null,
+        (Some("png"), _) | (None, Some(_)) => json!({ "format": "png" }),
+        (Some(name), quality) => {
+            let name = name.trim().to_lowercase();
+            match name.as_str() {
+                "png" => json!({ "format": "png" }),
+                "jpeg" | "jpg" => match quality {
+                    Some(quality) => json!({ "format": "jpeg", "quality": quality }),
+                    None => json!({ "format": "jpeg" }),
+                },
+                // Anything else travels as written, so the refusal names what the caller wrote
+                // instead of what this layer made of it.
+                _ => json!({ "format": name }),
+            }
+        }
+    }
+}
+
+/// A diagnostic pass the caller may give as its name or as the tagged object.
+fn pass_value(pass: &Value) -> Value {
+    match pass {
+        Value::String(name) => json!({ "pass": name.trim().to_lowercase() }),
+        other => other.clone(),
+    }
+}
+
+/// A camera the caller may omit, leave null or give as an empty object.
+fn camera_value(camera: &Value) -> Value {
+    match camera {
+        Value::Null => json!({}),
+        Value::Object(map) if map.is_empty() => json!({}),
+        other => other.clone(),
+    }
+}
+
+/// A background the caller may give as a name or as the tagged object.
+fn background_value(background: &Value) -> Value {
+    match background {
+        Value::Null => Value::Null,
+        Value::String(name) => json!({ "kind": name.trim().to_lowercase() }),
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -442,16 +517,54 @@ mod tests {
         assert_eq!(spec["expected_revision"], 4);
         assert_eq!(spec["camera"]["preset"], "front");
         assert_eq!(spec["viewport"]["width"], 320);
-        assert_eq!(spec["format"], "jpeg");
-        assert_eq!(spec["quality"], 80);
+        // The schema documents `format` as a name with `quality` beside it; the contract carries
+        // the pair together, so an explicit quality is honoured rather than dropped.
+        assert_eq!(spec["format"]["format"], "jpeg");
+        assert_eq!(spec["format"]["quality"], 80);
         // An omitted background stays absent rather than becoming a null the app has to interpret.
         assert!(spec["background"].is_null());
     }
 
     #[test]
+    fn the_documented_short_forms_survive_normalisation() {
+        let input: CaptureViewInput = serde_json::from_value(json!({
+            "format": "png",
+            "background": "transparent",
+            "camera": null,
+        }))
+        .unwrap();
+        let spec = capture_spec(&input);
+        assert_eq!(spec["format"]["format"], "png");
+        assert_eq!(spec["background"]["kind"], "transparent");
+        assert_eq!(spec["camera"], json!({}), "a null camera means keep the current one");
+
+        let set: CaptureViewsInput = serde_json::from_value(json!({
+            "views": [{ "label": "front", "camera": { "preset": "front" }, "passes": ["rgb", "alpha"] }],
+            "shared": { "background": "transparent", "format": "jpeg", "quality": 70 },
+        }))
+        .unwrap();
+        let normalised = capture_set_spec(&set);
+        assert_eq!(normalised["shared"]["format"]["quality"], 70);
+        assert_eq!(normalised["shared"]["background"]["kind"], "transparent");
+        assert_eq!(normalised["views"][0]["passes"][0]["pass"], "rgb");
+        assert_eq!(normalised["views"][0]["passes"][1]["pass"], "alpha");
+        // And the whole thing is what the contract itself accepts.
+        assert!(
+            splatmcp_bridge::capture_views_request(
+                normalised,
+                "test",
+                None,
+                &crate::contract::capture_limits(),
+            )
+            .is_ok(),
+            "the normalised set is a valid request"
+        );
+    }
+
+    #[test]
     fn capabilities_answer_without_an_app_and_say_so() {
         let link = AppLink::new(false);
-        let payload = capabilities(&link, &CapabilitiesInput::default()).unwrap();
+        let payload = capabilities(&link, &CapabilitiesInput::default(), &["capture_view".to_owned()]).unwrap();
         assert_eq!(payload["app_attached"], false);
         assert_eq!(payload["limits"]["capture_max_views"], 8);
         assert!(payload["limits_summary"].as_str().unwrap().contains("concurrent<=1"));
@@ -471,6 +584,7 @@ mod tests {
                 client_budget_hint_bytes: Some(200_000),
                 ..CapabilitiesInput::default()
             },
+            &[],
         )
         .unwrap();
         assert_eq!(payload["client_budget_hint"]["bytes"], 200_000);

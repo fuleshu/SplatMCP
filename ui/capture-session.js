@@ -17,7 +17,7 @@
 // rather than counted, because a capture that bumped its own token could never restore what it
 // changed.
 
-import { awaitRenderEvidence, captureFrameWithPixels } from "./capture.js";
+import { capturePinnedFrame } from "./capture.js";
 import {
   applyResolvedCamera,
   boundsFromViewer,
@@ -169,8 +169,9 @@ export function captureDeps(overrides = {}) {
   return {
     limits: CAPTURE_LIMITS,
     now: () => Date.now(),
-    awaitRender: awaitRenderEvidence,
-    captureFrame: captureFrameWithPixels,
+    // The whole single-frame operation, readiness included: one implementation, so the app and the
+    // window cannot disagree about when a frame may be read.
+    captureFrame: capturePinnedFrame,
     documentBounds: (viewer) => boundsFromViewer(viewer),
     framedBounds: null,
     displayedDocument: null,
@@ -186,9 +187,10 @@ export function captureDeps(overrides = {}) {
 /**
  * Captures one frame and reports exactly what was applied.
  *
- * The reply omits identity on purpose: the app mints the frame id and drives the core session
- * state machine, so this side reports the revision it pinned, the camera and viewport it applied,
- * the size it produced, and whether that size is the requested one.
+ * The order is the contract: pin the revision, take the camera off the interactive controls, apply
+ * the pose exactly, wait for the renderer to draw *that* revision, read the frame, then put the
+ * camera and the controls back. Nothing here is timed - every wait is a condition - and the
+ * content proof is only paid for while a freshly swapped revision has not been seen once.
  */
 export async function captureView(
   viewer,
@@ -198,14 +200,13 @@ export async function captureView(
   const limits = resolved.limits ?? CAPTURE_LIMITS;
   const request = normalizeCaptureSpec(spec, limits);
   const state = stateFor(viewer);
-  // A capture set takes the viewer once and passes its lease down: only the call that acquired
-  // the gate may release it, or the second view of a set would find the viewer free again.
   const owned = lease === null || lease === undefined;
   const held = owned ? state.gate.acquire(holder) : lease;
   let applied = false;
   let decision = RESTORE_DECISION.NothingToRestore;
   let appliedCameraValue = null;
   let produced = null;
+  let suspended = false;
   const generationBefore = state.generation;
   const previous = resolvedCameraOf(viewer);
   const previousViewport = resolved.canvasSize(viewer);
@@ -223,29 +224,36 @@ export async function captureView(
       : resolveCamera(request.camera, { bounds, current: previous, framed });
 
     if (!quiet) {
+      // The interactive controls are held off while the capture owns the camera: their own easing
+      // would otherwise move the entity between the pose we set and the frame we read.
+      suspended = Boolean(viewer.beginDeterministicCamera?.());
       applyResolvedCamera(viewer, camera);
       applied = true;
     }
 
-    await resolved.awaitRender(viewer, {
+    const pinned = displayed ? displayed.documentId : request.document_id;
+    produced = await resolved.captureFrame(viewer, {
+      viewport: request.viewport,
+      format: request.format.format,
+      quality: request.format.quality,
       timeoutMs: request.timeout_ms,
-      deps: resolved,
+      expectedDocumentId: pinned,
+      expectedRevision: request.expected_revision,
+      // Once this content has been seen to render, a later capture of the same content does not
+      // have to prove it again.
+      provenToken: state.provenContentToken,
     });
 
     const observed = resolvedCameraOf(viewer);
     if (applied && cameraMoved(camera, observed)) {
-      // The camera moved while the capture held it. That is a newer navigation as far as the
-      // restore rule is concerned, and the frame the caller gets is honestly the moved one.
+      // The camera moved while the capture held it, which is a newer navigation as far as the
+      // restore rule is concerned; the frame the caller gets is honestly the moved one.
       bumpCameraGeneration(viewer);
-      state.restoreSkipped = true;
     }
     appliedCameraValue = observed ?? camera;
-    produced = resolved.captureFrame(viewer, {
-      width: request.viewport?.width,
-      height: request.viewport?.height,
-      format: request.format.format,
-      quality: request.format.quality,
-    });
+    if (produced.content_token !== undefined) {
+      state.provenContentToken = produced.content_token;
+    }
 
     decision = restoreDecision({
       policy: request.restore,
@@ -268,7 +276,7 @@ export async function captureView(
       height: produced.height,
       pixels: produced.pixels ?? null,
       applied_camera: appliedCameraValue,
-      capped: cappedFrame(request, produced),
+      capped: Boolean(produced.capped),
       generation: state.generation,
     };
     state.outcome = outcome.metadata;
@@ -287,6 +295,11 @@ export async function captureView(
     if (applied && decision === RESTORE_DECISION.Restored) {
       // Both success and failure paths restore: a camera the capture moved is not left behind.
       restorePrevious(viewer, previous, previousViewport);
+    }
+    if (suspended) {
+      // Handing the controls back always happens, and they are re-attached to where the camera
+      // ended up - so the interactive camera is coherent whatever the capture's outcome was.
+      viewer.endDeterministicCamera?.();
     }
     if (owned) {
       state.gate.release(held.token);
@@ -352,7 +365,14 @@ function restorePrevious(viewer, previous, previousViewport) {
   }
 }
 
-/** Checks the revision this capture pins against the document being shown. */
+/**
+ * Checks the document this capture names, and whether its revision is still reachable.
+ *
+ * A revision *behind* the displayed one is refused here: it can never become current again. A
+ * revision *ahead* of it is left to the readiness loop, which waits for the publication to arrive -
+ * that is exactly the state an edit immediately followed by a capture leaves the viewer in, and
+ * refusing it would turn a normal workflow into a spurious failure.
+ */
 function pinDocument(request, displayed) {
   if (!request.document_id && request.expected_revision === undefined) {
     if (!displayed) {
@@ -368,16 +388,19 @@ function pinDocument(request, displayed) {
       `document ${request.document_id} is not the displayed document (${displayed.documentId})`,
     );
   }
-  if (request.expected_revision !== undefined && displayed.revision !== request.expected_revision) {
-    throw new Error(
-      `the document moved on: expected revision ${request.expected_revision}, current ` +
-        `${displayed.revision}`,
-    );
-  }
   if (request.document_id && request.expected_revision === undefined) {
     throw new Error(
       `document ${request.document_id} was named without expected_revision; a capture pins one ` +
         "exact revision",
+    );
+  }
+  if (
+    request.expected_revision !== undefined &&
+    displayed.revision > request.expected_revision
+  ) {
+    throw new Error(
+      `the document moved on: expected revision ${request.expected_revision}, current ` +
+        `${displayed.revision}`,
     );
   }
 }
@@ -496,6 +519,8 @@ function stateFor(viewer) {
       generation: 0,
       outcome: null,
       restoreSkipped: false,
+      // The content token whose rendering has been seen to contain the document.
+      provenContentToken: -1,
     };
     sessions.set(viewer, state);
   }
@@ -510,6 +535,7 @@ function ephemeralState() {
       generation: 0,
       outcome: null,
       restoreSkipped: false,
+      provenContentToken: -1,
     };
   }
   return ephemeral;

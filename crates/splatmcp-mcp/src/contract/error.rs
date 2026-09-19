@@ -403,11 +403,19 @@ pub fn classify(message: &str) -> ErrorCode {
     {
         return ErrorCode::UnsupportedCapability;
     }
+    // Budget before capability and input: a refusal that names a limit is exhaustion, not a
+    // malformed field. The vocabulary is the one the limits themselves use, so a new limit message
+    // that says "at most" or "above the" is classified without touching this list again.
     if has("budget")
         || has("too large")
+        || has("too many")
         || has("exceeds")
         || has("overload")
         || has("admission")
+        || has("at most")
+        || has("outside the supported")
+        || has("above the")
+        || has("beyond the")
         || has("queue is full")
         || has("out of memory")
     {
@@ -537,6 +545,15 @@ mod tests {
         );
         assert_eq!(
             classify("the capture budget of 2097152 bytes was exceeded"),
+            ErrorCode::BudgetExhausted
+        );
+        // The two limit refusals a caller meets first, in the words the limits use.
+        assert_eq!(
+            classify("9 views were requested; this build captures at most 8 per call"),
+            ErrorCode::BudgetExhausted
+        );
+        assert_eq!(
+            classify("480x4097 is outside the supported 1..=4096 pixel edge"),
             ErrorCode::BudgetExhausted
         );
         assert_eq!(

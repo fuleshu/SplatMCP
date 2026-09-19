@@ -29,6 +29,7 @@ pub use protocol::{
     AuthoringNote, BatchOpParams, BatchPointParams, BoundsInfo, BoundsSummary, BridgeDescriptor,
     CameraRequest, CameraState, CaptureRequest, CaptureResult, CaptureViewOutcomeReply,
     CaptureViewReply, CaptureViewRequest, CaptureViewsReply, CaptureViewsRequest,
+    ImageArtifactReply, ReferenceAsset, ReferenceComparisonReply,
     CommitPreviewRequest,
     ComponentSummary, ComponentsReply, ComponentsRequest, ContactSheetReply,
     DistributionSummary, DocumentPlyReply,

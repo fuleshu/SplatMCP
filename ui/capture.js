@@ -1,18 +1,18 @@
-// Frame capture for the viewer.
+// Frame capture for the viewer: size, readiness, readback and encoding.
 //
-// A capture answers a question about one frame, so this module owns the two halves of that
-// promise:
+// A capture answers a question about one frame, so this module owns exactly the mechanics of
+// getting one:
 //
-// - *when* the frame is read: only after the renderer has reported the evidence the contract
-//   requires, which is the splat's uploaded resource plus a produced frame
-//   (`awaitRenderEvidence`). Neither a fixed number of `app.render()` calls nor a sleep is a
-//   correctness contract, because both return a frame that may be one upload behind.
-// - *what* is read: the drawing buffer, at the requested size, restored afterwards so the window
-//   keeps its own resolution.
-//
-// The pixels are optionally returned alongside the encoded image, because the alpha/coverage
-// diagnostic reads them, and reading a canvas twice would cost a second readback of a megabyte
-// frame.
+// - *what size*: the requested viewport is applied to the canvas, and both the requested and the
+//   achieved size travel back so a caller can see a cap;
+// - *when*: only once the renderer's own evidence says the pinned revision is the one drawn
+//   (`awaitRenderEvidence`, see capture-readiness.js). A fixed number of `app.render()` calls or a
+//   sleep is not evidence, and a frame read before the splat was drawn is how a capture reported a
+//   blank image as a success;
+// - *what*: the drawing buffer, encoded, with the pixels kept because the alpha/coverage
+//   diagnostic reads them - a second readback of a megabyte frame is not free.
+
+import { READINESS, expired, readinessVerdict } from "./capture-readiness.js";
 
 const DEFAULT_FORMAT = "png";
 const FORMATS = {
@@ -22,173 +22,189 @@ const FORMATS = {
 };
 const DEFAULT_JPEG_QUALITY = 0.9;
 const MAX_FRAME_EDGE = 4096;
-// A single frame of evidence is not enough: PlayCanvas uploads a gsplat during the frame after
-// its asset loads, and the renderer's own readiness predicate below is what decides.
+// How long a capture waits for the renderer to show the pinned revision before it fails. The
+// caller's own `timeout_ms` overrides it.
 const EVIDENCE_TIMEOUT_MS = 15000;
 
 /**
- * Renders and captures the current frame.
+ * Captures one frame of a pinned revision.
  *
- * Returns `{mime_type, data_base64, width, height}` using the bridge protocol's field names. The
- * camera is assumed to have been applied by the caller; the reported size is the real drawing
- * buffer size, which may be capped.
+ * Returns the encoded frame, its real pixel size, the pixels themselves, and whether the size had
+ * to be capped - so nothing about what was actually produced has to be inferred by the caller.
  */
-export function captureImage(viewer, options = {}) {
+export async function capturePinnedFrame(
+  viewer,
+  {
+    viewport = null,
+    format = null,
+    quality = undefined,
+    timeoutMs = EVIDENCE_TIMEOUT_MS,
+    expectedDocumentId = null,
+    expectedRevision = null,
+    provenToken = -1,
+  } = {},
+) {
   const app = viewer?.app;
   const canvas = viewer?.canvas;
   if (!app || !canvas) {
     throw new Error("the viewer is not ready to render");
   }
-
-  const format = String(options.format ?? DEFAULT_FORMAT).toLowerCase();
-  const mimeType = FORMATS[format];
-  if (!mimeType) {
-    throw new Error(`unsupported image format '${options.format}' (use png or jpeg)`);
-  }
-
-  const requested = requestedSize(options, canvas);
-  const resized = requested !== null;
-
+  const encoding = resolveFormat(format, quality);
+  const requested = requestedSize(viewport, canvas);
+  const prior = requested ? applyFrameSize(viewer, requested) : null;
   try {
-    if (resized) {
-      // resizeCanvas sizes the element in CSS pixels and the drawing buffer is scaled by
-      // min(devicePixelRatio, maxPixelRatio), so the request is divided by that factor to make
-      // `width`/`height` mean real frame pixels. The achieved size is reported back.
-      const ratio = Math.min(window.devicePixelRatio || 1, app.graphicsDevice.maxPixelRatio || 1);
-      app.resizeCanvas(
-        Math.max(1, Math.round(requested.width / ratio)),
-        Math.max(1, Math.round(requested.height / ratio)),
-      );
-    }
-    app.render();
-    const { mimeType: reported, base64 } = readCanvas(canvas, mimeType, options.quality);
+    const ready = await awaitRenderEvidence(viewer, {
+      expectedDocumentId,
+      expectedRevision,
+      timeoutMs,
+      provenToken,
+      readback: (target) => readFrameProbe(target),
+    });
+    const probe = ready ?? readFrameProbe(viewer);
+    const encoded = encodeCanvasFrame(viewer, {
+      format: encoding.format,
+      quality: encoding.quality,
+      pixels: probe?.pixels ?? null,
+    });
     return {
-      mime_type: reported,
-      data_base64: base64,
-      width: canvas.width,
-      height: canvas.height,
+      ...encoded,
+      capped: requested ? requested.width !== encoded.width || requested.height !== encoded.height : false,
+      requested_viewport: requested,
+      attempts: ready?.attempts ?? 0,
+      content_token: ready?.readiness?.content_token ?? 0,
     };
   } finally {
-    if (resized) {
-      // Back to the container's own size.
-      viewer.handleResize();
+    if (prior) {
+      restoreFrameSize(viewer, prior);
     }
-    app.render();
   }
 }
 
 /**
- * Captures a frame and reads its pixels back as well.
+ * Renders and reads the current frame as pixels, without encoding it.
  *
- * The pixels come from the same readback as the image, so a diagnostic pass costs no second
- * render and no second upload. `pixels` is `null` when the frame cannot be read back into a
- * byte array (a tainted canvas, or a host that forbids it), and the caller then reports the pass
- * as unavailable rather than as empty coverage.
+ * The probe is what the readiness loop reads: encoding a frame that may still be an upload would
+ * cost a full PNG encode per attempt.
  */
-export function captureFrameWithPixels(viewer, options = {}) {
+export function readFrameProbe(viewer) {
   const app = viewer?.app;
   const canvas = viewer?.canvas;
   if (!app || !canvas) {
     throw new Error("the viewer is not ready to render");
   }
+  app.render();
+  const pixels = readPixels(canvas);
+  return {
+    pixels,
+    width: canvas.width,
+    height: canvas.height,
+  };
+}
 
-  const format = String(options.format ?? DEFAULT_FORMAT).toLowerCase();
-  const mimeType = FORMATS[format];
-  if (!mimeType) {
-    throw new Error(`unsupported image format '${options.format}' (use png or jpeg)`);
+/** Encodes the frame that is on the drawing buffer right now. */
+export function encodeCanvasFrame(viewer, { format = DEFAULT_FORMAT, quality = undefined, pixels = null } = {}) {
+  const canvas = viewer?.canvas;
+  if (!canvas) {
+    throw new Error("the viewer is not ready to render");
   }
-
-  const requested = requestedSize(options, canvas);
-  const resized = requested !== null;
-
-  try {
-    if (resized) {
-      const ratio = Math.min(window.devicePixelRatio || 1, app.graphicsDevice.maxPixelRatio || 1);
-      app.resizeCanvas(
-        Math.max(1, Math.round(requested.width / ratio)),
-        Math.max(1, Math.round(requested.height / ratio)),
-      );
-    }
-    app.render();
-    const { mimeType: reported, base64 } = readCanvas(canvas, mimeType, options.quality);
-    const pixels = readPixels(canvas);
-    return {
-      mime_type: reported,
-      data_base64: base64,
-      width: canvas.width,
-      height: canvas.height,
-      pixels,
-    };
-  } finally {
-    if (resized) {
-      viewer.handleResize();
-    }
-    app.render();
-  }
+  const encoding = resolveFormat(format, quality);
+  const { mimeType, base64 } = readCanvas(canvas, encoding.mime_type, quality);
+  return {
+    mime_type: mimeType,
+    data_base64: base64,
+    width: canvas.width,
+    height: canvas.height,
+    pixels: pixels ?? readPixels(canvas),
+  };
 }
 
 /**
- * Waits for the renderer's own evidence that a frame of the displayed splat can be read.
+ * Captures the current frame in the legacy one-shot shape.
  *
- * The predicate is the splat's uploaded resource, which is what actually has to be ready before
- * a frame shows it; PlayCanvas' `postrender` event is only how this module is scheduled to look
- * again. A renderer that never becomes ready fails with the reason instead of returning the
- * previous frame, and a timeout is reported as such - never as a successful capture of a stale
- * upload.
+ * Kept for `viewer_capture`, which older tools call: same readiness rule, same size handling, and
+ * the result reduced to the fields that reply has always carried.
  */
-export async function awaitRenderEvidence(viewer, { timeoutMs = EVIDENCE_TIMEOUT_MS, settle = null } = {}) {
+export async function captureImage(viewer, options = {}) {
+  const frame = await capturePinnedFrame(viewer, {
+    viewport: sizeOption(options),
+    format: options.format ?? null,
+    quality: options.quality,
+  });
+  return {
+    mime_type: frame.mime_type,
+    data_base64: frame.data_base64,
+    width: frame.width,
+    height: frame.height,
+  };
+}
+
+/** Captures the current frame and keeps its pixels, for the diagnostic passes. */
+export async function captureFrameWithPixels(viewer, options = {}) {
+  return capturePinnedFrame(viewer, {
+    viewport: sizeOption(options),
+    format: options.format ?? null,
+    quality: options.quality,
+  });
+}
+
+/**
+ * Waits until a frame of the pinned revision can be read, and returns that frame's readback.
+ *
+ * The conditions are the renderer's own evidence (see capture-readiness.js): the pinned revision
+ * is the one displayed, the engine has completed a frame since the content changed, and - while
+ * the content is still unproven - the frame actually holds the document. A timeout reports which
+ * condition never became true, so a blank frame is never returned as a success.
+ */
+export async function awaitRenderEvidence(
+  viewer,
+  {
+    expectedDocumentId = null,
+    expectedRevision = null,
+    timeoutMs = EVIDENCE_TIMEOUT_MS,
+    provenToken = -1,
+    readback = null,
+  } = {},
+) {
   const app = viewer?.app;
   if (!app) {
     throw new Error("the viewer is not ready to render");
   }
-  const deadline = Date.now() + Math.max(1, timeoutMs);
-  let frames = 0;
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(1, timeoutMs);
+  let attempts = 0;
+  let lastReason = "the renderer was never asked for a frame";
   for (;;) {
-    if (renderReady(viewer)) {
-      // One frame is produced after the resource is ready, so the readback below reads the
-      // upload that was awaited rather than the one before it.
-      app.render();
-      if (settle) {
-        await settle(viewer);
-      }
-      return { frames, ready: true };
+    attempts += 1;
+    const readiness = viewer.contentReadiness?.() ?? {};
+    const frame = typeof readback === "function" ? readback(viewer) : null;
+    const verdict = readinessVerdict({
+      expectedDocumentId,
+      expectedRevision,
+      displayedDocumentId: readiness.displayed_document_id ?? null,
+      displayedRevision: readiness.displayed_revision ?? null,
+      stagedDocumentId: readiness.staged_document_id ?? null,
+      stagedRevision: readiness.staged_revision ?? null,
+      uploadPending: Boolean(readiness.upload_pending),
+      contentToken: readiness.content_token ?? 0,
+      provenToken,
+      pointCount: readiness.point_count ?? 0,
+      pixels: frame?.pixels ?? null,
+    });
+    if (verdict.status === READINESS.Ready) {
+      return { ...frame, attempts, readiness };
     }
-    if (Date.now() > deadline) {
+    if (verdict.status === READINESS.Failed) {
+      throw new Error(verdict.reason);
+    }
+    lastReason = verdict.reason;
+    if (expired(startedAt, Date.now(), timeoutMs) || Date.now() >= deadline) {
       throw new Error(
-        `the renderer did not finish preparing the splat within ${timeoutMs} ms, so no frame of ` +
-          "this revision exists yet",
+        `no frame of revision ${expectedRevision ?? "?"} could be captured within ${timeoutMs} ms: ` +
+          lastReason,
       );
     }
     await nextRenderedFrame(app);
-    frames += 1;
   }
-}
-
-/**
- * True when the renderer holds everything the next frame needs.
- *
- * A splat is ready when its entity exists, its `gsplat` component has a resource, and that
- * resource has a valid bounding box - the same evidence the framing code relies on. The upload
- * of a large splat happens during the frames after its asset loads, which is exactly the window
- * in which a naive "render twice" capture returns an empty image.
- */
-export function renderReady(viewer) {
-  const entity = viewer?.splatEntity;
-  if (!entity || !entity.gsplat) {
-    return false;
-  }
-  const resource = entity.gsplat.resource ?? viewer.splatAsset?.resource ?? null;
-  if (!resource) {
-    return false;
-  }
-  const aabb = resource.aabb;
-  if (aabb && typeof aabb.getMin === "function") {
-    const min = aabb.getMin();
-    const max = aabb.getMax();
-    return [min.x, min.y, min.z, max.x, max.y, max.z].every(Number.isFinite);
-  }
-  // No bounding box is reported by this renderer: the resource itself is the evidence.
-  return true;
 }
 
 /** Resolves after the renderer has produced one more frame. */
@@ -203,21 +219,71 @@ export function nextRenderedFrame(app) {
       app.off?.("postrender", finish);
       resolve();
     };
-    app.once("postrender", finish);
-    // A renderer that is not currently running still has to answer: ask for a frame, and let the
-    // rare host without the event resolve on the next turn of the event loop.
-    app.render();
-    if (typeof app.once !== "function") {
-      setTimeout(finish, 0);
+    if (typeof app.once === "function") {
+      app.once("postrender", finish);
+      app.render();
+      return;
     }
+    // A host without the event still has to answer: ask for a frame and settle on the next turn.
+    app.render?.();
+    setTimeout(finish, 0);
   });
 }
 
-function readCanvas(canvas, mimeType, quality) {
+/**
+ * Applies a frame size and returns the drawing-buffer size it replaced.
+ *
+ * `resizeCanvas` sizes the element in CSS pixels and the buffer is scaled by
+ * min(devicePixelRatio, maxPixelRatio), so the request is divided by that factor for `width` and
+ * `height` to mean real frame pixels. The achieved size is reported back rather than assumed.
+ */
+export function applyFrameSize(viewer, size) {
+  const app = viewer?.app;
+  const prior = { width: viewer?.canvas?.width ?? 0, height: viewer?.canvas?.height ?? 0 };
+  const ratio = Math.min(
+    (typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1,
+    app?.graphicsDevice?.maxPixelRatio || 1,
+  );
+  app.resizeCanvas(
+    Math.max(1, Math.round(size.width / ratio)),
+    Math.max(1, Math.round(size.height / ratio)),
+  );
+  return prior;
+}
+
+/** Puts the window back to the size it had before a capture. */
+export function restoreFrameSize(viewer, prior) {
+  if (prior?.width > 0 && prior?.height > 0) {
+    viewer?.app?.resizeCanvas?.(prior.width, prior.height);
+  }
+  viewer?.handleResize?.();
+}
+
+function sizeOption(options) {
+  const width = numberOr(options.width, null);
+  const height = numberOr(options.height, null);
+  if (width === null && height === null) {
+    return null;
+  }
+  return { width, height: height ?? Math.max(1, Math.round(width * 0.75)) };
+}
+
+function resolveFormat(format, quality) {
+  const name = String(format ?? DEFAULT_FORMAT).toLowerCase();
+  const mimeType = FORMATS[name];
+  if (!mimeType) {
+    throw new Error(`unsupported image format '${format}' (use png or jpeg)`);
+  }
   const resolvedQuality =
     mimeType === "image/jpeg"
       ? clamp(numberOr(quality, null) ?? DEFAULT_JPEG_QUALITY * 100, 1, 100) / 100
       : undefined;
+  return { format: name === "jpg" ? "jpeg" : name, mime_type: mimeType, quality: resolvedQuality };
+}
+
+function readCanvas(canvas, mimeType, quality) {
+  const resolvedQuality =
+    mimeType === "image/jpeg" ? clamp(numberOr(quality, null) ?? DEFAULT_JPEG_QUALITY * 100, 1, 100) / 100 : undefined;
   const dataUrl = canvas.toDataURL(mimeType, resolvedQuality);
   const comma = dataUrl.indexOf(",");
   if (comma < 0) {
@@ -233,8 +299,8 @@ function readCanvas(canvas, mimeType, quality) {
 /**
  * The frame's pixels, or `null` when this host cannot read them back.
  *
- * Reading the drawing buffer is what makes the alpha and coverage passes possible, and a host
- * that refuses it must not be reported as a frame with no geometry.
+ * Reading the drawing buffer is what makes the alpha and coverage passes possible, and a host that
+ * refuses it must not be reported as a frame with no geometry.
  */
 function readPixels(canvas) {
   try {
@@ -249,9 +315,9 @@ function readPixels(canvas) {
   }
 }
 
-function requestedSize(options, canvas) {
-  const width = numberOr(options.width, null);
-  const height = numberOr(options.height, null);
+function requestedSize(viewport, canvas) {
+  const width = numberOr(viewport?.width, null);
+  const height = numberOr(viewport?.height, null);
   if (width === null && height === null) {
     return null;
   }

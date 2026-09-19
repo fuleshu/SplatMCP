@@ -34,7 +34,8 @@ pub const MAX_PASSES_PER_VIEW: usize = 5;
 pub struct ViewSpec {
     /// Short label used in the manifest and drawn on the contact sheet.
     pub label: String,
-    /// Camera for this view.
+    /// Camera for this view; `null` means the shared/default camera.
+    #[serde(default, deserialize_with = "super::null_default")]
     pub camera: CameraSpec,
     /// Frame size for this view; omitted uses the set's shared viewport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,6 +43,9 @@ pub struct ViewSpec {
     /// Encoding for this view; omitted uses the set's shared format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<OutputFormat>,
+    /// JPEG quality beside a format given by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
     /// Diagnostic passes this view adds to the shared ones.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passes: Vec<DiagnosticPass>,
@@ -54,6 +58,9 @@ pub struct SharedSettings {
     pub viewport: Option<Viewport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<OutputFormat>,
+    /// JPEG quality beside a format given by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<super::camera::Background>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,7 +107,7 @@ pub struct CaptureSetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
     pub views: Vec<ViewSpec>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_default")]
     pub shared: SharedSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_sheet: Option<ContactSheetRequest>,
@@ -121,6 +128,7 @@ impl CaptureSetSpec {
             camera: CameraSpec::default(),
             viewport: self.shared.viewport,
             format: self.shared.format,
+            quality: self.shared.quality,
             background: self.shared.background,
             timeout_ms: self.shared.timeout_ms,
             restore: self.shared.restore,
@@ -874,6 +882,7 @@ mod tests {
             },
             viewport: None,
             format: None,
+            quality: None,
             passes: Vec::new(),
         }
     }

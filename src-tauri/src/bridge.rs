@@ -127,6 +127,8 @@ impl Handler for AppBridge {
             Method::AppCapabilities => Ok(crate::capabilities::report(
                 &self.state(),
                 &self.captures,
+                &self.assets,
+                &self.jobs_host(),
             )),
             Method::PythonRunSplat => {
                 let request: PythonRunRequest = serde_json::from_value(params)
@@ -674,6 +676,11 @@ impl AppBridge {
         };
         self.captures
             .capture_views(&self.viewer, &self.state(), request)
+    }
+
+    /// The job host, resolved from managed state so a command and the bridge share it.
+    fn jobs_host(&self) -> Arc<crate::jobs::JobHost> {
+        self.app.state::<crate::jobs::JobHostState>().0.clone()
     }
 
     /// The document host, resolved from managed state so a command and the bridge share it.

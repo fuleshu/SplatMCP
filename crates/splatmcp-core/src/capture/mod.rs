@@ -28,8 +28,8 @@ pub use camera::{
     resolve,
 };
 pub use diagnostics::{
-    AlphaMask, Depth, DepthStatistic, DiagnosticPass, PassCapability, PassSupport, Sample,
-    alpha_coverage, depth_statistic, pass_capabilities,
+    AlphaMask, Depth, DepthStatistic, DiagnosticPass, PASS_NAMES, PassCapability, PassSupport,
+    Sample, alpha_coverage, depth_statistic, pass_capabilities,
 };
 pub use session::{
     CameraGeneration, CaptureGate, CaptureLease, CaptureSession, CaptureSpec, CaptureStage,
@@ -241,6 +241,20 @@ impl From<crate::document::ArtifactChecksum> for ChecksumSummary {
             bytes: checksum.bytes,
         }
     }
+}
+
+/// Deserializes `T` from a present value, or from an explicit `null` as `T::default()`.
+///
+/// A published tool schema says "omit this to keep the current value", and a client that sends
+/// `null` for an omitted optional object means exactly that. Without this, `{"camera": null}`
+/// fails as "invalid type: null, expected struct CameraSpec", which is a refusal of a request
+/// written the documented way.
+pub(crate) fn null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Rounds a float to three decimals, so a reply stays readable without losing a pose.

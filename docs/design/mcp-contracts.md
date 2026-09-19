@@ -65,6 +65,14 @@ which is what made validation failures, stale revisions and transport failures i
 
 ## Capabilities and real limits
 
+Discovery answers what a caller needs before calling anything: the tool names this server serves
+(read from the router itself), the app's build versions, `/limits/{capture,gaussians,assets,jobs,document}`
+with the numbers the enforcing components report, the camera presets, projections, formats, restore
+policies and fit targets, the accepted input shapes, the Gaussian conventions (handedness, axes,
+quaternion order, colour space, scale and opacity semantics, SH degree), the diagnostic passes with
+their meanings and limitations, and the Python runtime's readiness - reported as *unavailable*, with
+the reason, rather than omitted, when the optional runtime is not there.
+
 `src-tauri/src/capabilities.rs` assembles the report and `splatmcp_capabilities` serves it. Every
 number is read from the component that enforces it: the capture gate's `CaptureLimits`, the job
 service's `JobLimits`, the asset registry's budgets, the document store's retention limits, the

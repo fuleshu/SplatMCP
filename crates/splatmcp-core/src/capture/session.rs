@@ -111,8 +111,8 @@ pub struct CaptureSpec {
     /// Revision the caller believes is displayed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
-    /// Camera to apply; empty keeps the current one.
-    #[serde(default)]
+    /// Camera to apply; omitted, empty or `null` keeps the current one.
+    #[serde(default, deserialize_with = "super::null_default")]
     pub camera: CameraSpec,
     /// Frame size; omitted keeps the current viewport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +120,12 @@ pub struct CaptureSpec {
     /// Encoding; defaults to PNG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<OutputFormat>,
+    /// JPEG quality beside a format given by name, as the tool schema documents the pair.
+    ///
+    /// Meaningful only for a JPEG: a quality on a PNG is ignored rather than refused, because the
+    /// format has no such setting and the caller meant no harm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
     /// Background; defaults to the viewer's own colour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Background>,
@@ -137,9 +143,13 @@ impl CaptureSpec {
         self.restore.unwrap_or(RestorePolicy::RestorePrevious)
     }
 
-    /// The encoding in force.
+    /// The encoding in force, with a quality given beside the name applied to it.
     pub fn resolved_format(&self) -> OutputFormat {
-        self.format.unwrap_or(OutputFormat::Png)
+        match (self.format, self.quality) {
+            (Some(OutputFormat::Jpeg { .. }), Some(quality)) => OutputFormat::Jpeg { quality },
+            (Some(format), _) => format,
+            (None, _) => OutputFormat::Png,
+        }
     }
 
     /// The background in force.
@@ -255,6 +265,13 @@ pub struct CaptureSession {
     /// The camera the capture applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_camera: Option<super::camera::ResolvedCamera>,
+    /// True when this capture changed the camera.
+    ///
+    /// Deliberately separate from `applied_camera`: a capture that keeps the current camera still
+    /// *reports* the camera that was in force, and has nothing to restore. Inferring the restore
+    /// decision from "a camera was reported" made those two cases disagree.
+    #[serde(default)]
+    pub camera_applied: bool,
     pub stage: CaptureStage,
 }
 
@@ -371,6 +388,7 @@ impl CaptureSession {
             generation_before,
             previous_camera,
             applied_camera: None,
+            camera_applied: false,
             stage: CaptureStage::Pinned,
         })
     }
@@ -412,6 +430,7 @@ impl CaptureSession {
             });
         }
         self.applied_camera = Some(camera);
+        self.camera_applied = true;
         self.stage = CaptureStage::Applied;
         Ok(())
     }
@@ -497,6 +516,7 @@ impl CaptureSession {
         pinned: &DocumentHandle,
         generation_before: CameraGeneration,
         applied: super::camera::ResolvedCamera,
+        camera_applied: bool,
         frame_id: u64,
         viewport: Viewport,
         format: OutputFormat,
@@ -516,6 +536,7 @@ impl CaptureSession {
             generation_before,
             previous_camera: None,
             applied_camera: Some(applied),
+            camera_applied,
             stage: CaptureStage::AwaitingRender,
         };
         session.finish(
@@ -539,7 +560,7 @@ impl CaptureSession {
 
     /// Whether the interactive camera may be put back.
     pub fn restore_decision(&self, generation_now: CameraGeneration) -> RestoreDecision {
-        if self.applied_camera.is_none() {
+        if !self.camera_applied {
             return RestoreDecision::NothingToRestore;
         }
         if self.spec.restore_policy() == RestorePolicy::KeepCamera {
@@ -694,6 +715,7 @@ mod tests {
             },
             viewport: Some(Viewport::new(640, 480)),
             format: None,
+            quality: None,
             background: None,
             timeout_ms: Some(5_000),
             restore: None,
@@ -926,6 +948,7 @@ mod tests {
             &pinned,
             CameraGeneration(4),
             camera(),
+            true,
             12,
             Viewport::new(640, 480),
             OutputFormat::Png,
@@ -966,6 +989,37 @@ mod tests {
         assert_eq!(recorded, stepped, "both paths produce one shape of metadata");
         assert_eq!(recorded.restore, RestoreDecision::Restored);
         assert_eq!(recorded.applied.camera, camera());
+    }
+
+    #[test]
+    fn a_capture_that_kept_the_camera_has_nothing_to_restore() {
+        // The camera is still reported - a caller needs to know what a frame was made with - but
+        // nothing was changed, so there is nothing to undo.
+        let displayed = handle(3);
+        let spec = CaptureSpec {
+            camera: CameraSpec::default(),
+            ..spec()
+        };
+        let pinned = pin_for_capture(&spec, Some(&displayed)).unwrap();
+        let recorded = CaptureSession::record(
+            spec,
+            &pinned,
+            CameraGeneration(4),
+            camera(),
+            false,
+            21,
+            Viewport::new(640, 480),
+            OutputFormat::Png,
+            1024,
+            false,
+            1_700,
+            CameraGeneration(4),
+            "app",
+            3,
+        )
+        .unwrap();
+        assert_eq!(recorded.restore, RestoreDecision::NothingToRestore);
+        assert_eq!(recorded.applied.camera, camera(), "the camera in force is still reported");
     }
 
     #[test]

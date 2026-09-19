@@ -239,7 +239,7 @@ impl CameraPreset {
 }
 
 /// What `fit` frames, so "fit the document" and "fit one component" are different requests.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "of")]
 pub enum FitTarget {
     /// The whole displayed document.
@@ -252,6 +252,68 @@ pub enum FitTarget {
     ///
     /// Its radius and centre are derived, so a caller only states the corners it knows.
     Bounds { min: [f32; 3], max: [f32; 3] },
+}
+
+impl<'de> Deserialize<'de> for FitTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Tagged {
+                #[serde(default)]
+                of: Option<String>,
+                #[serde(default)]
+                component_id: Option<String>,
+                #[serde(default)]
+                selection_id: Option<String>,
+                #[serde(default)]
+                min: Option<[f32; 3]>,
+                #[serde(default)]
+                max: Option<[f32; 3]>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => match name.trim().to_lowercase().as_str() {
+                "document" | "all" => Self::Document,
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported fit target '{other}' (use document, component, selection or \
+                         bounds)"
+                    )));
+                }
+            },
+            Repr::Tagged {
+                of,
+                component_id,
+                selection_id,
+                min,
+                max,
+            } => match of.as_deref() {
+                None | Some("document") => Self::Document,
+                Some("component") => Self::Component {
+                    component_id: component_id.ok_or_else(|| {
+                        serde::de::Error::custom("fitting a component needs component_id")
+                    })?,
+                },
+                Some("selection") => Self::Selection {
+                    selection_id: selection_id.ok_or_else(|| {
+                        serde::de::Error::custom("fitting a selection needs selection_id")
+                    })?,
+                },
+                Some("bounds") => Self::Bounds {
+                    min: min.ok_or_else(|| serde::de::Error::custom("fitting bounds needs min"))?,
+                    max: max.ok_or_else(|| serde::de::Error::custom("fitting bounds needs max"))?,
+                },
+                Some(other) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported fit target '{other}' (use document, component, selection or \
+                         bounds)"
+                    )));
+                }
+            },
+        })
+    }
 }
 
 /// Derived bounds of an explicit box: centre and framing radius included.
@@ -315,7 +377,11 @@ impl Viewport {
 }
 
 /// Requested image encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serialised as a tagged object, and **accepted as the documented name as well**: the published
+/// tool schema says `"png"`, so a request written the way the schema documents it has to work
+/// instead of failing deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "format")]
 pub enum OutputFormat {
     Png,
@@ -323,6 +389,44 @@ pub enum OutputFormat {
         /// 1-100, as a caller writes it.
         quality: u8,
     },
+}
+
+impl<'de> Deserialize<'de> for OutputFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Jpeg {
+                #[serde(default)]
+                quality: Option<u8>,
+            },
+            // A quality on a PNG has no meaning; accepting it here keeps a caller that sends one
+            // from being refused for a field the format ignores.
+            Png {
+                #[serde(default)]
+                quality: Option<u8>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => match name.trim().to_lowercase().as_str() {
+                "png" => Self::Png,
+                "jpeg" | "jpg" => Self::Jpeg {
+                    quality: Self::DEFAULT_JPEG_QUALITY,
+                },
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported image format '{other}' (use png or jpeg)"
+                    )));
+                }
+            },
+            // A quality on a PNG is ignored: the format has no such setting.
+            Repr::Png { quality: _ignored } => Self::Png,
+            Repr::Jpeg { quality } => Self::Jpeg {
+                quality: quality.unwrap_or(Self::DEFAULT_JPEG_QUALITY),
+            },
+        })
+    }
 }
 
 impl OutputFormat {
@@ -377,7 +481,10 @@ impl OutputFormat {
 }
 
 /// What is behind the gaussians in the captured frame.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// Accepted as the documented name or as the tagged object, for the same reason as
+/// [`OutputFormat`]: the schema documents `"transparent"`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Background {
     /// Alpha is meaningful: an uncovered pixel keeps its transparency in PNG.
@@ -386,6 +493,42 @@ pub enum Background {
     Solid { color: [f32; 3] },
     /// The app's own viewport colour, so a capture matches what a user sees.
     Viewer,
+}
+
+impl<'de> Deserialize<'de> for Background {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Transparency {
+                #[serde(default)]
+                transparent: bool,
+                #[serde(default)]
+                color: Option<[f32; 3]>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => match name.trim().to_lowercase().as_str() {
+                "transparent" => Self::Transparent,
+                "viewer" => Self::Viewer,
+                "solid" => Self::Solid {
+                    color: [0.0; 3],
+                },
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported background '{other}' (use transparent, solid or viewer)"
+                    )));
+                }
+            },
+            Repr::Transparency { transparent, color } => match color {
+                Some(color) => Self::Solid { color },
+                None if transparent => Self::Transparent,
+                // `{}` is a viewer background: the caller asked for no particular one.
+                None => Self::Viewer,
+            },
+        })
+    }
 }
 
 impl Background {
@@ -424,13 +567,54 @@ impl Background {
 }
 
 /// Perspective or orthographic projection.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// `"perspective"` is accepted as a plain name; an orthographic projection carries the world
+/// height it needs, so it is only accepted as the tagged object.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Projection {
     /// Vertical field of view in degrees, taken from the camera spec.
     Perspective,
     /// Orthographic with an explicit world-space height in metres.
     Orthographic { height: f32 },
+}
+
+impl<'de> Deserialize<'de> for Projection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Tagged {
+                #[serde(default)]
+                kind: Option<String>,
+                #[serde(default)]
+                height: Option<f32>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => match name.trim().to_lowercase().as_str() {
+                "perspective" => Self::Perspective,
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported projection '{other}': an orthographic projection needs its \
+                         world height, so pass {{\"kind\":\"orthographic\",\"height\":..}}"
+                    )));
+                }
+            },
+            Repr::Tagged { kind, height } => match kind.as_deref() {
+                Some("orthographic") => Self::Orthographic {
+                    height: height.unwrap_or(0.0),
+                },
+                Some("perspective") | None => Self::Perspective,
+                Some(other) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported projection '{other}' (use perspective or orthographic)"
+                    )));
+                }
+            },
+        })
+    }
 }
 
 impl Projection {
@@ -463,6 +647,9 @@ impl Projection {
 /// A whole camera request: at most one form, plus the values that refine it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CameraSpec {
+    // Nothing here is required: an omitted camera keeps the current one, and a request that omits
+    // the whole object is deserialized as this default.
+
     /// An explicit eye/target/up placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose: Option<Pose>,
@@ -945,7 +1132,65 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
+    use super::super::session::CaptureSpec;
     use super::*;
+
+    #[test]
+    fn the_published_input_shapes_deserialize() {
+        // Each of these is how the tool schema documents a field. They failed before with
+        // "invalid type: string, expected internally tagged enum", which made a request written the
+        // documented way impossible to send.
+        let named: CaptureSpec = serde_json::from_str(r#"{"format": "png"}"#).unwrap();
+        assert_eq!(named.format, Some(OutputFormat::Png));
+
+        // A name with the quality beside it, and the tagged object carrying both.
+        let jpeg: CaptureSpec = serde_json::from_str(r#"{"format": "jpeg", "quality": 80}"#).unwrap();
+        assert_eq!(
+            jpeg.resolved_format(),
+            OutputFormat::Jpeg { quality: 80 },
+            "a jpeg is accepted as a name and keeps the quality given beside it"
+        );
+        let tagged: CaptureSpec =
+            serde_json::from_str(r#"{"format": {"format": "jpeg", "quality": 70}}"#).unwrap();
+        assert_eq!(tagged.resolved_format(), OutputFormat::Jpeg { quality: 70 });
+        let png: CaptureSpec = serde_json::from_str(r#"{"format": "png", "quality": 80}"#).unwrap();
+        assert_eq!(
+            png.resolved_format(),
+            OutputFormat::Png,
+            "a quality on a PNG is ignored rather than refused"
+        );
+
+        let transparent: CaptureSpec =
+            serde_json::from_str(r#"{"background": "transparent"}"#).unwrap();
+        assert_eq!(transparent.background, Some(Background::Transparent));
+        let viewer: CaptureSpec = serde_json::from_str(r#"{"background": "viewer"}"#).unwrap();
+        assert_eq!(viewer.background, Some(Background::Viewer));
+
+        // An omitted or null camera means "keep the current one".
+        let omitted: CaptureSpec = serde_json::from_str(r#"{"timeout_ms": 5000}"#).unwrap();
+        assert!(omitted.camera.keeps_current_camera());
+        let null: CaptureSpec = serde_json::from_str(r#"{"camera": null}"#).unwrap();
+        assert!(null.camera.keeps_current_camera());
+        let empty: CaptureSpec = serde_json::from_str(r#"{"camera": {}}"#).unwrap();
+        assert!(empty.camera.keeps_current_camera());
+
+        // The other documented short forms.
+        let projection: CaptureSpec =
+            serde_json::from_str(r#"{"camera": {"projection": "perspective"}}"#).unwrap();
+        assert_eq!(projection.camera.projection, Some(Projection::Perspective));
+        let fit: CaptureSpec = serde_json::from_str(r#"{"camera": {"fit": "document"}}"#).unwrap();
+        assert_eq!(fit.camera.fit, Some(FitTarget::Document));
+        let pose: CaptureSpec = serde_json::from_str(
+            r#"{"camera": {"pose": {"position": [0,0,3], "target": [0,0,0]}}}"#,
+        )
+        .unwrap();
+        assert!(pose.camera.pose.is_some());
+
+        // A name this contract does not have is still refused, by name.
+        let error = serde_json::from_str::<CaptureSpec>(r#"{"format": "bmp"}"#).unwrap_err();
+        assert!(error.to_string().contains("bmp"), "{error}");
+    }
+
 
     fn bounds() -> Bounds {
         Bounds {

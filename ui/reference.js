@@ -298,6 +298,84 @@ export function summarizeDifference({ capture, reference, width, height, region 
   };
 }
 
+/**
+ * Compares a captured view against a decoded reference image.
+ *
+ * The host supplies the decoded pixels of both images and the drawing surface used to apply the
+ * alignment, because decoding a PNG and resampling it are the host's capabilities, not rules. What
+ * this function owns is the *arithmetic and the wording*: explicit alignment, a declared mask, the
+ * named metrics and the disclaimer that keeps a difference from reading as a verdict.
+ */
+export async function compareWithReference({
+  reference,
+  capturePixels,
+  width,
+  height,
+  decodeReference,
+  alignReference,
+  differenceImage = null,
+}) {
+  validateReference(reference, { width, height });
+  const alignment = resolvedAlignment(reference);
+  const threshold = resolvedThreshold(reference);
+  const opacity = resolvedOpacity(reference);
+  const decoded = await decodeReference(reference.asset);
+  if (!decoded?.pixels) {
+    throw refuse("the reference image could not be decoded");
+  }
+  const aligned = await alignReference({
+    reference: decoded,
+    alignment,
+    width,
+    height,
+    crop: alignment.crop,
+  });
+  const captureRegion = reference.region ?? null;
+  const capturePlane = capturePixels
+    ? intensityPlane(capturePixels, { width, height, colorSpace: REFERENCE_COLOR_SPACE.MatchesCapture })
+    : null;
+  const referencePlane = aligned?.pixels
+    ? intensityPlane(aligned.pixels, { width, height, colorSpace: alignment.color_space })
+    : null;
+  const mask = comparisonMask({
+    width,
+    height,
+    coverage: captureCoverage(capturePixels, width, height),
+    pixels: capturePixels ?? null,
+    region: captureRegion,
+  });
+  const summary = comparePlanes(capturePlane, referencePlane, mask.maskFloat, threshold);
+  const difference = differenceImage
+    ? await differenceImage({ capture: capturePlane, reference: referencePlane, mask: mask.mask, width, height, threshold })
+    : null;
+  return {
+    ...summary,
+    /** Pixels the comparison read from the reference, so alignment differences are visible. */
+    aligned_size: aligned ? { width: aligned.width ?? width, height: aligned.height ?? height } : null,
+    alignment: {
+      scale: alignment.scale,
+      offset: alignment.offset,
+      rotation_degrees: alignment.rotation_degrees,
+      color_space: alignment.color_space,
+      resize_to_capture: alignment.resize_to_capture,
+      crop: alignment.crop,
+    },
+    opacity,
+    difference,
+  };
+}
+
+/** Per-pixel coverage of a captured frame, or `null` when the frame has no usable alpha. */
+function captureCoverage(pixels, width, height) {
+  if (!pixels) {
+    return null;
+  }
+  const coverage = alphaCoverage(pixels, { width, height, minCoverage: DEFAULT_MIN_COVERAGE });
+  // An opaque capture reports full coverage everywhere, which would mask nothing; a mask that
+  // excludes everything is worse than no mask, so it is dropped.
+  return coverage.maximum === coverage.minimum ? null : coverage.coverage;
+}
+
 function isAbsolutePath(path) {
   const text = String(path ?? "");
   return /^[A-Za-z]:[\\/]/.test(text) || text.startsWith("\\\\") || text.startsWith("/");

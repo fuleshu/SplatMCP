@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{CaptureError, Result};
 
+/// Every pass name this contract has, whether or not a build can produce it.
+///
+/// One list, used by the parser, the capability report and the refusal messages, so a name can
+/// never be accepted in one place and rejected in another.
+pub const PASS_NAMES: [&str; 5] = ["rgb", "alpha", "depth", "component", "scale_orientation"];
+
 /// Coverage below which a ray counts as background instead of geometry.
 pub const DEFAULT_MIN_COVERAGE: f32 = 0.5;
 
@@ -222,7 +228,11 @@ pub fn depth_statistic(samples: &[Sample], statistic: DepthStatistic, min_covera
 }
 
 /// A diagnostic pass a capture set may ask for.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Accepted as its documented name (`"rgb"`, `"alpha"`, `"scale_orientation"`, …) or as the
+/// tagged object that carries a pass's own arguments, because the published set schema lists the
+/// names: a request written the way the schema documents it has to work.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "pass")]
 pub enum DiagnosticPass {
     /// The rendered image itself.
@@ -248,6 +258,66 @@ pub enum DiagnosticPass {
     /// A colour-coded view of gaussian scale and dominant axis, which is how an oversized or
     /// elongated splat becomes visible.
     ScaleOrientation,
+}
+
+impl<'de> Deserialize<'de> for DiagnosticPass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Tagged {
+                #[serde(default)]
+                statistic: Option<DepthStatistic>,
+                #[serde(default)]
+                near: Option<f32>,
+                #[serde(default)]
+                far: Option<f32>,
+                #[serde(default)]
+                component_id: Option<String>,
+                #[serde(default)]
+                selection: Option<bool>,
+                #[serde(default)]
+                pass: Option<String>,
+            },
+        }
+        // The tagged form arrives with `pass` in it, so it is read through the same parser the
+        // schema validates against rather than a second list of names.
+        let (name, args) = match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => (name, None),
+            Repr::Tagged {
+                statistic,
+                near,
+                far,
+                component_id,
+                selection,
+                pass,
+            } => (
+                pass.ok_or_else(|| serde::de::Error::custom("a diagnostic pass needs a name"))?,
+                Some((statistic, near, far, component_id, selection)),
+            ),
+        };
+        let parsed = Self::parse(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unsupported diagnostic pass '{name}': this contract names {}",
+                PASS_NAMES.join(", ")
+            ))
+        })?;
+        Ok(match (parsed, args) {
+            (Self::Depth { statistic, near, far }, Some((statistic_arg, near_arg, far_arg, _, _))) => {
+                Self::Depth {
+                    statistic: statistic_arg.unwrap_or(statistic),
+                    near: near_arg.unwrap_or(near),
+                    far: far_arg.unwrap_or(far),
+                }
+            }
+            (Self::Component { .. }, Some((_, _, _, component_id, selection))) => Self::Component {
+                component_id,
+                selection: selection.unwrap_or(false),
+            },
+            (parsed, _) => parsed,
+        })
+    }
 }
 
 impl DiagnosticPass {
@@ -455,6 +525,36 @@ pub fn pass_capabilities(depth_readback: bool, component_ids: bool) -> Vec<PassC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pass_may_be_written_as_its_name() {
+        // The set schema lists pass names, so `["rgb", "alpha"]` is the documented request and has
+        // to deserialize; the tagged object stays available for the passes that carry arguments.
+        let named: Vec<DiagnosticPass> =
+            serde_json::from_str(r#"["rgb", "alpha", "scale_orientation"]"#).unwrap();
+        assert_eq!(named.len(), 3);
+        assert_eq!(named[0], DiagnosticPass::Rgb);
+        assert_eq!(named[1], DiagnosticPass::Alpha);
+
+        let tagged: DiagnosticPass =
+            serde_json::from_str(r#"{"pass": "depth", "near": 0.5, "far": 12.0}"#).unwrap();
+        match tagged {
+            DiagnosticPass::Depth { near, far, .. } => {
+                assert_eq!(near, 0.5);
+                assert_eq!(far, 12.0);
+            }
+            other => panic!("expected a depth pass, got {other:?}"),
+        }
+
+        let component: DiagnosticPass =
+            serde_json::from_str(r#"{"pass": "component", "selection": true}"#).unwrap();
+        assert!(matches!(component, DiagnosticPass::Component { selection: true, .. }));
+
+        // An unknown name is refused, with the names this contract has.
+        let error = serde_json::from_str::<DiagnosticPass>(r#""normals""#).unwrap_err();
+        assert!(error.to_string().contains("rgb"), "{error}");
+    }
+
 
     fn sample(depth: f32, alpha: f32) -> Sample {
         Sample { depth, alpha }

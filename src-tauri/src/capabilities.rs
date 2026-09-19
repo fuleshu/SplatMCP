@@ -20,8 +20,10 @@ use splatmcp_core::capture::{
     Background, CameraPreset, DepthStatistic, OutputFormat, Projection, pass_capabilities,
 };
 
+use crate::assets::AssetHost;
 use crate::capture::CaptureHost;
 use crate::document::AppState;
+use crate::jobs::JobHost;
 
 /// The features this build implements, by name, so a caller can gate on them.
 const FEATURES: &[&str] = &[
@@ -48,11 +50,13 @@ const FEATURES: &[&str] = &[
 ///
 /// `depth_readback` and `component_ids` are the two renderer facts a caller cannot assume: the
 /// first is a renderer feature this build does not have, the second needs the authoring layer.
-pub fn report(state: &AppState, captures: &CaptureHost) -> Value {
+pub fn report(state: &AppState, captures: &CaptureHost, assets: &AssetHost, jobs: &JobHost) -> Value {
     let capture_limits = captures.limits();
     let in_flight = captures
         .in_flight()
         .map(|lease| json!({ "holder": lease.holder, "lease": lease.token }));
+    let asset_budgets = assets.budgets();
+    let job_limits = jobs.service().limits();
     json!({
         "contract_version": splatmcp_bridge::PROTOCOL_VERSION,
         "build": {
@@ -78,6 +82,25 @@ pub fn report(state: &AppState, captures: &CaptureHost) -> Value {
             "gaussians": {
                 "max_points": splatmcp_core::MAX_POINTS,
                 "max_reported_issues": splatmcp_core::MAX_REPORTED_ISSUES,
+                // The buffers one call may move, so a caller can size a request before sending it.
+                "max_buffer_bytes": asset_budgets.max_expanded_bytes,
+                "max_expanded_points": asset_budgets.max_expanded_points,
+            },
+            "assets": {
+                "max_asset_bytes": asset_budgets.max_asset_bytes,
+                "max_total_bytes": asset_budgets.max_total_bytes,
+                "max_assets": asset_budgets.max_assets,
+                "lifetime_ms": asset_budgets.lifetime_ms,
+                "max_upload_chunk_bytes": asset_budgets.max_upload_chunk_bytes,
+            },
+            "jobs": {
+                "max_queued": job_limits.max_queued,
+                "max_running": job_limits.max_running,
+                "max_retained_jobs": job_limits.max_retained_jobs,
+                "max_log_entries": job_limits.max_log_entries,
+                "max_log_chars": job_limits.max_log_chars,
+                "receipt_ttl_ms": job_limits.receipt_ttl_ms,
+                "max_run_ms": job_limits.max_run_ms,
             },
             "document": {
                 "retained_revisions": state.retention().revisions,
@@ -94,9 +117,34 @@ pub fn report(state: &AppState, captures: &CaptureHost) -> Value {
             "projections": [Projection::Perspective.as_str(), "orthographic"],
             "formats": [OutputFormat::Png.as_str(), OutputFormat::Jpeg { quality: 90 }.as_str()],
             "backgrounds": ["transparent", "solid", "viewer"],
+            "restore_policies": ["restore_previous", "keep_camera"],
+            "fit_targets": ["document", "component", "selection", "bounds"],
             "angle_units": "degrees",
             "fov_axis": "vertical",
             "world_axes": "+Y up, +Z towards the viewer; see docs/design/gaussian-contract.md",
+            // The shapes a caller actually writes: a request may give a name where the reply
+            // carries a tagged object, and saying so removes a round trip spent discovering it.
+            "accepted_input_shapes": {
+                "format": "\"png\" or \"jpeg\" (with an optional quality), or the tagged object",
+                "background": "\"transparent\" | \"viewer\" | {kind:\"solid\",color:[r,g,b]}",
+                "projection": "\"perspective\" | {kind:\"orthographic\",height:metres}",
+                "passes": "a pass name, or the tagged object that carries its arguments",
+                "camera": "pose | orbit | preset | fit, with fov/projection/near/far/padding",
+                "fit": "\"document\" | {of:\"component\",component_id:..} | {of:\"selection\",selection_id:..} | {of:\"bounds\",min:..,max:..}",
+            },
+        },
+        "conventions": {
+            "contract_version": splatmcp_core::contract::CONTRACT_VERSION,
+            "handedness": "right",
+            "up_axis": "+Y (world)",
+            "forward_axis": "+Z (world); a PLY is authored Y-down and flipped once on attach",
+            "quaternion_order": "w,x,y,z",
+            "colour_space": "linear RGB in 0..=1 (PLY f_dc_* is the SH DC coefficient)",
+            "scale": "activated ellipsoid radius in world metres (PLY stores ln scale)",
+            "opacity": "0..=1 (PLY stores the sigmoid logit)",
+            "sh_degree": 0,
+            "spherical_harmonics": "fixed colour only; higher SH bands are dropped, never stored",
+            "ply": "import/export only; no other container is written",
         },
         "diagnostics": {
             "passes": pass_capabilities(false, state.active_handle().is_some())
@@ -160,7 +208,9 @@ mod tests {
     fn the_report_names_real_limits_and_honest_gaps() {
         let state = AppState::default();
         let captures = CaptureHost::new();
-        let report = report(&state, &captures);
+        let assets = AssetHost::default();
+        let jobs = JobHost::default();
+        let report = report(&state, &captures, &assets, &jobs);
         assert_eq!(report["limits"]["capture"]["max_frame_edge"], 4096);
         assert_eq!(report["limits"]["capture"]["max_concurrent_captures"], 1);
         assert!(report["capture"]["in_flight"].is_null(), "nothing is capturing yet");
@@ -186,11 +236,13 @@ mod tests {
     fn a_capture_in_flight_is_reported_with_its_holder() {
         let state = AppState::default();
         let captures = CaptureHost::new();
+        let assets = AssetHost::default();
+        let jobs = JobHost::default();
         let lease = captures.acquire("client A").unwrap();
         // The local is not named `report`: that would shadow the function this test calls twice.
-        let busy = report(&state, &captures);
+        let busy = report(&state, &captures, &assets, &jobs);
         assert_eq!(busy["capture"]["in_flight"]["holder"], "client A");
         captures.release(&lease);
-        assert!(report(&state, &captures)["capture"]["in_flight"].is_null());
+        assert!(report(&state, &captures, &assets, &jobs)["capture"]["in_flight"].is_null());
     }
 }

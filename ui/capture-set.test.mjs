@@ -424,21 +424,29 @@ await check("a reference comparison is explicit and never a verdict", async () =
         path: "C:\\refs\\reference.png",
         alignment: { scale: 1, offset: [0, 0], color_space: "srgb" },
         threshold: 0.1,
+        asset: { data_base64: "cmVm", mime_type: "image/png", source: "C:\\refs\\reference.png" },
       },
     },
     displayed,
     deps: fakeDeps({
-      compareReference: async ({ view }) => ({
-        capture: { pixels: new Uint8ClampedArray(view.width * view.height * 4).fill(200), plane: null },
-        reference: { pixels: new Uint8ClampedArray(view.width * view.height * 4).fill(120), plane: null },
-        width: view.width,
-        height: view.height,
+      // The host decodes, aligns and compares; what the set does with the result is what is
+      // checked here.
+      compareReference: async () => ({
+        metrics: [
+          { name: "mean_absolute_difference", value: 0.31, unit: "normalised intensity 0..=1" },
+        ],
+        mask: { compared_pixels: 10, excluded_pixels: 2, reason: "region and coverage" },
+        method: "per-pixel absolute and signed difference over the declared mask",
+        disclaimer: "a pixel difference reports image disagreement; it is not a likeness verdict",
+        color_space: "srgb",
+        opacity: 0.5,
       }),
     }),
   });
   assert.ok(compared.reference, "a difference was reported");
   assert.match(compared.reference.disclaimer, /not a likeness/);
-  assert.equal(compared.reference.metrics.length, 5);
+  assert.equal(compared.reference.metrics.length, 1);
+  assert.equal(compared.reference.mask.compared_pixels, 10);
 
   const undecodable = await captureViews(fakeViewer(), {
     set: {
@@ -482,6 +490,123 @@ await check("a manifest refuses a mixed revision or an untraceable frame", async
       }),
     /no checksum/,
   );
+});
+
+await check("the contact sheet carries the checksum the reply requires", async () => {
+  // The live failure: the app refused the set with "missing field checksum", because the sheet was
+  // composed without one.
+  const captured = await captureViews(fakeViewer(), {
+    set: { ...threeViews(), contact_sheet: { thumbnail_width: 160, columns: 1 } },
+    displayed,
+    deps: fakeDeps(),
+  });
+  assert.ok(captured.contact_sheet, "a sheet was composed");
+  assert.equal(captured.contact_sheet.checksum.algorithm, "fnv1a64");
+  assert.equal(typeof captured.contact_sheet.checksum.value, "string", "the digest travels as digits");
+  assert.equal(captured.contact_sheet.checksum.bytes > 0, true);
+  assert.equal(captured.contact_sheet.labels, true);
+
+  // Composed for real, through the sheet module the window uses.
+  const { composeContactSheet } = await import("./contact-sheet.js");
+  const sheet = await composeContactSheet({
+    plan: planContactSheet(2, { thumbnailWidth: 64 }),
+    views: [
+      { label: "front", data_base64: "ZnJhbWU=", mime_type: "image/png" },
+      { label: "back", data_base64: "ZnJhbWU=", mime_type: "image/png" },
+    ],
+    deps: {
+      createSurface: (width, height) => ({
+        width,
+        height,
+        getContext: () => ({
+          fillRect() {},
+          drawImage() {},
+          fillText() {},
+          setTransform() {},
+          translate() {},
+          rotate() {},
+          scale() {},
+        }),
+      }),
+      encodeSurface: async () => ({ mime_type: "image/png", base64: "c2hlZXQ=", bytes: 6 }),
+      loadImage: async () => ({}),
+    },
+  });
+  assert.equal(sheet.checksum.value, checksumSummary(new Uint8Array(0)).value.length > 0 ? sheet.checksum.value : null);
+  assert.equal(sheet.bytes, 6);
+  assert.equal(sheet.columns, 2);
+});
+
+await check("the reference comparison runs when the app supplied the bytes", async () => {
+  const reference = {
+    path: "C:\\refs\\reference.png",
+    alignment: { scale: 1, offset: [0, 0], color_space: "srgb" },
+    opacity: 0.4,
+    difference: true,
+    asset: { data_base64: "cmVm", mime_type: "image/png", source: "C:\\refs\\reference.png" },
+  };
+  let asked = null;
+  const result = await captureViews(fakeViewer(), {
+    set: { ...threeViews(), contact_sheet: null, reference },
+    displayed,
+    deps: fakeDeps({
+      compareReference: async (request) => {
+        asked = request;
+        return {
+          metrics: [{ name: "mean_absolute_difference", value: 0.25, unit: "normalised intensity 0..=1" }],
+          mask: { compared_pixels: 3, excluded_pixels: 1, reason: "region and coverage" },
+          method: "per-pixel absolute and signed difference over the declared mask",
+          disclaimer: "a pixel difference reports image disagreement; it is not a likeness verdict",
+          color_space: "srgb",
+          opacity: 0.4,
+          difference: { mime_type: "image/png", data_base64: "ZGlmZg==", width: 64, height: 48, bytes: 5 },
+        };
+      },
+    }),
+  });
+  assert.ok(asked, "the comparison was asked for");
+  assert.equal(asked.reference.asset.data_base64, "cmVm");
+  assert.equal(
+    asked.pixels.length,
+    asked.width * asked.height * 4,
+    "the comparison gets the captured frame's pixels at the frame's own size",
+  );
+  assert.ok(result.reference, "a comparison came back");
+  assert.equal(result.reference.opacity, 0.4);
+  assert.match(result.reference.disclaimer, /not a likeness/);
+
+  // Without the bytes, the note says why - which is what the live host reported before the app
+  // resolved the file.
+  const missing = await captureViews(fakeViewer(), {
+    set: {
+      ...threeViews(),
+      contact_sheet: null,
+      reference: { path: "C:\\refs\\reference.png", alignment: { scale: 1, offset: [0, 0] } },
+    },
+    displayed,
+    deps: fakeDeps({
+      compareReference: async () => null,
+    }),
+  });
+  assert.equal(missing.reference, null);
+  assert.ok(
+    missing.notes.some((note) => note.includes("did not supply the reference bytes")),
+    missing.notes.join(" | "),
+  );
+});
+
+await check("every captured view is traceable to a frame and a timestamp", async () => {
+  const result = await captureViews(fakeViewer(), {
+    set: threeViews(),
+    displayed,
+    deps: fakeDeps(),
+  });
+  for (const view of result.views) {
+    assert.equal(view.status, VIEW_STATUS.Captured);
+    assert.equal(view.checksum.algorithm, "fnv1a64");
+    // The manifest must let a caller name the exact frame an image came from.
+    assert.ok("frame_id" in view || view.frame_id === null);
+  }
 });
 
 await check("checksums identify artifacts the same way on both sides", async () => {

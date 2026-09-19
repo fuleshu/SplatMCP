@@ -219,6 +219,26 @@ export function captureSetDeps(overrides = {}) {
     composeSheet: composeContactSheet,
     writeFile: null,
     compareReference: null,
+    // Browser defaults for the sheet, created lazily so a host that composes its own sheet - and a
+    // test that injects a fake one - never needs them.
+    createSurface: (width, height) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      return canvas;
+    },
+    encodeSurface: (canvas) => {
+      const dataUrl = canvas.toDataURL("image/png");
+      const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+      return { mime_type: "image/png", base64, bytes: Math.floor((base64.length * 3) / 4) };
+    },
+    loadImage: (base64, mimeType) =>
+      new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error("a captured frame could not be decoded"));
+        image.src = `data:${mimeType};base64,${base64}`;
+      }),
     capabilities: null,
     framePasses: null,
     componentMarkerBytes: null,
@@ -367,6 +387,9 @@ async function captureOneView(
       camera: captured.metadata.applied,
       passes,
       data_base64: captured.data_base64,
+      // Held in memory only until the run ends: the reference comparison needs the pixels of one
+      // captured view, and re-rendering a view to compare it would be a second capture.
+      pixels: captured.pixels ?? null,
       path,
       error: null,
     };
@@ -601,9 +624,10 @@ function sanitizeLabel(label) {
 /**
  * Compares the reference against the first captured view.
  *
- * The host supplies the decoded pixels (it owns the file and the decoder); this function only
- * decides what a missing host means, which is a reported note rather than a silent absence: a
- * caller that asked for a difference has to learn that it did not get one.
+ * The decoded reference travels with the request from the app, which is the layer that may read a
+ * file: the renderer never opens a path itself. The comparison therefore runs whenever a reference
+ * was asked for, and a host that cannot decode images reports *why* rather than leaving the caller
+ * with an unexplained absence.
  */
 async function compareReference(reference, view, deps, notes) {
   if (typeof deps.compareReference !== "function") {
@@ -613,22 +637,32 @@ async function compareReference(reference, view, deps, notes) {
     );
     return null;
   }
+  if (!reference.asset?.data_base64) {
+    notes.push(
+      "the reference comparison was not run: the app did not supply the reference bytes, so the " +
+        "image could not be decoded",
+    );
+    return null;
+  }
+  if (!view.pixels) {
+    notes.push(
+      "the reference comparison was not run: the captured frame's pixels could not be read back",
+    );
+    return null;
+  }
   try {
-    const decoded = await deps.compareReference({ reference, view });
-    if (!decoded?.capture || !decoded?.reference) {
-      notes.push("the reference comparison was not run: the host returned no pixel planes");
+    const compared = await deps.compareReference({
+      reference,
+      view,
+      pixels: view.pixels,
+      width: view.width,
+      height: view.height,
+    });
+    if (!compared) {
+      notes.push("the reference comparison produced no result");
       return null;
     }
-    return summarizeDifference({
-      capture: decoded.capture,
-      reference: decoded.reference,
-      width: decoded.width ?? view.width,
-      height: decoded.height ?? view.height,
-      region: reference.region ?? null,
-      threshold: reference.threshold ?? 0.1,
-      opacity: reference.opacity ?? 0.5,
-      colorSpace: reference.alignment?.color_space,
-    });
+    return compared;
   } catch (error) {
     notes.push(
       `the reference comparison failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -664,7 +698,7 @@ export function captureManifest({ document, revision, views, contactSheet, limit
     contract_version: 1,
     document_id: document?.documentId ?? document,
     revision,
-    views: views.map(({ data_base64: _data, ...view }) => view),
+    views: views.map(({ data_base64: _data, pixels: _pixels, ...view }) => view),
     contact_sheet: contactSheet
       ? {
           mime_type: contactSheet.mime_type,

@@ -60,6 +60,56 @@ A capture pins one revision before anything renders:
 * A document replaced while a set runs fails that view and marks the remaining views `skipped` - a
   mixed set is never returned as a partial success.
 
+## Completion evidence (what a frame must satisfy before it is reported)
+
+A capture reports success only when three conditions hold, and the failure names the one that did
+not. None of them is a timing assumption:
+
+1. **the pinned revision is the one the viewer displays** - while a newer revision is staging, the
+   screen still shows the previous scene, so a capture pinned to the new one waits, and a capture
+   pinned to a revision that never arrives fails with "showing revision X while revision Y was
+   pinned";
+2. **the engine completed a frame after the content changed** - `contentReadiness().upload_pending`
+   is cleared by PlayCanvas' own `postrender`, which is the earliest moment new content can be on
+   the GPU. Reading before it is how a capture returned a blank image with `status: "ok"`;
+3. **the frame holds the document** - while this content token has not been seen to render, a frame
+   that is a single flat colour for a document with gaussians is an upload frame, not a picture, and
+   the capture keeps waiting (then fails with "the frame is a single flat colour although the pinned
+   revision has N gaussians"). The check is skipped for the *steady state* of a content token that
+   has already been seen to draw, for an empty document, and for a host that cannot read pixels -
+   so a legitimate empty view is not looped until its timeout.
+
+`ui/capture-readiness.js` owns the decision (pure and unit-tested); `ui/capture.js` owns the loop,
+the size handling and the readback.
+
+## Camera exactness
+
+An applied pose is the pose that is rendered *and* reported:
+
+* the transform is set directly (position, and a look-at that honours the requested up vector);
+* the **interactive controls are suspended for the duration of the capture** - both `enabled` and a
+  neutered `update`, so no engine build can ease the entity mid-frame. `beginDeterministicCamera` /
+  `endDeterministicCamera` bracket a capture on every path, and the controls are re-attached to
+  where the camera actually is when they come back;
+* outside a capture, `placeCamera` **synchronises** the controls to the new pose (`reset` plus
+  `focusPoint`, which also records the current zoom distance). Without that, the focus controller
+  eases the camera along its view axis over the following frames, which made a requested pose arrive
+  late and a reported camera disagree with the rendered frame;
+* the reported camera is read from the **entity**, never from the controls' internal pose. `target`
+  is the point on the camera's forward ray at the reported `distance`; the distance is stated
+  separately because a transform has a ray, not a target.
+
+`get_camera` and `viewer_status` therefore report the applied state: position, target, up, fov,
+projection, near, far, distance, viewport and both matrices.
+
+## Accepted input shapes
+
+The published schema is authoritative, so the contract accepts what it documents, in both layers:
+a format as `"png"`/`"jpeg"` (with `quality` beside it), a background as `"transparent"`, `"viewer"`
+or `{kind: "solid", color}`, a projection as `"perspective"`, a fit target as `"document"`, a
+diagnostic pass as `"rgb"`/`"alpha"`/…, and a camera that is omitted, `null` or `{}` to mean "keep
+the current one". The tagged forms remain available for the values that carry arguments.
+
 ## Completion evidence
 
 `ui/capture.js` waits for the renderer's own readiness (`renderReady`: the splat entity's uploaded
@@ -119,6 +169,15 @@ its limitations attached - which is also what the capabilities tool publishes.
   view's label drawn under its thumbnail, and a cell that cannot be decoded is marked as failed.
 * `output_dir` writes the originals where the caller asked; the app writes them, and the manifest
   stays the artifact.
+
+## Reference comparison
+
+The renderer never opens a path: the app reads the reference image it was given (bounded at 32 MiB,
+unreadable or oversized refused with the path in the message) and forwards the bytes with the
+request. The renderer decodes them, applies the caller's alignment through a canvas transform
+(crop, rotate, scale, translate, resize in one sampling), builds both intensity planes, compares
+them over the declared mask and, when asked, draws the difference image. So a comparison reports
+metrics and an artifact rather than a note about a missing decoder.
 
 ## Reference comparison
 

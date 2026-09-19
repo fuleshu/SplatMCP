@@ -95,18 +95,22 @@ function fakeViewer({ position = [0, 0, 5], target = [0, 0, 0], up = [0, 1, 0] }
 /** Dependencies that fake the readback and the render evidence. */
 function fakeDeps(overrides = {}) {
   return {
-    awaitRender: async () => ({ frames: 1, ready: true }),
     captureFrame: (viewer, options) => {
       viewer.state.frames += 1;
       // The real readback renders first (see capture.js), so the fake does too: a test that
       // skipped it would not notice a capture that reads an unrendered frame.
       viewer.app.render();
+      const width = Number(options.frameSize?.width ?? options.viewport?.width ?? 640);
+      const height = Number(options.frameSize?.height ?? options.viewport?.height ?? 480);
+      const requested = options.viewport ?? null;
       return {
         mime_type: "image/png",
         data_base64: "ZnJhbWU=",
-        width: Number(options.width ?? 640),
-        height: Number(options.height ?? 480),
-        pixels: new Uint8ClampedArray(Number(options.width ?? 640) * Number(options.height ?? 480) * 4).fill(255),
+        width,
+        height,
+        pixels: new Uint8ClampedArray(width * height * 4).fill(255),
+        capped: Boolean(requested && (requested.width !== width || requested.height !== height)),
+        content_token: 1,
       };
     },
     now: () => 1700,
@@ -140,9 +144,10 @@ await check("a capture holds the viewer and gives it back on every path", async 
   assert.equal(captureInFlight(viewer), null, "the gate is free again after a success");
   assert.ok(captureGateFor(viewer) instanceof CaptureGate);
 
+  // A revision the document has moved past: refused, and the viewer is given back.
   const failing = fakeViewer();
   const error = await captureView(failing, {
-    spec: { document_id: "doc-1-2", expected_revision: 9, camera: {} },
+    spec: { document_id: "doc-1-2", expected_revision: 3, camera: {} },
     holder: "client B",
     displayed,
     deps: fakeDeps(),
@@ -181,6 +186,43 @@ await check("a stale or replaced document is refused before anything renders", a
     deps: fakeDeps(),
   }).catch((thrown) => thrown);
   assert.match(nothing.message, /no document is displayed/);
+});
+
+await check("a capture pinned to a revision that is still coming waits for it", async () => {
+  // The edit-then-capture case: the app pinned revision 5, the viewer still shows 4 and is staging
+  // 5. The capture must not be refused for that - it waits for the publication - and it must not
+  // read a frame of revision 4 either.
+  const viewer = fakeViewer();
+  viewer.contentReadiness = () => ({
+    content_token: 2,
+    upload_pending: false,
+    staged_revision: 4,
+    staged_document_id: "doc-1-2",
+    displayed_revision: 4,
+    displayed_document_id: "doc-1-2",
+    point_count: 5,
+  });
+  let pinnedRevisionSeen = null;
+  const captured = await captureView(viewer, {
+    spec: { document_id: "doc-1-2", expected_revision: 5, camera: {} },
+    displayed: { documentId: "doc-1-2", revision: 4 },
+    deps: fakeDeps({
+      captureFrame: (target, options) => {
+        pinnedRevisionSeen = options.expectedRevision;
+        return fakeDeps().captureFrame(target, options);
+      },
+    }),
+  });
+  assert.equal(pinnedRevisionSeen, 5, "the frame operation is told which revision it is pinning");
+  assert.equal(captured.metadata.viewport.width > 0, true);
+
+  // A revision the document has moved past is refused before anything is read.
+  const stale = await captureView(fakeViewer(), {
+    spec: { document_id: "doc-1-2", expected_revision: 3, camera: {} },
+    displayed,
+    deps: fakeDeps(),
+  }).catch((thrown) => thrown);
+  assert.match(stale.message, /moved on: expected revision 3, current 4/);
 });
 
 await check("the restore decision follows the generation token", async () => {
@@ -248,7 +290,9 @@ await check("a capture restores the interactive camera, and a newer navigation w
     }),
   });
   assert.equal(stale.metadata.restore, RESTORE_DECISION.SkippedNewerNavigation);
-  assert.equal(cameraGeneration(moved), 1);
+  // Two advancements: the navigation the test performed, and the move the capture itself observed
+  // when it read the camera back. Either one is enough to refuse a stale restore.
+  assert.ok(cameraGeneration(moved) >= 1, "a navigation during a capture is recorded");
 });
 
 await check("a capture that changed nothing has nothing to restore", async () => {
@@ -263,26 +307,29 @@ await check("a capture that changed nothing has nothing to restore", async () =>
   assert.deepEqual(viewer.state.position, [1, 2, 3]);
 });
 
-await check("the renderer's own evidence is what decides the frame is read", async () => {
-  const order = [];
+await check("the pose is applied before the frame is waited for and read", async () => {
   const viewer = fakeViewer();
+  let seenAtFrameTime = null;
   await captureView(viewer, {
     spec: { document_id: "doc-1-2", expected_revision: 4, camera: { preset: "left" } },
     displayed,
     deps: fakeDeps({
-      awaitRender: async (target) => {
-        order.push("await_render");
-        const [x, y, z] = target.state.position;
-        assert.ok(x < 0 && Math.abs(y) < 1e-6 && Math.abs(z) < 1e-6, "the pose is applied before waiting");
-      },
+      // The single frame operation owns the wait and the readback, so this is where the camera has
+      // to be exactly where the request asked for - and where the renderer has to have run.
       captureFrame: (target, options) => {
-        order.push("read_back");
+        seenAtFrameTime = {
+          position: [...target.state.position],
+          renders: target.state.renders,
+          // The controls are held off the camera while this runs.
+          suspended: target.controlsSuspended === true || target.state.controlsEnabled === false,
+        };
         return fakeDeps().captureFrame(target, options);
       },
     }),
   });
-  assert.deepEqual(order, ["await_render", "read_back"]);
-  assert.equal(viewer.state.renders > 0, true);
+  const [x, y] = seenAtFrameTime.position;
+  assert.ok(x < 0 && Math.abs(y) < 1e-6, "the requested pose is in force before the read");
+  assert.equal(viewer.state.renders > 0, true, "the renderer produced the frame that was read");
 });
 
 await check("a renderer that never becomes ready fails instead of returning a stale frame", async () => {
@@ -291,12 +338,14 @@ await check("a renderer that never becomes ready fails instead of returning a st
     spec: { document_id: "doc-1-2", expected_revision: 4, camera: { preset: "front" } },
     displayed,
     deps: fakeDeps({
-      awaitRender: async () => {
-        throw new Error("the renderer did not finish preparing the splat within 10 ms, so no frame of this revision exists yet");
+      captureFrame: () => {
+        throw new Error(
+          "no frame of revision 4 could be captured within 10 ms: the renderer has not completed a frame since the new revision was attached",
+        );
       },
     }),
   }).catch((thrown) => thrown);
-  assert.match(error.message, /did not finish preparing/);
+  assert.match(error.message, /no frame of revision 4 could be captured within 10 ms/);
   assert.equal(error.restore, RESTORE_DECISION.Restored, "the failure still says what was undone");
   assert.deepEqual(viewer.state.position, [0, 0, 5], "the camera is restored on the error path");
   assert.equal(viewer.state.frames, 0, "no frame was read back");
@@ -313,11 +362,8 @@ await check("a requested viewport that the renderer caps is reported", async () 
     },
     displayed,
     deps: fakeDeps({
-      captureFrame: (target, options) => ({
-        ...fakeDeps().captureFrame(target, options),
-        width: 1600,
-        height: 800,
-      }),
+      captureFrame: (target, options) =>
+        fakeDeps().captureFrame(target, { ...options, frameSize: { width: 1600, height: 800 } }),
     }),
   });
   assert.equal(captured.capped, true);

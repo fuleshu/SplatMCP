@@ -301,11 +301,33 @@ impl Response {
 }
 
 /// Camera placement in the viewer, in world units.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// `position`, `target` and `fov` are the original three fields. Everything below them is the
+/// *applied* state a caller needs to reason about a frame - orientation, projection, clipping,
+/// viewport and the matrices - and is additive, so a client that only reads the original fields
+/// keeps working. `target` is the point on the camera's forward ray at `distance`; the distance is
+/// reported rather than implied.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct CameraState {
     pub position: [f32; 3],
     pub target: [f32; 3],
     pub fov: f32,
+    #[serde(default)]
+    pub up: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<splatmcp_core::capture::Projection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<splatmcp_core::capture::Viewport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_matrix: Option<[f32; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_matrix: Option<[f32; 16]>,
 }
 
 /// Camera request accepted by `viewer.set_camera` and by `viewer.capture`.
@@ -424,6 +446,51 @@ pub struct CaptureViewsRequest {
     /// instead of inline images. Originals are the caller's, and nothing here rewrites them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+    /// Reference bytes the app resolved from the caller's path or asset.
+    ///
+    /// A renderer cannot open a file, and a comparison that silently does nothing is worse than no
+    /// comparison: the app reads the file it was given and hands the bytes over here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_asset: Option<ReferenceAsset>,
+}
+
+/// A payload the app resolved for a request, carried as bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceAsset {
+    /// Absolute path the bytes came from, kept as provenance.
+    pub source: String,
+    pub mime_type: String,
+    pub data_base64: String,
+    pub bytes: usize,
+}
+
+/// One image artifact, with the identity of its bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageArtifactReply {
+    pub data_base64: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: usize,
+    pub checksum: splatmcp_core::capture::ChecksumSummary,
+}
+
+/// The bounded result of comparing a reference against one captured view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceComparisonReply {
+    /// Named metrics over the declared mask, with their units.
+    pub metrics: Vec<splatmcp_core::capture::Metric>,
+    pub mask: splatmcp_core::capture::ComparisonMask,
+    pub method: String,
+    /// What the numbers do and do not mean; never omitted.
+    pub disclaimer: String,
+    pub color_space: String,
+    pub opacity: f32,
+    /// The alignment the comparison was performed under, echoed back.
+    pub alignment: Value,
+    /// The difference image, when the caller asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difference: Option<ImageArtifactReply>,
 }
 
 /// Reply of `viewer.capture_views`.
@@ -439,6 +506,9 @@ pub struct CaptureViewsReply {
     /// The contact sheet, when one was asked for and at least one view was captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_sheet: Option<ContactSheetReply>,
+    /// The reference comparison, when one was asked for and could be performed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ReferenceComparisonReply>,
     /// Passes this build cannot produce, reported once rather than per view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsupported_passes: Vec<String>,
@@ -458,6 +528,9 @@ pub struct CaptureViewOutcomeReply {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_id: Option<u64>,
+    /// When the frame was read back, as the app stamped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2118,6 +2191,7 @@ pub fn capture_views_request(
         set,
         holder: holder.into(),
         output_dir,
+        reference_asset: None,
     })
 }
 

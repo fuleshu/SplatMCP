@@ -26,12 +26,12 @@ use serde_json::{Value, json};
 use splatmcp_bridge::client::CAPTURE_TIMEOUT;
 use splatmcp_bridge::{
     CaptureViewOutcomeReply, CaptureViewReply, CaptureViewRequest, CaptureViewsReply,
-    CaptureViewsRequest, ContactSheetReply, Method,
+    CaptureViewsRequest, ContactSheetReply, Method, ReferenceAsset, ReferenceComparisonReply,
 };
 use splatmcp_core::capture::{
     CameraGeneration, CaptureError, CaptureGate, CaptureLease, CaptureLimits, CaptureSession,
     CaptureSetSpec, CaptureSpec, ChecksumSummary, OutputFormat, PassOutcome, PinnedRevision,
-    ResolvedCamera, Viewport, pin_for_capture,
+    ResolvedCamera, RestoreDecision, Viewport, pin_for_capture,
 };
 use splatmcp_core::{DocumentHandle, Expected};
 
@@ -105,8 +105,11 @@ impl CaptureHost {
         let holder = holder_of(&request.holder);
         let pinned = pin_for_capture(&request.set.capture_spec(), Some(&displayed(state)?))
             .map_err(capture_error)?;
+        // The reference is read here, before the viewer is taken: a comparison whose bytes could
+        // not be resolved is refused rather than reported as a set without one.
+        let reference_asset = resolve_reference(request.set.reference.as_ref())?;
         let lease = self.acquire(&holder)?;
-        let outcome = self.run_set(viewer, state, &request, &pinned, &lease);
+        let outcome = self.run_set(viewer, state, &request, &pinned, &lease, reference_asset);
         self.release(&lease);
         outcome
     }
@@ -180,11 +183,15 @@ impl CaptureHost {
         }
         let checksum = ChecksumSummary::of(&bytes);
         let format = format_of(&frame.mime_type)?;
+        // A viewer that reports nothing to restore did not move the camera; anything else did. That
+        // keeps the two sides on one rule instead of one inferring what the other meant.
+        let camera_applied = frame.restore != RestoreDecision::NothingToRestore.as_str();
         let metadata = CaptureSession::record(
             spec,
             pinned,
             frame.generation_before,
             frame.applied_camera,
+            camera_applied,
             self.next_frame(),
             Viewport::new(frame.width, frame.height),
             format,
@@ -221,12 +228,16 @@ impl CaptureHost {
         request: &CaptureViewsRequest,
         pinned: &DocumentHandle,
         lease: &CaptureLease,
+        reference_asset: Option<ReferenceAsset>,
     ) -> Result<Value, String> {
         let set = request.set.pinned_to(pinned);
         let forwarded = CaptureViewsRequest {
             set: set.clone(),
             holder: lease.holder.clone(),
+            // Output paths are the app's business: the renderer produces frames, and this layer
+            // knows where the caller asked for them.
             output_dir: None,
+            reference_asset,
         };
         let params =
             serde_json::to_value(forwarded).map_err(|error| format!("invalid capture set: {error}"))?;
@@ -259,6 +270,10 @@ impl CaptureHost {
                 .to_string());
             }
             let checksum = ChecksumSummary::of(&bytes);
+            // A frame id and a timestamp per view: an image a caller can trace back to one frame
+            // of one revision, exactly as a single capture reports its own.
+            let frame_id = self.next_frame();
+            let captured_at_ms = splatmcp_core::capture::now_ms();
             // Read the fields the reply must keep before taking the mutable borrow: a label that
             // was read after `as_object_mut` would borrow the same value twice.
             let label = view
@@ -276,6 +291,8 @@ impl CaptureHost {
                 // and checksums, and a controller that needs an image asks for one view.
                 object.remove("data_base64");
                 object.insert("bytes".to_owned(), json!(bytes.len()));
+                object.insert("frame_id".to_owned(), json!(frame_id));
+                object.insert("captured_at_ms".to_owned(), json!(captured_at_ms));
                 object.insert(
                     "checksum".to_owned(),
                     serde_json::to_value(checksum).unwrap_or(Value::Null),
@@ -320,6 +337,16 @@ impl CaptureHost {
             })
             .transpose()?;
 
+        let reference = reply
+            .get("reference")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value::<ReferenceComparisonReply>(value.clone()).map_err(|error| {
+                    format!("the viewer returned an unexpected reference comparison: {error}")
+                })
+            })
+            .transpose()?;
+
         let reply = CaptureViewsReply {
             document: PinnedRevision {
                 document_id: document,
@@ -328,6 +355,7 @@ impl CaptureHost {
             point_count,
             views,
             contact_sheet,
+            reference,
             unsupported_passes: string_list(&reply, "unsupported_passes"),
             cancelled: reply
                 .get("cancelled")
@@ -338,6 +366,50 @@ impl CaptureHost {
         serde_json::to_value(reply).map_err(|error| error.to_string())
     }
 }
+
+/// Reads the reference image a set asked for, bounded, so the renderer can compare against it.
+///
+/// A renderer cannot open a file, and a comparison that silently does nothing is worse than no
+/// comparison: an unreadable or oversized reference is refused here, with the path in the message.
+fn resolve_reference(reference: Option<&splatmcp_core::capture::ReferenceSpec>) -> Result<Option<ReferenceAsset>, String> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let Some(path) = reference.path.as_deref() else {
+        // An asset-backed reference is resolved by the asset host before it reaches here.
+        return Ok(None);
+    };
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("could not read the reference image {path}: {error}"))?;
+    if metadata.len() > MAX_REFERENCE_BYTES {
+        return Err(format!(
+            "the reference image {path} is {} bytes, above the {} byte limit for a comparison",
+            metadata.len(),
+            MAX_REFERENCE_BYTES
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read the reference image {path}: {error}"))?;
+    Ok(Some(ReferenceAsset {
+        source: path.to_owned(),
+        mime_type: reference_mime_type(path).to_owned(),
+        data_base64: BASE64.encode(&bytes),
+        bytes: bytes.len(),
+    }))
+}
+
+/// The media type a reference file carries, from its extension.
+fn reference_mime_type(path: &str) -> &'static str {
+    let lowered = path.to_lowercase();
+    if lowered.ends_with(".jpg") || lowered.ends_with(".jpeg") {
+        "image/jpeg"
+    } else {
+        "image/png"
+    }
+}
+
+/// Largest reference image a comparison accepts.
+const MAX_REFERENCE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The frame as the viewer reports it, before the app mints its identity.
 #[derive(Debug, serde::Deserialize)]
@@ -447,7 +519,6 @@ fn capture_error(error: CaptureError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use splatmcp_core::capture::{AppliedCamera, FrameIdentity, FrameMetadata, Projection};
 
     #[test]
     fn a_holder_is_named_or_the_capture_says_it_was_not() {
@@ -483,6 +554,7 @@ mod tests {
                 camera: splatmcp_core::capture::CameraSpec::default(),
                 viewport: None,
                 format: None,
+                quality: None,
                 passes: Vec::new(),
             }],
             shared: splatmcp_core::capture::SharedSettings {

@@ -5,10 +5,12 @@
 // executes viewer methods, reports readiness, and converts a failure into the error
 // string the tool caller will see.
 
-import { applyCamera, cameraState } from "./camera.js";
+import { appliedCameraState, applyCamera, cameraState } from "./camera.js";
 import { captureImage } from "./capture.js";
 import { cameraGeneration, captureView } from "./capture-session.js";
 import { captureViews } from "./capture-set.js";
+import { checksumOfBase64 } from "./checksums.js";
+import { compareWithReference } from "./reference.js";
 import { checksumSummary } from "./checksums.js";
 
 /** Event the app emits for each request. */
@@ -69,8 +71,11 @@ export class ViewerBridge {
         return this.status();
       case "viewer_get_camera":
         return this.requireCamera();
-      case "viewer_set_camera":
-        return applyCamera(this.viewer, params);
+      case "viewer_set_camera": {
+        applyCamera(this.viewer, params);
+        // The reply describes the camera that resulted, not the request that produced it.
+        return appliedCameraState(this.viewer) ?? cameraState(this.viewer);
+      }
       case "viewer_capture_view":
         return this.captureView(params);
       case "viewer_capture_views":
@@ -121,7 +126,12 @@ export class ViewerBridge {
 
   /** Captures a set of views, composing the contact sheet in the window that owns the canvas. */
   async captureViews(params) {
-    const set = params?.set ?? {};
+    const set = { ...(params?.set ?? {}) };
+    // The reference bytes travel beside the set: the app read the file, so the renderer never
+    // opens a path itself.
+    if (params?.reference_asset) {
+      set.reference = { ...(set.reference ?? {}), asset: params.reference_asset };
+    }
     const result = await captureViews(this.viewer, {
       set,
       holder: params?.holder ?? "the viewer",
@@ -147,6 +157,7 @@ export class ViewerBridge {
         data_base64: view.data_base64,
       })),
       contact_sheet: result.contact_sheet,
+      reference: result.reference ?? null,
       unsupported_passes: result.unsupported_passes,
       cancelled: result.cancelled,
       notes: result.notes,
@@ -183,12 +194,21 @@ export class ViewerBridge {
           checksum: checksumSummary(base64ToBytes(base64)),
         };
       },
-      loadImage: (base64, mimeType) =>
-        new Promise((resolve, reject) => {
-          const image = new Image();
-          image.onload = () => resolve(image);
-          image.onerror = () => reject(new Error("a captured frame could not be decoded"));
-          image.src = `data:${mimeType};base64,${base64}`;
+      loadImage: (base64, mimeType) => loadImage(base64, mimeType),
+      compareReference: ({ reference, pixels, width, height }) =>
+        compareWithReference({
+          reference,
+          capturePixels: pixels,
+          width,
+          height,
+          decodeReference: (asset) => decodeImage(asset),
+          // The alignment is applied by drawing the reference through a canvas transform: the
+          // browser's own sampler is the resampler, so an overlay and a difference use the same
+          // mapping as the image the caller sees.
+          alignReference: ({ reference: decoded, alignment, width: targetWidth, height: targetHeight, crop }) =>
+            alignOnCanvas({ decoded, alignment, width: targetWidth, height: targetHeight, crop }),
+          differenceImage: ({ capture, reference: expected, mask, width: diffWidth, height: diffHeight, threshold }) =>
+            drawDifference({ capture, expected, mask, width: diffWidth, height: diffHeight, threshold }),
         }),
     };
   }
@@ -206,8 +226,14 @@ export class ViewerBridge {
     };
   }
 
+  /**
+   * The camera the renderer has, with its projection data and matrices.
+   *
+   * Read from the entity via `appliedCameraState`, so a caller learns what a frame from this pose
+   * would contain - the requested parameters are not the answer to that question.
+   */
   requireCamera() {
-    const state = cameraState(this.viewer);
+    const state = appliedCameraState(this.viewer);
     if (!state) {
       throw new Error("the viewer has no camera yet");
     }
@@ -228,6 +254,112 @@ export class ViewerBridge {
     });
     return this.status();
   }
+}
+
+/** Decodes a captured frame or a reference image into a drawable bitmap. */
+function loadImage(base64, mimeType) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("an image could not be decoded"));
+    image.src = `data:${mimeType};base64,${base64}`;
+  });
+}
+
+/** The pixels of a reference the app already read, decoded at its own size. */
+async function decodeImage(asset) {
+  if (!asset?.data_base64) {
+    throw new Error("the app supplied no reference bytes");
+  }
+  const image = await loadImage(asset.data_base64, asset.mime_type || "image/png");
+  return drawToSurface(image, image.naturalWidth || image.width, image.naturalHeight || image.height, (context, width, height) => {
+    context.drawImage(image, 0, 0, width, height);
+  });
+}
+
+/**
+ * Applies the caller's alignment by drawing the reference through a canvas transform.
+ *
+ * Crop, rotate, scale, translate and resize all happen in one draw, so the reference is sampled
+ * once and the result is what the overlay and the difference both use.
+ */
+async function alignOnCanvas({ decoded, alignment, width, height, crop }) {
+  const sourceWidth = crop ? crop.width : decoded.width;
+  const sourceHeight = crop ? crop.height : decoded.height;
+  const sourceX = crop ? crop.x : 0;
+  const sourceY = crop ? crop.y : 0;
+  return drawToSurface(decoded.canvas, width, height, (context) => {
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, width, height);
+    // Half a pixel keeps the mapping symmetric about the image centre when rotated.
+    context.translate(width / 2 + alignment.offset[0], height / 2 + alignment.offset[1]);
+    context.rotate((alignment.rotation_degrees * Math.PI) / 180);
+    context.scale(alignment.scale, alignment.scale);
+    context.drawImage(
+      decoded.canvas,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      -width / 2,
+      -height / 2,
+      width,
+      height,
+    );
+    context.setTransform(1, 0, 0, 1, 0, 0);
+  });
+}
+
+/** One image's pixels, on a surface of the requested size. */
+function drawToSurface(source, width, height, draw) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.trunc(width));
+  canvas.height = Math.max(1, Math.trunc(height));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    throw new Error("the window cannot draw the reference image");
+  }
+  draw(context, canvas.width, canvas.height);
+  const image = context.getImageData(0, 0, canvas.width, canvas.height);
+  return { canvas, pixels: image.data, width: canvas.width, height: canvas.height };
+}
+
+/**
+ * Draws the disagreement between two intensity planes as a grayscale image.
+ *
+ * The artifact shows where the images differ, under the alignment the caller declared and inside
+ * the mask the comparison used; it is not a picture of the scene.
+ */
+async function drawDifference({ capture, expected, mask, width, height, threshold }) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.trunc(width));
+  canvas.height = Math.max(1, Math.trunc(height));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    throw new Error("the window cannot draw the difference image");
+  }
+  const image = context.createImageData(canvas.width, canvas.height);
+  for (let index = 0; index < image.data.length / 4; index += 1) {
+    const compared = mask[index] === 1;
+    const difference = compared ? Math.abs(capture[index] - expected[index]) : 0;
+    const level = Math.max(0, Math.min(255, Math.round(difference * 255)));
+    image.data[index * 4] = level;
+    image.data[index * 4 + 1] = compared && difference > threshold ? 64 : 0;
+    image.data[index * 4 + 2] = compared ? 0 : 32;
+    image.data[index * 4 + 3] = 255;
+  }
+  context.putImageData(image, 0, 0);
+  const dataUrl = canvas.toDataURL("image/png");
+  const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  return {
+    mime_type: "image/png",
+    data_base64: base64,
+    width: canvas.width,
+    height: canvas.height,
+    bytes: Math.floor((base64.length * 3) / 4),
+    // Every artifact is identified by its bytes, so a caller can name the image it received.
+    checksum: checksumOfBase64(base64),
+  };
 }
 
 function base64ToBytes(base64) {

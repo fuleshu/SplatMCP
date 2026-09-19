@@ -69,8 +69,54 @@ export class SplatViewer {
     this.highlightToken = 0;
     // Read from the PLY header on load; reported to the bridge as status.
     this.plyPointCount = 0;
+    // Distance from the eye to the point it is looking at, in world metres.
+    //
+    // A camera transform has a forward ray, not a target, so the target a reply reports is the
+    // point on that ray at this distance. It is recorded whenever a camera is placed, and never
+    // read back from the interactive controls: their internal pose is what a capture must prove
+    // is *not* still easing.
+    this.lookDistance = 1;
+    // Bumped whenever the displayed *content* changes. A capture uses it to decide whether it
+    // still has to prove the new content has been drawn.
+    this.contentToken = 0;
+    // True between a swap and the first frame the engine finished after it. A frame read before
+    // that is the frame of an upload, which is how a capture returned a blank image.
+    this.uploadPending = false;
+    // True while a capture owns the camera and the interactive controls are held off it.
+    this.controlsSuspended = false;
+    this.controlsUpdate = null;
 
     this.handleResize = this.handleResize.bind(this);
+    this.onPostRender = this.onPostRender.bind(this);
+  }
+
+  /**
+   * The engine finished a frame.
+   *
+   * This is the renderer's own completion evidence for whatever was staged: the entity was in the
+   * render list of a frame that completed, which is the earliest moment its contents may exist on
+   * the GPU. It is deliberately not a frame count - it is the engine telling us a frame happened.
+   */
+  onPostRender() {
+    this.uploadPending = false;
+  }
+
+  /**
+   * What a capture needs to know about this viewer's content, without guessing.
+   *
+   * `staged` is a revision that is loading: the screen still shows the previous one, so a capture
+   * pinned to the newer revision has to wait rather than photograph the old scene.
+   */
+  contentReadiness() {
+    return {
+      content_token: this.contentToken,
+      upload_pending: this.uploadPending,
+      staged_revision: this.staged?.revision ?? null,
+      staged_document_id: this.staged?.documentId ?? null,
+      displayed_revision: this.displayed?.revision ?? null,
+      displayed_document_id: this.displayed?.documentId ?? null,
+      point_count: this.plyPointCount,
+    };
   }
 
   /**
@@ -177,6 +223,10 @@ export class SplatViewer {
     this.splatEntity = entity;
     this.app.root.addChild(entity);
     entity.syncHierarchy();
+    // New content: nothing has been drawn from it yet, so a capture must wait for the engine to
+    // complete a frame before it may read one.
+    this.contentToken += 1;
+    this.uploadPending = true;
   }
 
   /**
@@ -399,6 +449,7 @@ export class SplatViewer {
     this.clearSplat();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.app?.off?.("postrender", this.onPostRender);
     this.app?.destroy();
     this.app = null;
     this.cameraEntity = null;
@@ -458,6 +509,9 @@ export class SplatViewer {
       this.controls.focusDamping = 0.9;
       this.controls.enablePan = true;
     }
+
+    // One listener for the life of the app: a swap only has to raise the flag above.
+    this.app.on("postrender", this.onPostRender);
 
     this.resizeObserver = new ResizeObserver(this.handleResize);
     this.resizeObserver.observe(this.container);
@@ -535,16 +589,80 @@ export class SplatViewer {
     return { min, max, center: world.center, halfExtents: world.halfExtents };
   }
 
-  placeCamera(position, focus, radius) {
+  /**
+   * Places the camera exactly at a pose.
+   *
+   * The transform is set directly - position, and a look-at that honours the caller's up vector -
+   * and the interactive controls are then *synchronised* to that pose rather than left to ease
+   * toward it. Without the sync the focus controller pulls the camera along its view axis on the
+   * following frames, which is what made a requested pose arrive late and a reported camera
+   * disagree with the frame that was rendered.
+   */
+  placeCamera(position, focus, radius, up = null) {
     // Accept plain arrays so the bridge can stay free of engine types.
     const positionVec = Array.isArray(position) ? new pc.Vec3(...position) : position;
     const focusVec = Array.isArray(focus) ? new pc.Vec3(...focus) : focus;
+    const upVec = up ? new pc.Vec3(...up) : pc.Vec3.UP;
     const farClip = Math.max(1000, positionVec.distance(focusVec) + radius * 20);
     this.cameraEntity.camera.nearClip = 0.001;
     this.cameraEntity.camera.farClip = farClip;
     this.cameraEntity.setPosition(positionVec);
-    this.cameraEntity.lookAt(focusVec);
-    this.controls?.reset(focusVec, positionVec);
+    this.cameraEntity.lookAt(focusVec, upVec);
+    this.lookDistance = Math.max(positionVec.distance(focusVec), 1e-4);
+    this.syncControls(focusVec, positionVec);
+  }
+
+  /**
+   * Puts the interactive controls onto the pose the entity now has.
+   *
+   * `reset` attaches them to an exact pose, and setting `focusPoint` also tells them the current
+   * zoom distance: the focus controller eases toward its own recorded distance, so a stale one
+   * walks the camera along the view axis.
+   */
+  syncControls(focus, position) {
+    if (!this.controls || this.controlsSuspended) {
+      return;
+    }
+    this.controls.reset(focus, position);
+    this.controls.focusPoint = focus;
+  }
+
+  /**
+   * Holds the interactive controls off the camera for the duration of a capture.
+   *
+   * Deliberately both the enabled flag and the update method: whichever way this engine build
+   * schedules script updates, neither one can move the entity while a capture is reading it.
+   */
+  beginDeterministicCamera() {
+    if (!this.controls) {
+      return false;
+    }
+    this.controlsSuspended = true;
+    this.controlsUpdate = this.controls.update;
+    this.controls.update = () => {};
+    this.controls.enabled = false;
+    return true;
+  }
+
+  /** Gives the controls back, attached to where the camera actually is. */
+  endDeterministicCamera() {
+    if (!this.controlsSuspended || !this.controls) {
+      this.controlsSuspended = false;
+      return false;
+    }
+    const position = new pc.Vec3().copy(this.cameraEntity.getPosition());
+    const focus = new pc.Vec3().copy(position).add(
+      new pc.Vec3().copy(this.cameraEntity.forward).mulScalar(this.lookDistance),
+    );
+    this.controlsSuspended = false;
+    if (this.controlsUpdate) {
+      this.controls.update = this.controlsUpdate;
+      this.controlsUpdate = null;
+    }
+    this.controls.reset(focus, position);
+    this.controls.focusPoint = focus;
+    this.controls.enabled = true;
+    return true;
   }
 
   handleResize() {

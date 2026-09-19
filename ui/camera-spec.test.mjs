@@ -271,6 +271,9 @@ check("the legacy interactive request shape still works", () => {
       forward: { x: 0, y: 0, z: -1 },
     },
     controls: { focusPoint: { clone: () => ({ x: 0, y: 0, z: 0 }) } },
+    // The viewer records how far away its look-at point is when it places a camera; a report of the
+    // target is the point on the forward ray at that distance.
+    lookDistance: 5,
     placeCamera: (position, target) => placed.push({ position: [...position], target: [...target] }),
     worldBounds: () => null,
   };
